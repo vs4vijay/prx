@@ -1,0 +1,100 @@
+# CI for the prx workspace (local-first PR review lifecycle manager). Runs on
+# pushes to main and on every pull request (the PR gate), and is called by
+# release.yml so a tag is only released from a green tree.
+#
+# Everything runs on the repo's self-hosted runner: an Apple silicon Mac
+# (label prx-macos-arm64). The macos job builds, tests, and lints the whole
+# workspace natively and runs the settings web UI's node:test suite. The
+# linux job runs the core crate's gate inside a gnu rust docker container on
+# the same machine, so the core crate keeps proving it builds and tests on
+# Linux. With a single runner the jobs execute one after another.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same PR supersedes the run in flight. github.workflow is
+# the caller's name when release.yml calls this, hence the fixed "ci-" prefix:
+# without it the group would collide with release.yml's own.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: Build, test, lint workspace (self-hosted macOS arm64)
+    runs-on: [self-hosted, prx-macos-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The launchd service PATH carries neither cargo (~/.cargo/bin) nor the
+      # homebrew tools (gh, node); export them to the steps below.
+      - name: Put cargo and homebrew tools on PATH
+        run: echo "$HOME/.cargo/bin:/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The workspace (core + prx-menubar) builds on macOS with no extra
+      # system packages.
+      - run: cargo build --workspace --all-targets --locked
+
+      - run: cargo test -p prx --locked
+
+      # The menubar crate's tests (model, actions, clipboard, banners,
+      # settings bridge) are macOS-only.
+      - run: cargo test -p prx-menubar --locked
+
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - run: cargo fmt --check
+
+      # Settings web UI (menubar/settings-ui) unit tests: plain node:test,
+      # no npm dependencies.
+      - run: node --test menubar/settings-ui-tests/*.test.js
+
+  linux:
+    name: Core crate gate on Linux (gnu container)
+    runs-on: [self-hosted, prx-macos-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The official rust image is a gnu Linux userspace; its minimal profile
+      # lacks rustfmt/clippy, so add them. A named volume keeps the cargo
+      # registry cache across runs, and a separate target dir keeps container
+      # artifacts (and their root ownership) out of the host's target/.
+      - name: Build, test, lint the core crate
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE":/work --workdir /work \
+            --volume prx-cargo-gnu:/usr/local/cargo \
+            --env CARGO_TARGET_DIR=/work/target-gnu-aarch64 \
+            rust:1 \
+            sh -c 'rustup component add rustfmt clippy \
+              && cargo build -p prx --locked \
+              && cargo test -p prx --locked \
+              && cargo clippy -p prx --all-targets --locked -- -D warnings \
+              && cargo fmt --check'
+
+  # The single status to require in branch protection: green only when every
+  # job above is, so the required-check list never has to track job renames.
+  gate:
+    name: PR gate
+    if: always()
+    needs: [macos, linux]
+    runs-on: [self-hosted, prx-macos-arm64]
+    steps:
+      - name: All CI jobs passed
+        run: |
+          echo "macos: ${{ needs.macos.result }}"
+          echo "linux: ${{ needs.linux.result }}"
+          [ "${{ needs.macos.result }}" = "success" ] && [ "${{ needs.linux.result }}" = "success" ]

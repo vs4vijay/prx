@@ -1,0 +1,266 @@
+#!/bin/sh
+# Fake `gh` CLI for prx integration tests. No network, no real gh.
+#
+# Environment:
+#   FAKE_GH_DIR        fixture directory containing:
+#                        list_<org>_<repo>.json  -> JSON array printed for
+#                           `gh pr list -R org/repo --json ... --state open ...`
+#                        <org>_<repo>#<n>.state  -> text OPEN|MERGED|CLOSED for
+#                           `gh pr view <n> -R org/repo --json state`
+#                        <org>_<repo>#<n>.detail.json -> JSON printed for
+#                           `gh pr view <n> -R org/repo --json files,additions,deletions,commits`
+#                        <org>_<repo>#<n>.pr.json -> one PR object (the list
+#                           fields, no `state`) for `gh pr view <n> -R org/repo
+#                           --json <list fields>,state`; `state` is spliced in
+#                           from <n>.state (default OPEN). Missing file: the
+#                           PR does not exist (stderr + exit 1, like gh)
+#                        <org>_<repo>#<n>.brief.json -> JSON printed for
+#                           `gh pr view <n> -R org/repo --json title,body,author,files`
+#                           (on-demand briefs); falls back to <n>.detail.json
+#                        <org>_<repo>#<n>.diff   -> text printed for `gh pr diff`
+#                        <org>_<repo>#<n>.approve-error -> stderr + exit 1 for
+#                           `gh pr review --approve`
+#                        <org>_<repo>#<n>.review-error -> stderr + exit 1 for
+#                           verdict reviews (simulates GitHub's "Can not
+#                           request changes on your own pull request");
+#                           `--comment` reviews still succeed (degrade path)
+#                        <org>_<repo>#<n>.review-body.txt <- stdin body captured
+#                           from `gh pr review ... --body-file -`
+#   FAKE_GH_LOG        if set, every invocation's args are appended (one line);
+#                      FAKE_GH_LOG.tokens gets the same line prefixed with the
+#                      GH_TOKEN the call ran with ("<default>" when unset)
+#   FAKE_GH_AUTH_FAIL  if set non-empty, `gh auth status` exits 1
+#   FAKE_GH_LIST_FAIL  number of `gh pr list` calls that fail with an
+#                      auth-expiry style error before succeeding again
+#                      (simulates auth expiry + re-login; a countdown file
+#                      .list_fail_count in FAKE_GH_DIR tracks the remaining
+#                      failures). A huge value means "always fail".
+#
+# Unrecognized invocations exit 1 (used by doctor failure-path tests).
+
+set -u
+
+if [ -n "${FAKE_GH_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_GH_LOG"
+  printf '%s %s\n' "${GH_TOKEN:-<default>}" "$*" >> "$FAKE_GH_LOG.tokens"
+fi
+
+if [ "${1:-}" = "auth" ] && [ "${2:-}" = "status" ]; then
+  if [ -n "${FAKE_GH_AUTH_FAIL:-}" ]; then
+    echo "gh: To get started with GitHub CLI, please run: gh auth login" >&2
+    exit 1
+  fi
+  echo "github.com"
+  echo "  OK Logged in to github.com as testuser (keyring)"
+  exit 0
+fi
+
+# REST API (already logged above):
+#   api user ...                          -> prints $FAKE_GH_DIR/user (default
+#                                            "testuser"): the --jq .login answer
+#   api repos/<org>/<repo>/pulls/<n>/reviews ...
+#                                         -> cats <org>_<repo>#<n>.reviews.jsonl
+#                                            (one {id,state,login} object per
+#                                            line, i.e. the --jq output)
+#   api -X PUT .../reviews/<id>/dismissals -> touches
+#                                            <org>_<repo>#<n>.dismissed-<id>
+#   anything else (inline comments)       -> exit 0
+if [ "${1:-}" = "api" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      user)
+        if [ -f "${FAKE_GH_DIR:-}/user" ]; then
+          cat "${FAKE_GH_DIR:-}/user"
+        else
+          echo "testuser"
+        fi
+        exit 0
+        ;;
+      repos/*/pulls/*/reviews/*/dismissals)
+        rest="${arg#repos/}"
+        org="${rest%%/*}"; rest="${rest#*/}"
+        name="${rest%%/*}"; rest="${rest#*/pulls/}"
+        number="${rest%%/*}"; rest="${rest#*/reviews/}"
+        id="${rest%%/*}"
+        touch "${FAKE_GH_DIR:-}/${org}_${name}#${number}.dismissed-${id}"
+        exit 0
+        ;;
+      repos/*/pulls/*/reviews)
+        rest="${arg#repos/}"
+        org="${rest%%/*}"; rest="${rest#*/}"
+        name="${rest%%/*}"; rest="${rest#*/pulls/}"
+        number="${rest%%/*}"
+        f="${FAKE_GH_DIR:-}/${org}_${name}#${number}.reviews.jsonl"
+        [ -f "$f" ] && cat "$f"
+        exit 0
+        ;;
+    esac
+  done
+  exit 0
+fi
+
+if [ "${1:-}" = "pr" ]; then
+  sub=""
+  repo=""
+  number=""
+  fields=""
+  bodyfile=""
+  review_flag=""
+  prev=""
+  for arg in "$@"; do
+    case "$arg" in
+      list|view|diff|review)
+        sub="$arg"
+        ;;
+      -R)
+        prev="R"
+        ;;
+      --json)
+        prev="J"
+        ;;
+      --body-file)
+        prev="B"
+        ;;
+      --state|--limit|--repo)
+        prev="X"
+        ;;
+      --request-changes)
+        review_flag="request-changes"
+        ;;
+      --comment)
+        review_flag="comment"
+        ;;
+      --approve)
+        review_flag="approve"
+        ;;
+      *)
+        case "$prev" in
+          R)
+            repo="$arg"
+            prev=""
+            ;;
+          J)
+            fields="$arg"
+            prev=""
+            ;;
+          B)
+            bodyfile="$arg"
+            prev=""
+            ;;
+          X)
+            prev=""
+            ;;
+          *)
+            if [ "$sub" = "view" ] || [ "$sub" = "diff" ] || [ "$sub" = "review" ]; then
+              if [ -z "$number" ]; then
+                number="$arg"
+              fi
+            fi
+            ;;
+        esac
+        ;;
+    esac
+  done
+  org="${repo%%/*}"
+  name="${repo##*/}"
+
+  if [ "$sub" = "list" ]; then
+    if [ -n "${FAKE_GH_LIST_FAIL:-}" ]; then
+      cfile="${FAKE_GH_DIR:-}/.list_fail_count"
+      remaining=$(cat "$cfile" 2>/dev/null || echo "${FAKE_GH_LIST_FAIL}")
+      if [ "${remaining:-0}" -gt 0 ] 2>/dev/null; then
+        printf '%s' "$((remaining - 1))" > "$cfile"
+        echo "gh: auth error (simulated): To get started with GitHub CLI, please run: gh auth login" >&2
+        exit 1
+      fi
+    fi
+    f="${FAKE_GH_DIR:-}/list_${org}_${name}.json"
+    if [ -f "$f" ]; then
+      cat "$f"
+    else
+      echo "[]"
+    fi
+    exit 0
+  fi
+
+  if [ "$sub" = "view" ]; then
+    case "$fields" in
+      *headRefOid*)
+        f="${FAKE_GH_DIR:-}/${org}_${name}#${number}.pr.json"
+        if [ ! -f "$f" ]; then
+          echo "GraphQL: Could not resolve to a PullRequest with the number of ${number}. (repository.pullRequest)" >&2
+          exit 1
+        fi
+        sf="${FAKE_GH_DIR:-}/${org}_${name}#${number}.state"
+        if [ -f "$sf" ]; then
+          state=$(cat "$sf")
+        else
+          state="OPEN"
+        fi
+        awk -v s="$state" '!done && sub(/\{/, "{\"state\":\"" s "\",") { done = 1 } { print }' "$f"
+        ;;
+      *body*)
+        # On-demand brief view (title,body,author,files): <n>.brief.json,
+        # else the detail fixture (its `files` carry the paths).
+        f="${FAKE_GH_DIR:-}/${org}_${name}#${number}.brief.json"
+        [ -f "$f" ] || f="${FAKE_GH_DIR:-}/${org}_${name}#${number}.detail.json"
+        if [ -f "$f" ]; then
+          cat "$f"
+        else
+          echo '{"title":"","body":"","author":{"login":""},"files":[]}'
+        fi
+        ;;
+      *files*)
+        f="${FAKE_GH_DIR:-}/${org}_${name}#${number}.detail.json"
+        if [ -f "$f" ]; then
+          cat "$f"
+        else
+          echo '{"files":[],"additions":0,"deletions":0,"commits":[]}'
+        fi
+        ;;
+      *)
+        f="${FAKE_GH_DIR:-}/${org}_${name}#${number}.state"
+        if [ -f "$f" ]; then
+          state=$(cat "$f")
+        else
+          state="OPEN"
+        fi
+        echo "{\"state\":\"$state\"}"
+        ;;
+    esac
+    exit 0
+  fi
+
+  if [ "$sub" = "diff" ]; then
+    f="${FAKE_GH_DIR:-}/${org}_${name}#${number}.diff"
+    if [ -f "$f" ]; then
+      cat "$f"
+    fi
+    exit 0
+  fi
+
+  if [ "$sub" = "review" ]; then
+    # PR number is the positional arg (real gh: `gh pr review <n> -R org/repo`).
+    base="${FAKE_GH_DIR:-}/${org}_${name}#${number}"
+    # Self-authored-PR injection: a verdict review (request-changes/approve)
+    # fails with GitHub's GraphQL error; --comment (the degrade path) succeeds.
+    if [ "$review_flag" != "comment" ] && [ -f "${base}.review-error" ]; then
+      cat "${base}.review-error" >&2
+      exit 1
+    fi
+    if [ "$review_flag" = "approve" ]; then
+      if [ -f "${base}.approve-error" ]; then
+        cat "${base}.approve-error" >&2
+        exit 1
+      fi
+      exit 0
+    fi
+    if [ "$bodyfile" = "-" ]; then
+      cat > "${base}.review-body.txt"
+    fi
+    exit 0
+  fi
+fi
+
+echo "fake gh: unsupported invocation: $*" >&2
+exit 1

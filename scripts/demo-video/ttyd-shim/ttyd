@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# ttyd shim for the vhs recordings (build.sh and capture-screenshots.py --cli
+# put this directory first on PATH, so vhs starts this instead of ttyd).
+#
+# Why: vhs draws its terminal with the xterm.js that ttyd serves, and that
+# xterm.js measures an emoji written as a base character plus the U+FE0F
+# variation selector (the warning sign, the bin, the tick in `prx status`) as
+# ONE cell, while drawing it two cells wide. Current terminals (iTerm2,
+# Ghostty, kitty, WezTerm, Terminal.app, VS Code) measure it as two, and so
+# does prx when it pads its tables. Unpatched, those rows sit one cell left in
+# a recording although they line up in a real terminal.
+#
+# What: runs the real ttyd with `-I`, serving ttyd's own page with one change:
+# xterm.js's width provider gives a U+FE0F that joins the previous character
+# two cells. prx's output is not touched; it reaches the terminal byte for
+# byte.
+#
+# The patched page is cached per ttyd version in $PRX_TTYD_INDEX (default:
+# $TMPDIR/prx-ttyd-index-<version>.html). If ttyd's bundled xterm.js changes
+# shape and the patch no longer applies, this fails rather than record a
+# misaligned table.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REAL=""
+IFS=: read -ra path_dirs <<<"$PATH"
+for dir in "${path_dirs[@]}"; do
+    [[ -n "$dir" && -d "$dir" ]] || continue
+    [[ "$dir" -ef "$HERE" ]] && continue
+    if [[ -x "$dir/ttyd" ]]; then REAL="$dir/ttyd"; break; fi
+done
+[[ -n "$REAL" ]] || { echo "ttyd shim: no real ttyd on PATH" >&2; exit 127; }
+
+case "${1:-}" in
+    --version | -v | --help | -h) exec "$REAL" "$@" ;;
+esac
+
+version="$("$REAL" --version 2>&1 | tr -c 'A-Za-z0-9.\n' '-' | head -n 1)"
+INDEX="${PRX_TTYD_INDEX:-${TMPDIR:-/tmp}/prx-ttyd-index-$version.html}"
+
+if [[ ! -s "$INDEX" ]]; then
+    raw="$(mktemp "${TMPDIR:-/tmp}/prx-ttyd-raw.XXXXXX")"
+    port="$(perl -MIO::Socket::INET -e 'my $s = IO::Socket::INET->new(Listen => 1, LocalAddr => "127.0.0.1", LocalPort => 0) or die; print $s->sockport')"
+    "$REAL" -p "$port" -i 127.0.0.1 true >/dev/null 2>&1 &
+    server=$!
+    fetched=""
+    for _ in $(seq 1 50); do
+        if curl -fs --compressed "http://127.0.0.1:$port/" -o "$raw"; then fetched=1; break; fi
+        sleep 0.1
+    done
+    kill "$server" 2>/dev/null || true
+    wait "$server" 2>/dev/null || true
+    [[ -n "$fetched" ]] || { rm -f "$raw"; echo "ttyd shim: could not fetch ttyd's page" >&2; exit 1; }
+    # In every width provider: charProperties(e = code point, t = previous
+    # character's properties) ends by packing (width i, joins r). Before that,
+    # make a joining U+FE0F (65039) two cells wide.
+    patched="$(perl -0pe '
+        $n += s/(charProperties\(e,t\)\{let i=this\.wcwidth\(e\),r=0===i&&0!==t;if\(r\)\{const e=[A-Za-z]\.UnicodeService\.extractWidth\(t\);0===e\?r=!1:e>i&&\(i=e\)\})(return )/$1if(r&&65039===e)i=2;$2/g;
+        END { print STDERR $n + 0 }' "$raw" 2>"$raw.count" >"$raw.html"; cat "$raw.count")"
+    rm -f "$raw" "$raw.count"
+    if [[ "$patched" -lt 1 ]]; then
+        rm -f "$raw.html"
+        echo "ttyd shim: ttyd $version serves an xterm.js this patch does not know; update scripts/demo-video/ttyd-shim/ttyd" >&2
+        exit 1
+    fi
+    mv "$raw.html" "$INDEX"
+fi
+
+exec "$REAL" -I "$INDEX" "$@"

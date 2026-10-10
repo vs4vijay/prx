@@ -1,0 +1,11 @@
+{"type":"thread.started","thread_id":"0199a213-81c0-7800-8aa1-bbab2a035a53"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"**Fetching the PR diff**"}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"bash -lc 'gh pr diff 7 --repo org/repo'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"bash -lc 'gh pr diff 7 --repo org/repo'","aggregated_output":"diff --git a/src/a.rs b/src/a.rs\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Fetched the diff; reviewing."}}
+{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":640,"output_tokens":210}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_3","type":"file_change","changes":[{"path":"/tmp/prx/manifests/org_repo-7.json","kind":"add"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"Wrote the review manifest."}}
+{"type":"turn.completed","usage":{"input_tokens":500,"cached_input_tokens":384,"output_tokens":95}}

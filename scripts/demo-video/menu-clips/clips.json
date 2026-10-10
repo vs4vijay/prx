@@ -1,0 +1,10 @@
+{
+  "_": "Menu bar takes for the demo video. Geometry is in screen points (top-left origin) of the 1728x925 pt capture; the clips hold 2 pixels per point. build.sh scales them to `scale` stage pixels per point.",
+  "scale": 1.4,
+  "clips": {
+    "open":     { "file": "1-open.mp4",       "x": 965, "y": 0,   "w": 760,  "h": 925 },
+    "pr":       { "file": "2-pr-actions.mp4", "x": 0,   "y": 160, "w": 1725, "h": 600 },
+    "approve":  { "file": "3-approve.mp4",    "x": 475, "y": 55,  "w": 1250, "h": 705 },
+    "approved": { "file": "4-approved.mp4",   "x": 715, "y": 0,   "w": 1010, "h": 760 }
+  }
+}

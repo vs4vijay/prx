@@ -1,0 +1,198 @@
+# Release pipeline. Push a tag `vX.Y.Z` whose version matches Cargo.toml:
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag is checked against both crates' versions, the full CI gate (ci.yml)
+# runs on the tagged commit, then the release assets are built and published
+# as a GitHub release with generated notes:
+#
+#   prx-<tag>-<target>.tar.gz    CLI/daemon: macOS arm64 + x86_64, Linux x86_64 + arm64
+#   PRX-<tag>-macos-arm64.zip    PRX.app (menu bar UI + bundled CLI), ad-hoc signed
+#   SHA256SUMS
+#
+# A tag with a pre-release suffix (v0.2.0-rc.1) is published as a pre-release.
+# PRX.app is ad-hoc signed, not notarized: a downloaded copy is quarantined by
+# Gatekeeper until `xattr -dr com.apple.quarantine PRX.app` (see the release
+# notes footer).
+#
+# Everything runs on the repo's self-hosted runner: an Apple silicon Mac
+# (label prx-macos-arm64). The Apple targets build on the host (x86_64 as a
+# cross-compile); the Linux gnu targets build in docker containers on the
+# same machine, arm64 natively and x86_64 under emulation. With a single
+# runner the jobs execute one after another, so the ci job's warm target/
+# carries into the asset builds.
+name: release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches Cargo.toml
+    runs-on: [self-hosted, prx-macos-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag with crate versions
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          for manifest in Cargo.toml menubar/Cargo.toml; do
+            crate="$(sed -n 's/^version = "\(.*\)"/\1/p' "$manifest" | head -1)"
+            if [ "$crate" != "$tag" ]; then
+              echo "::error file=$manifest::tag $GITHUB_REF_NAME does not match version $crate"
+              exit 1
+            fi
+          done
+
+  ci:
+    name: CI
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  cli:
+    name: CLI (${{ matrix.target }})
+    needs: ci
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+          - target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
+          - target: x86_64-apple-darwin
+            platform: ''
+    runs-on: [self-hosted, prx-macos-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Put cargo and homebrew tools on PATH
+        run: echo "$HOME/.cargo/bin:/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      # Apple targets build on the host. A non-empty platform builds in the
+      # matching gnu container; a per-target cargo cache volume keeps the
+      # registry warm, and CARGO_TARGET_DIR aims container output at the same
+      # target/<triple>/ tree the host uses, without ownership clashes.
+      - name: Build
+        run: |
+          if [ -n "${{ matrix.platform }}" ]; then
+            docker run --rm --platform ${{ matrix.platform }} \
+              --volume "$GITHUB_WORKSPACE":/work --workdir /work \
+              --volume "prx-cargo-${{ matrix.target }}":/usr/local/cargo \
+              --env CARGO_TARGET_DIR=/work/target \
+              rust:1 \
+              cargo build --release -p prx --locked --target ${{ matrix.target }}
+          else
+            cargo build --release -p prx --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        run: |
+          name="prx-$GITHUB_REF_NAME-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/prx" README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          # The self-hosted runner reuses one workspace across jobs: without
+          # this, the staging dir leaks into the publish job's dist/ and
+          # breaks the checksum step.
+          rm -rf "dist/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # PRX.app plus the arm64 CLI tarball, both from the one release build that
+  # scripts/bundle-macos.sh does. The committed assets/AppIcon.iconset
+  # supplies the icon.
+  macos-app:
+    name: PRX.app (macOS arm64)
+    needs: ci
+    runs-on: [self-hosted, prx-macos-arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Put cargo and homebrew tools on PATH
+        run: echo "$HOME/.cargo/bin:/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      - run: scripts/bundle-macos.sh --no-install
+
+      - name: Package
+        run: |
+          [ "$(uname -m)" = "arm64" ] || { echo "::error::expected an arm64 runner"; exit 1; }
+          mkdir -p dist
+          ditto -c -k --keepParent --sequesterRsrc \
+            target/bundle.noindex/PRX.app "dist/PRX-$GITHUB_REF_NAME-macos-arm64.zip"
+          name="prx-$GITHUB_REF_NAME-aarch64-apple-darwin"
+          mkdir -p "dist/$name"
+          cp target/release/prx README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          rm -rf "dist/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-app
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: [cli, macos-app]
+    runs-on: [self-hosted, prx-macos-arm64]
+    permissions:
+      contents: write
+    steps:
+      # Same shared-workspace concern: drop anything an earlier build or a
+      # previous release left in dist/ so checksums and the upload cover
+      # exactly this tag's assets.
+      - name: Clear stale files
+        run: rm -rf dist
+
+      - name: Put homebrew tools on PATH
+        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > "$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes-footer.md <<'EOF'
+
+          ---
+          **macOS:** `PRX.app` is ad-hoc signed and not notarized. After unzipping, clear the
+          quarantine flag before the first launch: `xattr -dr com.apple.quarantine PRX.app`.
+          Verify downloads with `shasum -a 256 -c SHA256SUMS`.
+          EOF
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" --jq .body > notes.md
+          cat notes-footer.md >> notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "prx $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag "${prerelease[@]}"

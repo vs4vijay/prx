@@ -1,0 +1,116 @@
+[package]
+name = "prx-menubar"
+version = "0.1.0"
+edition = "2021"
+description = "prx macOS menu bar shell"
+license = "MIT"
+repository = "https://github.com/vs4vijay/prx"
+
+[dependencies]
+# kill(2) for the supervised daemon (supervisor.rs: SIGTERM on quit,
+# liveness probes); already in the lock via prx.
+libc = "0.2"
+# Watermark timestamps for the notification delta detector (banners.rs); the
+# lock already carries chrono via prx.
+chrono = "0.4"
+# NSApplication run loop + accessory activation policy (no Dock icon) — the
+# shell's main loop. Replaces winit, whose run-loop sources registered in
+# kCFRunLoopCommonModes fired inside AppKit's menu tracking and dismissed an
+# open menu on every poll (see mainloop.rs and rust-windowing/tao#1324).
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSRunningApplication",
+    # Multi-scale, appearance-aware tray icon (icon.rs, design D14): one
+    # NSImage with 1x/2x/3x NSBitmapImageReps set on the status-bar button.
+    "NSAppearance",
+    "NSBitmapImageRep",
+    "NSButton",
+    "NSControl",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
+    "NSResponder",
+    "NSStatusBarButton",
+    "NSStatusItem",
+    "NSView",
+    # Review panel (review_panel.rs, task 6.3): floating NSAlert whose
+    # accessory view holds a reference field, an engine pop-up, a "Post to
+    # GitHub" checkbox and a scrollable NSTextView.
+    "NSAlert",
+    "NSCell",
+    "NSMenu",
+    "NSMenuItem",
+    "NSPanel",
+    "NSPopUpButton",
+    "NSScrollView",
+    "NSText",
+    "NSTextField",
+    "NSTextView",
+    "NSWindow",
+    # PRX.app (tasks 6.3/6.5): the app delegate (reopen, terminate) and the
+    # ⌥ "Quit PRX (keep reviewing)" alternate's modifier mask.
+    "NSEvent",
+    # Browser picker (settings/browser_bridge.rs, design W1): https handler
+    # discovery + app icons rendered to 32px PNGs, and the "Other app…"
+    # chooser panel.
+    "NSWorkspace",
+    "NSGraphicsContext",
+    # In-menu SF Symbols (main.rs symbol_image, design-audit Part 0 round
+    # 2): tone colours for the hierarchical symbol configuration.
+    "NSColor",
+    "NSOpenPanel",
+    "NSSavePanel",
+] }
+objc2-foundation = { version = "0.3", features = [
+    "NSArray",
+    "NSGeometry",
+    "NSString",
+    # Settings window delegate (settings/mod.rs): windowWillClose:.
+    "NSNotification",
+    # Single instance (instance.rs, design A2): a second launch posts
+    # com.prx.app.open-window to the running app.
+    "NSDistributedNotificationCenter",
+    "NSDictionary",
+    # Browser picker: app URLs, bundle IDs, PNG data.
+    "NSURL",
+    "NSBundle",
+    "NSData",
+] }
+# PRX.app posts its own banners (notify_center.rs, design A7) so macOS shows
+# "PRX" as the sender; block2 carries the completion-handler blocks.
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "bitflags",
+    "block2",
+    "UNNotification",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationSettings",
+    "UNNotificationSound",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
+block2 = "0.6"
+# CFRunLoopSource for the default-mode-only main-thread queue (mainloop.rs).
+core-foundation = "0.9"
+muda = "0.21"
+prx = { path = ".." }
+# Current-thread runtime + time driver for the poller thread's
+# DaemonClient::discover()/get_status() calls (prx enables tokio/full, so
+# this unifies with the workspace's tokio).
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+tray-icon = "0.26"
+# Settings window (settings.rs, design D6): a WKWebView hosted in our own
+# objc2 NSWindow — no tao, no os-webview (Linux GTK) features.
+wry = { version = "0.57", default-features = false }
+# Hands our NSWindow's content view to wry as the webview parent.
+raw-window-handle = "0.6"
+# Settings bridge wire format (settings/bridge.rs); all already in the lock
+# via prx.
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Browser picker icons (PNG → base64 for the page); already in the lock.
+base64 = "0.22"

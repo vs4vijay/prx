@@ -1,0 +1,134 @@
+#!/bin/sh
+# Fake coding agent for prx integration tests (the "agent analyzes" side of
+# the A1-A3 architecture). It writes a canned review manifest to the path prx
+# communicates via $PRX_MANIFEST_PATH and prints optional diagnostics.
+#
+# Environment:
+#   FAKE_AGENT_MANIFEST       file whose contents are copied to $PRX_MANIFEST_PATH
+#   FAKE_AGENT_MANIFEST_JSON  literal manifest text written to $PRX_MANIFEST_PATH
+#                             (overrides FAKE_AGENT_MANIFEST)
+#   FAKE_AGENT_SESSION        if set, prints "prx-session: <value>" on stdout
+#   FAKE_AGENT_SLEEP          seconds to sleep before finishing (timeout tests;
+#                             prx must kill the process)
+#   FAKE_AGENT_EXIT           exit code after writing (default 0)
+#   FAKE_AGENT_PROMPT_OUT     file receiving the prompt the agent was given
+#                             (argv when {{PROMPT}} was substituted, stdin
+#                             when the args contain "-")
+#   FAKE_AGENT_RUNS_LOG       if set, each run appends "resume <id>" (argv
+#                             carried `--resume <id>`) or "fresh" to this file
+#   FAKE_AGENT_FAIL_RESUME    if set, a run carrying `--resume` exits 3 before
+#                             writing anything (a rejected/expired session)
+#   FAKE_AGENT_STDOUT         if set, printed on stdout after the session line
+#                             (e.g. a JSON document reporting token usage)
+#   FAKE_AGENT_BRIEF          if set, spliced into the written manifest as its
+#                             optional `brief` field (design B2; plain text
+#                             without quotes or backslashes)
+#   FAKE_AGENT_MUTEX_DIR      if set, serialize agent runs through a lock dir
+#                             under this path and append start/end nanos to
+#                             $FAKE_AGENT_MUTEX_DIR/timeline.log (used to
+#                             assert max_concurrent_reviews semantics)
+#
+# The manifest destination is $PRX_MANIFEST_PATH; PRX_PR_NUMBER / PRX_REPO are
+# also set by prx for assertions.
+#
+# Free-form prompt runs (the on-demand brief, design B2; formerly the
+# executive summary) carry no $PRX_MANIFEST_PATH. They touch none of the
+# review knobs above and use:
+#   FAKE_AGENT_SUMMARY            text printed on stdout (unset: empty reply)
+#   FAKE_AGENT_SUMMARY_EXIT       exit code (default 0)
+#   FAKE_AGENT_SUMMARY_SLEEP      seconds to sleep first (timeout tests)
+#   FAKE_AGENT_SUMMARY_PROMPT_OUT file receiving the brief prompt
+#   FAKE_AGENT_SUMMARY_RUNS_LOG   if set, each such run appends "brief"
+
+set -u
+
+if [ -z "${PRX_MANIFEST_PATH:-}" ]; then
+  if [ -n "${FAKE_AGENT_SUMMARY_RUNS_LOG:-}" ]; then
+    echo "brief" >> "$FAKE_AGENT_SUMMARY_RUNS_LOG"
+  fi
+  if [ -n "${FAKE_AGENT_SUMMARY_PROMPT_OUT:-}" ]; then
+    if [ "$#" -eq 0 ] || [ "${1:-}" = "-" ]; then
+      cat > "$FAKE_AGENT_SUMMARY_PROMPT_OUT"
+    else
+      printf '%s\n' "$*" > "$FAKE_AGENT_SUMMARY_PROMPT_OUT"
+    fi
+  fi
+  if [ -n "${FAKE_AGENT_SUMMARY_SLEEP:-}" ]; then
+    sleep "$FAKE_AGENT_SUMMARY_SLEEP"
+  fi
+  if [ -n "${FAKE_AGENT_SUMMARY:-}" ]; then
+    printf '%s\n' "$FAKE_AGENT_SUMMARY"
+  fi
+  exit "${FAKE_AGENT_SUMMARY_EXIT:-0}"
+fi
+
+if [ -n "${FAKE_AGENT_PROMPT_OUT:-}" ]; then
+  if [ "$#" -eq 0 ] || [ "${1:-}" = "-" ]; then
+    # Prompt arrived on stdin (or not at all).
+    cat > "$FAKE_AGENT_PROMPT_OUT"
+  else
+    # Prompt was substituted into the argv.
+    printf '%s\n' "$*" > "$FAKE_AGENT_PROMPT_OUT"
+  fi
+fi
+
+resumed=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--resume" ]; then
+    resumed="$arg"
+  fi
+  prev="$arg"
+done
+if [ -n "${FAKE_AGENT_RUNS_LOG:-}" ]; then
+  if [ -n "$resumed" ]; then
+    echo "resume $resumed" >> "$FAKE_AGENT_RUNS_LOG"
+  else
+    echo "fresh" >> "$FAKE_AGENT_RUNS_LOG"
+  fi
+fi
+if [ -n "$resumed" ] && [ -n "${FAKE_AGENT_FAIL_RESUME:-}" ]; then
+  echo "fake-agent: no conversation found with session ID $resumed" >&2
+  exit 3
+fi
+
+if [ -n "${FAKE_AGENT_MUTEX_DIR:-}" ]; then
+  mkdir -p "${FAKE_AGENT_MUTEX_DIR}"
+  n=0
+  until mkdir "${FAKE_AGENT_MUTEX_DIR}/lock" 2>/dev/null; do
+    n=$((n + 1))
+    if [ "$n" -gt 250 ]; then
+      echo "fake-agent: could not acquire the mutex lock" >&2
+      exit 1
+    fi
+    sleep 0.02
+  done
+  printf 'start %s\n' "$(date +%s%N)" >> "${FAKE_AGENT_MUTEX_DIR}/timeline.log"
+  sleep "${FAKE_AGENT_SLEEP:-0}"
+  printf 'end %s\n' "$(date +%s%N)" >> "${FAKE_AGENT_MUTEX_DIR}/timeline.log"
+  rmdir "${FAKE_AGENT_MUTEX_DIR}/lock"
+elif [ -n "${FAKE_AGENT_SLEEP:-}" ]; then
+  sleep "$FAKE_AGENT_SLEEP"
+fi
+
+if [ -n "${FAKE_AGENT_SESSION:-}" ]; then
+  echo "prx-session: ${FAKE_AGENT_SESSION}"
+fi
+
+if [ -n "${FAKE_AGENT_STDOUT:-}" ]; then
+  printf '%s\n' "$FAKE_AGENT_STDOUT"
+fi
+
+if [ -n "${PRX_MANIFEST_PATH:-}" ]; then
+  if [ -n "${FAKE_AGENT_MANIFEST_JSON:-}" ]; then
+    printf '%s' "$FAKE_AGENT_MANIFEST_JSON" > "$PRX_MANIFEST_PATH"
+  elif [ -n "${FAKE_AGENT_MANIFEST:-}" ]; then
+    cp "$FAKE_AGENT_MANIFEST" "$PRX_MANIFEST_PATH"
+  fi
+  if [ -n "${FAKE_AGENT_BRIEF:-}" ] && [ -f "$PRX_MANIFEST_PATH" ]; then
+    awk -v b="$FAKE_AGENT_BRIEF" '!done && sub(/\{/, "{\"brief\":\"" b "\",") { done = 1 } { print }' \
+      "$PRX_MANIFEST_PATH" > "$PRX_MANIFEST_PATH.tmp" && mv "$PRX_MANIFEST_PATH.tmp" "$PRX_MANIFEST_PATH"
+  fi
+fi
+
+exit "${FAKE_AGENT_EXIT:-0}"

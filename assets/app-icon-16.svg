@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" role="img" aria-labelledby="title">
+  <title id="title">PRX app icon, pixel-hinted 16 px master (Verdict X)</title>
+  <!-- Drawn on the 16 px grid: heavier strokes, a wider gap, an opaque counter-stroke tint
+       and a simplified squircle, so the mark stays crisp where the 1024 master would blur.
+       Used for icon_16x16.png. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="1" x2="0" y2="15" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4590FC"/>
+      <stop offset="1" stop-color="#175DCF"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="1" x2="0" y2="15" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.35"/>
+      <stop offset="0.3" stop-color="#FFFFFF" stop-opacity="0"/>
+      <stop offset="1" stop-color="#001A4D" stop-opacity="0.25"/>
+    </linearGradient>
+    <clipPath id="clip"><path d="M 5.82 1 L 10.18 1 C 11.57 1 12.26 1 12.89 1.21 L 13.01 1.24 C 13.83 1.53 14.47 2.17 14.76 2.99 L 14.79 3.11 C 15 3.74 15 4.43 15 5.82 L 15 10.18 C 15 11.57 15 12.26 14.79 12.89 L 14.76 13.01 C 14.47 13.83 13.83 14.47 13.01 14.76 L 12.89 14.79 C 12.26 15 11.57 15 10.18 15 L 5.82 15 C 4.43 15 3.74 15 3.11 14.79 L 2.99 14.76 C 2.17 14.47 1.53 13.83 1.24 13.01 L 1.21 12.89 C 1 12.26 1 11.57 1 10.18 L 1 5.82 C 1 4.43 1 3.74 1.21 3.11 L 1.24 2.99 C 1.53 2.17 2.17 1.53 2.99 1.24 L 3.11 1.21 C 3.74 1 4.43 1 5.82 1 Z"/></clipPath>
+    <filter id="drop" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="0.45" stdDeviation="0.35" flood-color="#000000" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+  <path d="M 5.82 1 L 10.18 1 C 11.57 1 12.26 1 12.89 1.21 L 13.01 1.24 C 13.83 1.53 14.47 2.17 14.76 2.99 L 14.79 3.11 C 15 3.74 15 4.43 15 5.82 L 15 10.18 C 15 11.57 15 12.26 14.79 12.89 L 14.76 13.01 C 14.47 13.83 13.83 14.47 13.01 14.76 L 12.89 14.79 C 12.26 15 11.57 15 10.18 15 L 5.82 15 C 4.43 15 3.74 15 3.11 14.79 L 2.99 14.76 C 2.17 14.47 1.53 13.83 1.24 13.01 L 1.21 12.89 C 1 12.26 1 11.57 1 10.18 L 1 5.82 C 1 4.43 1 3.74 1.21 3.11 L 1.24 2.99 C 1.53 2.17 2.17 1.53 2.99 1.24 L 3.11 1.21 C 3.74 1 4.43 1 5.82 1 Z" fill="url(#bg)" filter="url(#drop)"/>
+  <path d="M 5.82 1 L 10.18 1 C 11.57 1 12.26 1 12.89 1.21 L 13.01 1.24 C 13.83 1.53 14.47 2.17 14.76 2.99 L 14.79 3.11 C 15 3.74 15 4.43 15 5.82 L 15 10.18 C 15 11.57 15 12.26 14.79 12.89 L 14.76 13.01 C 14.47 13.83 13.83 14.47 13.01 14.76 L 12.89 14.79 C 12.26 15 11.57 15 10.18 15 L 5.82 15 C 4.43 15 3.74 15 3.11 14.79 L 2.99 14.76 C 2.17 14.47 1.53 13.83 1.24 13.01 L 1.21 12.89 C 1 12.26 1 11.57 1 10.18 L 1 5.82 C 1 4.43 1 3.74 1.21 3.11 L 1.24 2.99 C 1.53 2.17 2.17 1.53 2.99 1.24 L 3.11 1.21 C 3.74 1 4.43 1 5.82 1 Z" fill="none" stroke="url(#edge)" stroke-width="0.8" clip-path="url(#clip)"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <g stroke="#C2D9FF" stroke-width="1.45">
+      <path d="M 4.5 4.5 L 6.93 6.93"/>
+      <path d="M 10.29 10.29 L 11.5 11.5"/>
+    </g>
+    <path d="M 3.75 8.25 L 6.5 11 L 12 4.75" stroke="#FFFFFF" stroke-width="1.6"/>
+  </g>
+</svg>

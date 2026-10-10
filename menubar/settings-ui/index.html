@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Local and unprivileged (settings-app spec): only embedded assets load,
+       and the page can make no network requests at all — every daemon call
+       goes through window.prxBridge to the hosting process. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self' prx:; style-src 'self' prx:; img-src 'self' prx: data:; font-src 'self' prx:; connect-src 'none'; form-action 'none'; frame-src 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PRX</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <button type="button" id="skip" class="skip-link">Skip to page content</button>
+  <aside id="sidebar">
+    <p class="brand"><span class="brand-mark" id="brand-mark"></span>PRX</p>
+    <nav id="nav" aria-label="Pages"></nav>
+    <p id="daemon" class="daemon" role="status"></p>
+  </aside>
+  <div id="main">
+    <main id="page" tabindex="-1"></main>
+    <footer id="savebar">
+      <div class="savebar-text">
+        <p id="save-status" class="status" role="status" aria-live="polite"></p>
+        <p id="save-note" class="note" hidden></p>
+      </div>
+      <button type="button" id="revert" class="btn" disabled>Revert</button>
+      <button type="button" id="save" class="btn primary" disabled>Save <kbd>⌘S</kbd></button>
+    </footer>
+  </div>
+  <script src="bridge.js"></script>
+  <script src="icons.js"></script>
+  <script src="fields.js"></script>
+  <script src="cron.js"></script>
+  <script src="schema.js"></script>
+  <script src="form.js"></script>
+  <script src="app-section.js"></script>
+  <script src="pages-defaults.js"></script>
+  <script src="pages-messages.js"></script>
+  <script src="pages-repos.js"></script>
+  <script src="pages-misc.js"></script>
+  <script src="overview.js"></script>
+  <script src="brief-card.js"></script>
+  <script src="chart.js"></script>
+  <script src="pages-dashboard.js"></script>
+  <script src="pages-prs.js"></script>
+  <script src="pages-history.js"></script>
+  <script src="pages-usage.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 98 18" width="196" height="36" role="img" aria-labelledby="t d">
+  <title id="t">PRX menu-bar template glyphs: idle, attention, reviewing, paused/stopped, offline</title>
+  <desc id="d">Master for menubar/src/icon.rs (which mirrors these coordinates; a unit test pins them). One 18x18 pt group per state, laid out 20 pt apart. Black on transparent: the app hands macOS a template image, so the system tints it for light, dark, and tinted menu bars; no state uses colour. States differ by shape: idle has the full counter-stroke; every other state replaces its lower segment with one badge in the bottom-right 8x8 pt corner (solid dot, three dots, pause bars, slashed ring), and the mark is knocked out 1 pt around the badge. The attention COUNT is not part of the glyph: the app sets it as the status item's title, in the menu bar font, right of the glyph. Mark geometry: the 24-grid Verdict X mapped by p' = 9 + (p - 12) * 0.8; check stroke 1.7 pt, counter-stroke 1.5 pt.</desc>
+  <g id="idle" transform="translate(0 0)">
+    <title>Idle: the Verdict X (check + interrupted counter-stroke).</title>
+    <g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round"><path d="M 3.24 3.24 L 7.56 7.56" stroke-width="1.5"/><path d="M 11.56 11.56 L 14.92 14.92" stroke-width="1.5"/><path d="M 3.08 10.12 L 6.52 13.56 L 15.08 3.08" stroke-width="1.7"/></g>
+  </g>
+  <g id="attention" transform="translate(20 0)">
+    <title>Attention: a solid dot (the count is the status item's title, beside the glyph).</title>
+    <defs><mask id="clr-attention" maskUnits="userSpaceOnUse" x="0" y="0" width="18" height="18"><rect width="18" height="18" fill="#fff"/><circle cx="14" cy="14" r="5" fill="#000"/></mask></defs><g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" mask="url(#clr-attention)"><path d="M 3.24 3.24 L 7.56 7.56" stroke-width="1.5"/><path d="M 3.08 10.12 L 6.52 13.56 L 15.08 3.08" stroke-width="1.7"/></g><circle cx="14" cy="14" r="3.25" fill="#000" class="attention"/>
+  </g>
+  <g id="reviewing" transform="translate(40 0)">
+    <title>Reviewing: three dots (in progress), count-free.</title>
+    <defs><mask id="clr-reviewing" maskUnits="userSpaceOnUse" x="0" y="0" width="18" height="18"><rect width="18" height="18" fill="#fff"/><circle cx="14" cy="14" r="5" fill="#000"/></mask></defs><g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" mask="url(#clr-reviewing)"><path d="M 3.24 3.24 L 7.56 7.56" stroke-width="1.5"/><path d="M 3.08 10.12 L 6.52 13.56 L 15.08 3.08" stroke-width="1.7"/></g><g fill="#000"><circle cx="11.2" cy="14" r="1.1"/><circle cx="14" cy="14" r="1.1"/><circle cx="16.8" cy="14" r="1.1"/></g>
+  </g>
+  <g id="paused" transform="translate(60 0)">
+    <title>Paused / stopped (a pause, or review mode off): pause bars.</title>
+    <defs><mask id="clr-paused" maskUnits="userSpaceOnUse" x="0" y="0" width="18" height="18"><rect width="18" height="18" fill="#fff"/><circle cx="14" cy="14" r="5" fill="#000"/></mask></defs><g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" mask="url(#clr-paused)"><path d="M 3.24 3.24 L 7.56 7.56" stroke-width="1.5"/><path d="M 3.08 10.12 L 6.52 13.56 L 15.08 3.08" stroke-width="1.7"/></g><g fill="#000"><rect x="11" y="11" width="2" height="6" rx="0.5"/><rect x="15" y="11" width="2" height="6" rx="0.5"/></g>
+  </g>
+  <g id="offline" transform="translate(80 0)">
+    <title>Offline: mark at 45% opacity + a slashed ring.</title>
+    <defs><mask id="clr-offline" maskUnits="userSpaceOnUse" x="0" y="0" width="18" height="18"><rect width="18" height="18" fill="#fff"/><circle cx="14" cy="14" r="5" fill="#000"/></mask></defs><g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" opacity="0.45" mask="url(#clr-offline)"><path d="M 3.24 3.24 L 7.56 7.56" stroke-width="1.5"/><path d="M 3.08 10.12 L 6.52 13.56 L 15.08 3.08" stroke-width="1.7"/></g><g fill="none" stroke="#000" stroke-width="1.25" stroke-linecap="round"><circle cx="14" cy="14" r="3.25"/><path d="M 11.7 11.7 L 16.3 16.3"/></g>
+  </g>
+</svg>

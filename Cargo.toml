@@ -1,0 +1,41 @@
+[package]
+name = "prx"
+version = "0.1.0"
+edition = "2021"
+description = "Local-first PR review lifecycle manager"
+license = "MIT"
+repository = "https://github.com/vs4vijay/prx"
+
+# Workspace root: `prx` (daemon/CLI core, GUI-free) plus the macOS menu bar shell.
+# resolver 2 matches the edition-2021 members (avoids v1 feature unification).
+[workspace]
+members = ["menubar"]
+resolver = "2"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+cron = "0.12"
+dirs = "7"
+glob = "0.3"
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "tokio"] }
+rand = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+unicode-width = "0.2"
+
+# Process liveness checks for the single-instance pid guard (A16).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Placeholder PRX app icon used by scripts/bundle-macos.sh until the real
+       icon (assets/app-icon.svg, OpenSpec task 7.2) exists: the current
+       "interrupted loop" mark on a macOS-shaped tile (824 px body, 100 px
+       margins). -->
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3F3F46"/>
+      <stop offset="1" stop-color="#18181B"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#tile)"/>
+  <g transform="translate(224 224) scale(24)" fill="none" stroke="#FAFAFA"
+     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 15.80 20.15 A 9 9 0 1 1 19.09 6.46"/>
+    <path d="M 11.2 14.4 L 17.48 17.48 L 22.17 8.65" stroke="#4ADE80" stroke-width="3.0"/>
+  </g>
+</svg>
