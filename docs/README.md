@@ -8,7 +8,7 @@ request read-only, and posts the result itself. Only you approve. New here? Read
 
 | Page | What it covers |
 |------|----------------|
-| [Install](getting-started/install.md) | Release downloads, building from source, PRX.app |
+| [Install](getting-started/install.md) | Download PRX.app or the CLI from a release, the macOS quarantine step, first launch, updating, uninstalling |
 | [Quickstart](getting-started/quickstart.md) | From `prx init` to a running daemon |
 | [Your first review](getting-started/first-review.md) | What happens to one PR, step by step |
 
@@ -54,6 +54,7 @@ request read-only, and posts the result itself. Only you approve. New here? Read
 ## Help and contributing
 
 - [Troubleshooting](troubleshooting.md)
-- [Development](development.md): building, the test tiers, releasing
+- [Development](development.md): [building from source](development.md#building-from-source),
+  the test tiers, releasing
 - [CONTRIBUTING.md](../CONTRIBUTING.md), [AGENTS.md](../AGENTS.md), [SECURITY.md](../SECURITY.md)
 - [Internal design notes](internal/README.md): historical, partly stale

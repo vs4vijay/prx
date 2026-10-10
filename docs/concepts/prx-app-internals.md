@@ -22,9 +22,12 @@ on the default case-insensitive volume would be the same file as `MacOS/PRX`). `
 macOS 12 as the minimum; the version comes from `cargo metadata`. The icon is rendered from
 `assets/app-icon.svg` with `rsvg-convert` (`brew install librsvg`), else a committed
 `assets/AppIcon.iconset`, else a placeholder. The app is ad-hoc signed (`codesign -s -`), which is
-fine for the machine that built it; copied to another Mac it trips Gatekeeper (no notarization).
+fine for the machine that built it; a copy downloaded to another Mac is quarantined and trips
+Gatekeeper (no notarization) until the flag is
+[cleared](../getting-started/install.md#clear-the-quarantine-flag).
 `cargo install --path .` keeps working for headless, CLI-only use, and `cargo run -p prx-menubar`
-still runs the UI from a checkout (it supervises the `prx` next to it in `target/`).
+still runs the UI from a checkout (it supervises the `prx` next to it in `target/`); see
+[Building from source](../development.md#building-from-source).
 
 ## One app, two processes
 

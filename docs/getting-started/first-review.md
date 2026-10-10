@@ -67,7 +67,8 @@ prx daemon start
 ```
 
 The daemon polls on an interval, applies cooldowns, queues reviews, sends notifications, and
-serves the CLI and PRX.app. From here:
+serves the CLI and PRX.app. If PRX.app is running, it has already started the daemon and this
+command only tells you so. From here:
 
 - [Review schedule](../guides/schedule.md) limits when reviews run; [Pausing](../guides/pausing.md)
   holds them for a while.

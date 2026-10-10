@@ -13,20 +13,75 @@ A Cargo workspace with two crates:
 - `prx-menubar` (`menubar/`): PRX.app, the macOS menu bar item and window. Its settings pages are
   plain JavaScript under `menubar/settings-ui/`, with no npm dependencies and no build step.
 
-## Build and run
+## Building from source
+
+Users install prx from a release download; see [Install](getting-started/install.md). Build from
+source to work on prx, to run an unreleased version, or on a platform the releases do not cover:
+PRX.app on an Intel Mac, or the CLI on a Linux with a glibc older than the release binaries need.
+
+You need a stable Rust toolchain (on macOS, with the Xcode command line tools) and a checkout:
 
 ```bash
-cargo build                       # the prx binary: target/debug/prx
-cargo run -- status               # run the CLI from a checkout
-cargo run -p prx-menubar          # macOS: run the app UI (supervises the prx next to it in target/)
-scripts/bundle-macos.sh           # macOS: build, sign ad hoc, and install PRX.app
+git clone https://github.com/vs4vijay/prx
+cd prx
 ```
+
+To run prx itself you also need what every user needs: the GitHub CLI (`gh`), signed in, and a
+coding-agent CLI or an LLM API key.
+
+### The CLI and daemon
+
+```bash
+cargo build                       # a debug build: target/debug/prx
+cargo run -- status               # run the CLI from the checkout
+cargo install --path .            # a release build, installed as ~/.cargo/bin/prx
+```
+
+`cargo install --path .` gives you a `prx` on your `PATH` (Cargo's bin directory,
+`~/.cargo/bin`). It is all a headless, CLI-only machine needs, Mac or Linux. If you register
+autostart from a build, [Autostart](guides/autostart.md#which-binary-gets-registered) explains
+which binary path is recorded.
 
 To try prx without touching your real setup, point it at a scratch home:
 
 ```bash
 PRX_CONFIG=/tmp/prx/config.yml PRX_DATA_DIR=/tmp/prx/data cargo run -- init
 ```
+
+### PRX.app (macOS)
+
+```bash
+cargo run -p prx-menubar          # run the app UI from the checkout
+```
+
+This runs the UI without a bundle; it supervises the `prx` binary next to it in `target/`.
+
+`scripts/bundle-macos.sh` builds the real app bundle. It needs no Apple developer account: it
+makes a release build of the workspace, assembles `PRX.app`, and signs it ad hoc.
+
+```bash
+scripts/bundle-macos.sh --no-install         # build only: <target>/bundle.noindex/PRX.app
+scripts/bundle-macos.sh                      # build, then install to ~/Applications
+scripts/bundle-macos.sh --install DIR        # build, then install to DIR (for example /Applications)
+open ~/Applications/PRX.app                  # or Spotlight / Finder: "PRX"
+```
+
+> **The default form replaces `~/Applications/PRX.app`.** Without `--no-install`, the script
+> deletes the `PRX.app` already in the install directory and copies the new build in its place.
+> If that is the PRX you use every day, you have just swapped it for your work in progress. Use
+> `--no-install` while developing, and quit a running PRX before you install over it.
+
+- `<target>` is Cargo's target directory (`target/`, or `CARGO_TARGET_DIR` when set). The
+  `.noindex` suffix keeps Spotlight from listing the build copy next to the installed one.
+- An app built on your own machine is not quarantined, so the
+  [quarantine step](getting-started/install.md#clear-the-quarantine-flag) that release downloads
+  need does not apply. Copied to another Mac, it does.
+- The app icon is rendered from `assets/app-icon.svg` with `rsvg-convert` when that is installed
+  (`brew install librsvg`); otherwise it comes from the icon set committed in `assets/`.
+- The script builds for the machine it runs on. The release zip is Apple silicon only, so this is
+  how to get PRX.app on an Intel Mac.
+- After installing, Settings → General in the app offers *Install command-line tool…* and *Open
+  at login*, as in a release install.
 
 ## The gate
 

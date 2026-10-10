@@ -14,6 +14,16 @@ Newest first. One entry per decision, in this format:
 What changed, why, and what to do differently from now on. Link the files or docs involved.
 ```
 
+### 2026-10-10: Install docs are download-first; building from source is a development topic
+
+"Install" in `README.md` and `docs/getting-started/install.md` now means what a user does:
+download a release asset, on macOS clear the quarantine flag, run it. Everything about cloning,
+`cargo install --path .`, and `scripts/bundle-macos.sh` lives in
+[Building from source](docs/development.md#building-from-source). From now on, keep build steps
+out of the install pages, and keep the quarantine step prominent wherever a macOS download is
+described, for as long as releases are not notarized. If the release assets or their names change
+in `.github/workflows/release.yml`, update the install page's asset table and commands with them.
+
 ### 2026-10-10: Demo dataset and media tooling
 
 All published screenshots, the demo video, and the GIF under `docs/media/` are generated from one
@@ -142,11 +152,16 @@ Other useful commands:
 ```bash
 cargo run -- <command>                               # run the CLI from a checkout
 cargo run -p prx-menubar                             # run the app UI (macOS)
-scripts/bundle-macos.sh [--no-install]               # build PRX.app
+scripts/bundle-macos.sh --no-install                 # build PRX.app, do not install it
 node menubar/settings-ui-tests/preview-server.js     # settings UI in a browser, fake daemon
 scripts/demo-sandbox.sh /tmp/prx-demo                # throwaway prx with fictional data
 /tmp/prx-demo/prx status                             # one command inside that sandbox
 ```
+
+Without `--no-install`, `scripts/bundle-macos.sh` replaces `~/Applications/PRX.app`, which may be
+the copy the user is running. Build instructions live in
+[Building from source](docs/development.md#building-from-source);
+[Install](docs/getting-started/install.md) is the user page and covers release downloads only.
 
 ## Testing approach
 
@@ -185,8 +200,10 @@ Do not commit or push unless asked.
 
 - **Helper path.** Inside PRX.app the CLI is `Contents/Helpers/prx`, not `Contents/MacOS/prx`:
   on a case-insensitive APFS volume that would be the same file as `Contents/MacOS/PRX`.
-- **Signing.** PRX.app is ad-hoc signed and not notarized. A downloaded copy is quarantined until
-  `xattr -dr com.apple.quarantine PRX.app`.
+- **Signing.** PRX.app is ad-hoc signed and not notarized. A copy downloaded with a browser is
+  quarantined and macOS refuses to open it until `xattr -dr com.apple.quarantine PRX.app`; the
+  same goes for a `prx` unpacked from a browser-downloaded tarball. The user-facing steps are in
+  [Install](docs/getting-started/install.md#clear-the-quarantine-flag).
 - **launchd PATH.** launchd plists written by `prx daemon install` snapshot the installing
   shell's `PATH`. Engines should be configured with absolute paths.
 - **Release tags.** A release tag `vX.Y.Z` must equal the version in both `Cargo.toml` and

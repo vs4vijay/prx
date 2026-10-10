@@ -113,27 +113,61 @@ More screenshots are in the guides, starting with [PRX.app](docs/guides/prx-app.
 
 ## Install
 
-You need the [GitHub CLI](https://cli.github.com/) signed in (`gh auth status`), and either a
-coding-agent CLI or an API key for an LLM API.
+prx is a download from the [latest release](https://github.com/vs4vijay/prx/releases/latest);
+there is nothing to compile. You need the [GitHub CLI](https://cli.github.com/) signed in
+(`gh auth status`), and either a coding-agent CLI (`pi`, `claude`, `codex`) or an API key for an
+LLM API.
 
-**From source**, with a stable Rust toolchain:
+### PRX.app (macOS 12 or later, Apple silicon)
+
+The menu bar app, with the CLI and the daemon inside. Download `PRX-v0.1.0-macos-arm64.zip` in a
+browser, or with the `gh` line here:
 
 ```bash
-git clone https://github.com/vs4vijay/prx
-cd prx
-cargo install --path .         # the prx CLI and daemon
-scripts/bundle-macos.sh        # macOS only: build PRX.app and install it to ~/Applications
+cd ~/Downloads
+gh release download --repo vs4vijay/prx --pattern 'PRX-*-macos-arm64.zip'
+ditto -x -k PRX-*-macos-arm64.zip .                     # unzip; or double-click the zip in Finder
+mv PRX.app /Applications/
+xattr -dr com.apple.quarantine /Applications/PRX.app    # needed before the first open, see below
+/Applications/PRX.app/Contents/Helpers/prx init         # writes ~/.config/prx/config.yml
+open /Applications/PRX.app                              # PRX appears in the menu bar
 ```
 
-**Prebuilt.** Tagged versions are published on the
-[releases page](https://github.com/vs4vijay/prx/releases) with CLI tarballs for macOS and Linux
-(arm64 and x86_64), a `PRX.app` zip for Apple silicon, and `SHA256SUMS`. If no release is listed
-there yet, build from source.
+> **Do not skip the `xattr` line.** PRX.app is not yet notarized by Apple, so macOS refuses to
+> open a copy downloaded with a browser, saying that Apple could not verify "PRX", or that "PRX"
+> is damaged. The app is fine: the command clears the download flag macOS is objecting to.
+> [More about this step](docs/getting-started/install.md#clear-the-quarantine-flag).
 
-PRX.app is ad-hoc signed and not notarized; a downloaded copy needs its quarantine flag cleared
-once. Details for every platform are in [Install](docs/getting-started/install.md).
+For a `prx` command in your terminal, open Settings → General in PRX and choose *Install
+command-line tool…*.
+
+### CLI and daemon (macOS and Linux)
+
+On an Intel Mac, on Linux, or without the app. The release has one tarball per platform,
+`prx-v0.1.0-<target>.tar.gz`:
+
+```bash
+target=aarch64-apple-darwin          # macOS, Apple silicon
+# target=x86_64-apple-darwin         # macOS, Intel
+# target=x86_64-unknown-linux-gnu    # Linux, x86_64
+# target=aarch64-unknown-linux-gnu   # Linux, arm64
+
+gh release download --repo vs4vijay/prx --pattern "prx-*-$target.tar.gz"
+tar -xzf prx-*-"$target".tar.gz
+xattr -dr com.apple.quarantine prx-*-"$target"         # macOS only
+mkdir -p ~/.local/bin
+install -m 755 prx-*-"$target"/prx ~/.local/bin/prx    # or any directory on your PATH
+prx --version
+```
+
+[Install](docs/getting-started/install.md) has the details: system requirements, checksums,
+updating, and uninstalling. To build prx yourself, see
+[Building from source](docs/development.md#building-from-source).
 
 ## Quickstart
+
+If you installed PRX.app, skip `prx init` (done above) and `prx daemon start` (the app starts the
+daemon). Watching a repository, reviewing, and approving can also be done from the app.
 
 ```bash
 prx init                            # write ~/.config/prx/config.yml
@@ -154,8 +188,7 @@ prx history                         # what was reviewed, merged, or failed
 prx insights                        # throughput, recurring blockers, effectiveness
 ```
 
-On macOS, `open ~/Applications/PRX.app` starts the daemon for you and puts the same controls in the
-menu bar. The [Quickstart](docs/getting-started/quickstart.md) and
+The [Quickstart](docs/getting-started/quickstart.md) and
 [Your first review](docs/getting-started/first-review.md) go through this step by step.
 
 ## Features
@@ -222,8 +255,9 @@ Linux.
 
 Bug reports and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) has the setup and
 the checks to run before you push; [AGENTS.md](AGENTS.md) has the project's invariants and
-conventions, for people and coding agents alike; [Development](docs/development.md) covers the
-test tiers, the release process, and how the screenshots and the demo video are regenerated.
+conventions, for people and coding agents alike; [Development](docs/development.md) covers
+building from source, the test tiers, the release process, and how the screenshots and the demo
+video are regenerated.
 
 ## License
 

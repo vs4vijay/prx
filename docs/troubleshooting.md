@@ -99,10 +99,42 @@ clears it.
   daemon is down, accept only `org/repo#N` and PR URLs.
 - A merged or closed PR is rejected with its state. The repo must be watched.
 
+## macOS will not open PRX.app or `prx`
+
+You downloaded PRX.app, opened it, and macOS stopped it with a message like one of these (the
+exact wording depends on the macOS version):
+
+- *"PRX" Not Opened. Apple could not verify "PRX" is free of malware that may harm your Mac or
+  compromise your privacy.*
+- *"PRX" can't be opened because Apple cannot check it for malicious software.*
+- *"PRX" cannot be opened because the developer cannot be verified.*
+- *"PRX" is damaged and can't be opened. You should move it to the Trash.*
+
+Or you downloaded the CLI, and running `prx` prints only `killed`.
+
+Nothing is damaged. This is Gatekeeper: PRX.app and `prx` are signed ad hoc and not notarized by
+Apple, and macOS refuses such a program while it carries the quarantine flag that browsers put on
+downloads. Close the dialog (*Done* or *Cancel*, not *Move to Trash*) and clear the flag:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/PRX.app     # the app, wherever you put it
+xattr -d com.apple.quarantine ~/.local/bin/prx           # a prx from a release tarball
+```
+
+Then open it again. For the app there is also System Settings → Privacy & Security → *Open
+Anyway*, which appears after a refused open; it is not offered for the "damaged" message. The
+step is needed again after each new download. See
+[Clear the quarantine flag](getting-started/install.md#clear-the-quarantine-flag) in the install
+guide.
+
 ## PRX.app
 
-- **macOS refuses to open a downloaded PRX.app.** It is ad-hoc signed and not notarized. Run
-  `xattr -dr com.apple.quarantine /Applications/PRX.app` once.
+- **macOS refuses to open a downloaded PRX.app** ("Apple could not verify", "is damaged"). See
+  [macOS will not open PRX.app or `prx`](#macos-will-not-open-prxapp-or-prx) above.
+- **The menu shows *Daemon restarting*, then *Daemon stopped*, on a new install.** There is no
+  config file yet, and the daemon does not start without one; `logs/daemon-stderr.log` says
+  ``config file not found … run `prx init` first``. Run
+  `/Applications/PRX.app/Contents/Helpers/prx init` (or `prx init`), then choose *Start daemon*.
 - **The menu shows *Daemon stopped*.** The app gave up after 5 daemon failures within 10 minutes.
   Choose *Show daemon log*, and check `logs/daemon-stderr.log` in the data directory for start-up
   errors. *Start daemon* tries again.

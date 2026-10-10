@@ -2,7 +2,8 @@
 
 `prx daemon install` registers prx to start at login; `prx daemon uninstall` removes the
 registration. Neither starts or stops anything right now. If the daemon cannot find `gh` or your
-agent after a login start, see [Troubleshooting](../troubleshooting.md).
+agent after a login start, see [Troubleshooting](../troubleshooting.md). When you remove prx,
+remove the registration first: see [Uninstall](../getting-started/install.md#uninstall).
 
 ## With PRX.app (macOS)
 
@@ -21,7 +22,8 @@ order: `--app <PATH>` (an absolute path to a PRX.app); the bundle containing the
 
 ## Headless (no app)
 
-Without a bundle — Linux, or a `cargo install`-only Mac — `prx daemon
+Without a bundle — Linux, or a Mac with only the CLI (from a release tarball or
+`cargo install`) — `prx daemon
 install` registers the daemon to start at login exactly as before. On macOS it writes a launchd plist to
 `~/Library/LaunchAgents/com.prx.daemon.plist` (`Label com.prx.daemon`, `RunAtLoad`); on Linux it
 writes a systemd

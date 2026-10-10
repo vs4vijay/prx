@@ -11,9 +11,13 @@ repositories.
 
 ## Install
 
-See [Install](../getting-started/install.md#prxapp-macos) for the release download and the
-build-from-source script. After the first launch, Settings → General offers *Open at login* and
-*Install command-line tool…*.
+See [Install](../getting-started/install.md#prxapp-macos): download the release zip, move
+`PRX.app` to Applications, and
+[clear the quarantine flag](../getting-started/install.md#clear-the-quarantine-flag) before the
+first open, or macOS refuses to open it. The daemon needs a config file, so run `prx init` once
+(the install page shows how before `prx` is on your `PATH`). After the first launch, Settings →
+General offers *Open at login* and *Install command-line tool…*. To build the app yourself, see
+[Building from source](../development.md#building-from-source).
 
 ## Launching
 

@@ -4,6 +4,10 @@ This walks from an installed `prx` to a first review. If you have not installed 
 [Install](install.md). You need the GitHub CLI (`gh`) authenticated, and either a coding-agent CLI
 (`pi`, `claude`, or `codex` work out of the box) or an [LLM API engine](../guides/engines.md).
 
+The commands below need `prx` on your `PATH`. If you installed PRX.app and `prx` is not found,
+choose *Install command-line tool…* under Settings → General in the app; see
+[The `prx` command](install.md#the-prx-command).
+
 ## Set up and review one PR
 
 ```bash
@@ -26,15 +30,18 @@ happens during a real one.
 
 ## With PRX.app (macOS)
 
-On macOS, build and install the app from a checkout (menu bar item + window, with the CLI and daemon inside):
+If you [installed PRX.app](install.md#prxapp-macos) (a menu bar item and a window, with the CLI
+and daemon inside), open it instead of running `prx daemon start`:
 
 ```bash
-scripts/bundle-macos.sh && open ~/Applications/PRX.app
+open /Applications/PRX.app
 ```
 
 PRX.app starts the daemon for you (or attaches to one that is already running), opens its window,
 and offers *Open at login* and *Install command-line tool…* under Settings → General — see
-[PRX.app](../guides/prx-app.md).
+[PRX.app](../guides/prx-app.md). It needs the config file that `prx init` writes; without one the
+daemon does not start and the menu shows *Daemon stopped*. Repositories can be added on the
+window's *Repos & Orgs* page as well as with `prx repos add`.
 
 ## Day to day
 
