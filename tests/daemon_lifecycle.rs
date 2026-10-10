@@ -282,6 +282,86 @@ fn daemon_start_surfaces_a_bad_config() {
     assert!(stdout_of(&out).contains("daemon not running"));
 }
 
+/// The first-run contract PRX.app relies on (v0.1.1): on a machine with no
+/// config, `prx::config::ensure_starter_config` (what the app calls before
+/// it spawns its daemon, and what `prx init` calls) writes a config the real
+/// daemon starts on — with nothing on PATH (no agent CLI, no `gh`) and an
+/// empty HOME. Without that call the daemon still refuses and points
+/// terminal users at `prx init`.
+#[test]
+fn daemon_starts_on_the_starter_config_with_no_setup_and_no_agent_cli() {
+    let home = TempDir::new("lc-firstrun-home");
+    let data = TempDir::new("lc-firstrun-data");
+    let config = home.child(".config/prx/config.yml");
+    let home_str = home.path().display().to_string();
+    let env = [("HOME", home_str.as_str())];
+    let run = |args: &[&str]| run_cli_isolated(&config, data.path(), args, None, &env);
+
+    // Before: no config, and the CLI-only start path says so.
+    assert!(!config.exists());
+    let out = run(&["daemon", "start", "--foreground"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr_of(&out).contains("run `prx init` first"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!config.exists(), "the daemon itself never creates a config");
+
+    // The app's first-launch step.
+    assert!(prx::config::ensure_starter_config(&config).unwrap());
+    let written = std::fs::read_to_string(&config).unwrap();
+
+    // After: the daemon starts and answers.
+    let out = run(&["daemon", "start"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    wait_for_file(
+        &data.child("daemon.port"),
+        Duration::from_secs(10),
+        true,
+        "port file",
+    );
+    let status = run(&["daemon", "status"]);
+    let stopped = run(&["daemon", "stop"]);
+    assert!(
+        stdout_of(&status).contains("daemon running"),
+        "{}",
+        stdout_of(&status)
+    );
+    assert!(stopped.status.success(), "{}", stderr_of(&stopped));
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        written,
+        "starting the daemon leaves the config as written"
+    );
+}
+
+/// An invalid config is never replaced by the starter one, and the daemon
+/// keeps reporting it as a parse error rather than a missing file.
+#[test]
+fn an_invalid_config_is_not_replaced_and_still_fails_the_start() {
+    let home = TempDir::new("lc-invalid-home");
+    let data = TempDir::new("lc-invalid-data");
+    let config = home.child("config.yml");
+    let broken = "defaults: [not, a, map\n";
+    write_file(&config, broken);
+    assert!(!prx::config::ensure_starter_config(&config).unwrap());
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), broken);
+    let home_str = home.path().display().to_string();
+    let out = run_cli_isolated(
+        &config,
+        data.path(),
+        &["daemon", "start", "--foreground"],
+        None,
+        &[("HOME", home_str.as_str())],
+    );
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(err.contains("failed to parse config file"), "{err}");
+    assert!(!err.contains("prx init"), "{err}");
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), broken);
+}
+
 #[test]
 fn cli_review_falls_back_in_process_without_daemon() {
     let env = Env::new("lc-fallback", false);

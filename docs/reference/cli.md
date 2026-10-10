@@ -1,7 +1,8 @@
 # CLI reference
 
 ```
-prx init                          create config + data dirs, write the starter config
+prx init                          create config + data dirs, write the starter config (never
+                                  overwrites; PRX.app does this itself on a first launch)
 prx doctor                        self-check: config, gh binary + auth, agents, prompts, data dir
 prx repos add <org/repo>          add a repo to watch
 prx repos list                    show configured repos (effective agent/poll/skip rules)

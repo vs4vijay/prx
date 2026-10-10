@@ -1,6 +1,6 @@
 [package]
 name = "prx-menubar"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "prx macOS menu bar shell"
 license = "MIT"

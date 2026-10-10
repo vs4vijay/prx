@@ -1,8 +1,9 @@
 # Your first review
 
 This page follows one pull request through prx so you know what to expect before letting the
-daemon run on its own. It assumes you have done the [Quickstart](quickstart.md) setup
-(`prx init`, `prx repos add`, `prx doctor`).
+daemon run on its own. It assumes you have done the [Quickstart](quickstart.md) setup: a config
+file (`prx init`, or a first launch of PRX.app), a watched repository (`prx repos add`, or *Add a
+repo* in the app), and a clean `prx doctor`.
 
 ## 1. See what prx is tracking
 

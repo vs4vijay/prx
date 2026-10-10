@@ -722,12 +722,12 @@ fn cmd_init() -> Result<()> {
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
 
-    if config_path.exists() {
-        println!("config already exists: {}", config_path.display());
-    } else {
-        std::fs::write(&config_path, STARTER_CONFIG)
-            .with_context(|| format!("cannot write {}", config_path.display()))?;
+    // One definition of the default config, shared with PRX.app's first
+    // launch (`prx::config::ensure_starter_config`); never overwrites.
+    if prx::config::ensure_starter_config(&config_path)? {
         println!("wrote config: {}", config_path.display());
+    } else {
+        println!("config already exists: {}", config_path.display());
     }
 
     // Design F5: the review prompt is config text (`default` = built in),
@@ -1403,79 +1403,3 @@ fn cmd_config_set(key: &str, value: &str) -> Result<()> {
     println!("set {key} = {value}");
     Ok(())
 }
-
-// ------------------------------------------------------- starter assets
-
-const STARTER_CONFIG: &str = r#"# prx configuration
-# Global defaults below; per-repo entries under `repos:` override individual keys only.
-
-defaults:
-  engine: pi                         # key into `engines` (built-ins: pi, claude, codex)
-  poll_interval_minutes: 15          # poll cadence per repo (±10% jitter in the daemon)
-  cooldown:
-    before_first_review_minutes: 60  # anchored to the PR's GitHub creation time
-    between_re_reviews_minutes: 30   # anchored to new-commit detection time
-  review_prompt: default             # "default" (built in) or the prompt TEXT itself (a YAML
-                                     # block, `review_prompt: |`); overrides replace, and
-                                     # {{PARENT_PROMPT}} splices the default in
-  # extra_prompt: |                  # appended to every review prompt (unset = nothing)
-  #   Pay special attention to database migrations.
-  max_concurrent_reviews: 1
-  diff_max_files: 50                 # skip larger diffs with a too-large note
-  diff_max_lines: 4000
-  agent_timeout_seconds: 600         # wall-clock budget per agent run; killed on expiry
-  skip:
-    drafts: true                     # drafts are TRACKED under Skipped(draft), not invisible
-    authors: []                      # exact login match
-    labels: ["wip", "do-not-review"] # case-insensitive exact match
-    branches: []                     # glob patterns
-  notifications:                     # event → tier mapping (these keys ARE the event list)
-    on_new_pr: informational
-    on_review_complete_approved: informational
-    on_review_complete_blocking: urgent
-    on_new_commits: informational
-    on_re_review_triggered: informational
-    on_merged: silent
-    on_closed: silent
-    on_failure: urgent
-    on_skipped: silent
-  # comments:
-  #   inline: true                     # false keeps findings in the review body only
-  # brief:                            # (formerly executive_summary)
-  #   enabled: true                    # plain-language brief of what each PR does
-  #   timeout_seconds: 120
-  # auto_open: off                     # off | approved | blocking | both
-
-notification_tiers:
-  urgent:        { banner: true,  sound: Basso }
-  informational: { banner: true,  sound: null }
-  silent:        { banner: false, sound: null }
-
-# Optional engine overrides; built-in agent engines exist for pi, claude, codex.
-# engines:
-#   pi:
-#     type: agent
-#     command: pi
-#     args: ["--yes", "-p", "{{PROMPT}}"]
-#   cheap:
-#     type: llm_api
-#     provider: anthropic              # anthropic | openai | openai_compatible
-#     model: claude-haiku-4-5
-#     api_key_env: ANTHROPIC_API_KEY   # the variable's NAME; keys never go in this file
-
-# Menu bar ordering and grouping (global only; repos cannot override it).
-# menu:
-#   sort: created_desc                 # created_desc | created_asc | last_review_desc | key
-#   group_by: lifecycle                # lifecycle | repo | none
-
-# Per-repo overrides; only specify what differs from the defaults.
-repos: []
-# repos:
-#   - name: org/repo
-#     engine: claude
-#     poll_interval_minutes: 15
-#     cooldown:
-#       before_first_review_minutes: 30
-#     skip:
-#       authors: ["dependabot[bot]"]
-"#;

@@ -24,7 +24,7 @@ macOS 12 as the minimum; the version comes from `cargo metadata`. The icon is re
 `assets/AppIcon.iconset`, else a placeholder. The app is ad-hoc signed (`codesign -s -`), which is
 fine for the machine that built it; a copy downloaded to another Mac is quarantined and trips
 Gatekeeper (no notarization) until the flag is
-[cleared](../getting-started/install.md#clear-the-quarantine-flag).
+[cleared](../getting-started/install.md#step-2-allow-it-to-open).
 `cargo install --path .` keeps working for headless, CLI-only use, and `cargo run -p prx-menubar`
 still runs the UI from a checkout (it supervises the `prx` next to it in `target/`); see
 [Building from source](../development.md#building-from-source).
@@ -34,7 +34,9 @@ still runs the UI from a checkout (it supervises the `prx` next to it in `target
 The daemon stays a separate process (crash isolation: a WebView or
 AppKit fault never kills an in-flight review). On launch the app first looks for a running daemon
 (the CLI's `prx daemon start`, a launchd agent, another session) and **attaches** to it; only when
-none answers does it start `Contents/Helpers/prx daemon start --foreground` itself, with your
+none answers does it start `Contents/Helpers/prx daemon start --foreground` itself (first writing
+the default config when no config file exists, through the same library call as `prx init`; an
+existing file, valid or not, is left alone), with your
 login shell's `PATH` (so `gh` and agent CLIs resolve like in Terminal), logging to the usual daemon
 logs plus `logs/daemon-stderr.log` for start-up errors. A daemon the app started is supervised:
 if it exits non-zero (a crash, `kill -9`) it is restarted after 1 s, 2 s, 4 s, … (capped at 60 s)

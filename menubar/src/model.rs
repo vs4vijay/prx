@@ -1849,7 +1849,9 @@ mod tests {
 
     fn status(prs: Vec<StatusEntry>) -> StatusResponse {
         StatusResponse {
-            version: "0.1.0".to_string(),
+            // The app's own version: a daemon on another version adds the
+            // version-mismatch row, which these fixtures do not want.
+            version: APP_VERSION.to_string(),
             pid: 42,
             uptime_seconds: 7,
             in_flight: 0,

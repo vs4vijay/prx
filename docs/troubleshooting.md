@@ -124,20 +124,25 @@ xattr -d com.apple.quarantine ~/.local/bin/prx           # a prx from a release 
 Then open it again. For the app there is also System Settings → Privacy & Security → *Open
 Anyway*, which appears after a refused open; it is not offered for the "damaged" message. The
 step is needed again after each new download. See
-[Clear the quarantine flag](getting-started/install.md#clear-the-quarantine-flag) in the install
-guide.
+[Allow it to open](getting-started/install.md#step-2-allow-it-to-open) in the install guide.
 
 ## PRX.app
 
 - **macOS refuses to open a downloaded PRX.app** ("Apple could not verify", "is damaged"). See
   [macOS will not open PRX.app or `prx`](#macos-will-not-open-prxapp-or-prx) above.
-- **The menu shows *Daemon restarting*, then *Daemon stopped*, on a new install.** There is no
-  config file yet, and the daemon does not start without one; `logs/daemon-stderr.log` says
-  ``config file not found … run `prx init` first``. Run
-  `/Applications/PRX.app/Contents/Helpers/prx init` (or `prx init`), then choose *Start daemon*.
+- **The menu shows *Daemon restarting*, then *Daemon stopped*, on a new install of v0.1.0.**
+  PRX.app v0.1.0 does not create the config file, and the daemon does not start without one;
+  `logs/daemon-stderr.log` says ``config file not found … run `prx init` first``. From v0.1.1 the
+  app writes a default config on its first launch, so either
+  [update](getting-started/install.md#update), or stay on v0.1.0 and run
+  `/Applications/PRX.app/Contents/Helpers/prx init` once, then choose *Start daemon* in the menu.
+  On v0.1.1 or later the same two menu states mean something else: see the next entry.
 - **The menu shows *Daemon stopped*.** The app gave up after 5 daemon failures within 10 minutes.
   Choose *Show daemon log*, and check `logs/daemon-stderr.log` in the data directory for start-up
-  errors. *Start daemon* tries again.
+  errors. *Start daemon* tries again. A config file that does not parse or validate is a common
+  cause (`failed to parse config file …`, `configuration is invalid`): PRX.app creates a config
+  only when there is none, and never replaces or repairs one that exists, so fix the file (or
+  move it away to get a fresh default on the next start).
 - **The menu says the daemon and app versions differ.** An older daemon (from the CLI or a login
   item) is still running. Stop it with `prx daemon stop`, then choose *Start daemon* in the menu.
 - **No banners.** Check System Settings → Notifications → PRX, and

@@ -6,6 +6,8 @@
 //! --foreground` (PRX.app's `Contents/Helpers/prx`) with the login-shell
 //! `PATH` ([`crate::shellenv`]) and records the owned pid.
 //!
+//! - Before a spawn the app creates the default config when none exists
+//!   ([`ensure_first_run_config`]), so a first launch needs no `prx init`.
 //! - An owned daemon exiting non-zero (a crash, `kill -9`) is restarted with
 //!   exponential backoff (1 s, 2 s, 4 s, … capped at 60 s). After
 //!   [`MAX_FAILURES`] failures inside [`FAILURE_WINDOW`] the supervisor gives
@@ -242,6 +244,7 @@ impl Worker {
             return;
         };
         self.set_state(DaemonState::Starting);
+        ensure_first_run_config();
         match spawn_daemon(&prx) {
             Ok(child) => {
                 let pid = child.id();
@@ -348,6 +351,26 @@ pub fn bundled_prx() -> Option<PathBuf> {
     }
     let sibling = exe.parent()?.join("prx");
     sibling.is_file().then_some(sibling)
+}
+
+/// First launch: the daemon refuses to start without a config file, and an
+/// app user is never asked to run `prx init`. So before every spawn the app
+/// makes sure one exists, through the same library call `prx init` uses
+/// ([`prx::config::ensure_starter_config`]: one definition of the default
+/// config, non-interactive, and it never touches an existing file). An
+/// invalid existing config is therefore left alone and the daemon's own
+/// error stays visible ("Daemon stopped", "Show log"). A failure to write is
+/// logged and the spawn goes ahead, so the daemon reports the real problem.
+fn ensure_first_run_config() {
+    let path = prx::paths::config_path();
+    match prx::config::ensure_starter_config(&path) {
+        Ok(true) => eprintln!(
+            "prx-menubar: first run: no config found; wrote the default config to {}",
+            path.display()
+        ),
+        Ok(false) => {}
+        Err(error) => eprintln!("prx-menubar: cannot create the default config: {error}"),
+    }
 }
 
 /// Spawn `prx daemon start --foreground` detached from our process group,
@@ -491,7 +514,150 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("prx-supervisor-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::actions::tests::with_data_dir(&dir.clone(), move || supervise_in(&dir));
+        in_sandbox(&dir.clone(), move || supervise_in(&dir));
+    }
+
+    /// `PRX_DATA_DIR` and `PRX_CONFIG` both pointed into `dir` (the spawn
+    /// path now creates a missing config, which must never be the real
+    /// one), serialized with the other env-pointing tests.
+    fn in_sandbox<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
+        crate::actions::tests::with_data_dir(dir, || {
+            let previous = std::env::var("PRX_CONFIG").ok();
+            std::env::set_var("PRX_CONFIG", dir.join("config").join("config.yml"));
+            let out = f();
+            match previous {
+                Some(value) => std::env::set_var("PRX_CONFIG", value),
+                None => std::env::remove_var("PRX_CONFIG"),
+            }
+            out
+        })
+    }
+
+    fn sandbox(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("prx-firstrun-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A fake `prx` with the real daemon's start rule: exit 1 when the
+    /// config is missing or does not parse (here: lacks a `repos:` key),
+    /// otherwise run until SIGTERM.
+    fn config_checking_prx(dir: &Path) -> PathBuf {
+        let fake = dir.join("prx");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             [ -f \"$PRX_CONFIG\" ] || { echo 'config file not found' >&2; exit 1; }\n\
+             grep -q '^repos:' \"$PRX_CONFIG\" || { echo 'failed to parse config' >&2; exit 1; }\n\
+             trap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    /// The v0.1.0 bug: a first launch with no config left the daemon
+    /// crash-looping into "Daemon stopped". Now the app writes the default
+    /// config before the spawn, and the daemon comes up and stays up.
+    #[test]
+    fn first_launch_without_a_config_creates_one_and_the_daemon_stays_up() {
+        let dir = sandbox("fresh");
+        in_sandbox(&dir.clone(), move || {
+            let config = prx::paths::config_path();
+            assert!(config.starts_with(&dir) && !config.exists());
+            let fake = config_checking_prx(&dir);
+            let (tx, rx) = mpsc::channel();
+            let supervisor = Supervisor::spawn(Some(fake), move |s| {
+                let _ = tx.send(s);
+            });
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(20)).ok(),
+                Some(DaemonState::Starting)
+            );
+            let Some(DaemonState::Running { pid }) = rx.recv_timeout(Duration::from_secs(20)).ok()
+            else {
+                panic!("the daemon should be running");
+            };
+            // No crash follows: the fake exits at once without a config.
+            assert_eq!(
+                rx.recv_timeout(Duration::from_millis(1500)).ok(),
+                None,
+                "the daemon must stay up on the config the app created"
+            );
+            assert!(process_alive(pid));
+
+            // What was written is the `prx init` config, and it is valid.
+            assert_eq!(
+                std::fs::read_to_string(&config).unwrap(),
+                prx::config::STARTER_CONFIG
+            );
+            let loaded = prx::config::Config::load(&config).unwrap();
+            loaded.validate().unwrap();
+            assert!(loaded.repos.is_empty(), "first run watches nothing yet");
+
+            supervisor.shutdown(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn an_existing_config_is_left_untouched_by_a_launch() {
+        let dir = sandbox("existing");
+        in_sandbox(&dir.clone(), move || {
+            let config = prx::paths::config_path();
+            let mine = "# mine\nrepos:\n  - name: org/mine\n";
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, mine).unwrap();
+            let (tx, rx) = mpsc::channel();
+            let supervisor = Supervisor::spawn(Some(config_checking_prx(&dir)), move |s| {
+                let _ = tx.send(s);
+            });
+            loop {
+                let state = rx.recv_timeout(Duration::from_secs(20)).expect("state");
+                if matches!(state, DaemonState::Running { .. }) {
+                    break;
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), mine);
+            supervisor.shutdown(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// An invalid config is the user's to fix: the app must not replace it
+    /// with the default, and the failed start must stay visible.
+    #[test]
+    fn an_invalid_existing_config_is_not_replaced_and_the_failure_shows() {
+        let dir = sandbox("invalid");
+        in_sandbox(&dir.clone(), move || {
+            let config = prx::paths::config_path();
+            let broken = "defaults: [not, a, map\n";
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, broken).unwrap();
+            assert!(prx::config::Config::load(&config).is_err());
+            let (tx, rx) = mpsc::channel();
+            let supervisor = Supervisor::spawn(Some(config_checking_prx(&dir)), move |s| {
+                let _ = tx.send(s);
+            });
+            loop {
+                let state = rx.recv_timeout(Duration::from_secs(20)).expect("state");
+                if matches!(state, DaemonState::Restarting { .. }) {
+                    break;
+                }
+            }
+            // Through the restart that follows, too.
+            loop {
+                let state = rx.recv_timeout(Duration::from_secs(20)).expect("state");
+                if matches!(state, DaemonState::Restarting { failures: 2, .. }) {
+                    break;
+                }
+            }
+            assert_eq!(std::fs::read_to_string(&config).unwrap(), broken);
+            supervisor.shutdown(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     fn supervise_in(dir: &Path) {

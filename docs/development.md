@@ -74,7 +74,7 @@ open ~/Applications/PRX.app                  # or Spotlight / Finder: "PRX"
 - `<target>` is Cargo's target directory (`target/`, or `CARGO_TARGET_DIR` when set). The
   `.noindex` suffix keeps Spotlight from listing the build copy next to the installed one.
 - An app built on your own machine is not quarantined, so the
-  [quarantine step](getting-started/install.md#clear-the-quarantine-flag) that release downloads
+  [quarantine step](getting-started/install.md#step-2-allow-it-to-open) that release downloads
   need does not apply. Copied to another Mac, it does.
 - The app icon is rendered from `assets/app-icon.svg` with `rsvg-convert` when that is installed
   (`brew install librsvg`); otherwise it comes from the icon set committed in `assets/`.

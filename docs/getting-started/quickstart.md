@@ -6,12 +6,13 @@ This walks from an installed `prx` to a first review. If you have not installed 
 
 The commands below need `prx` on your `PATH`. If you installed PRX.app and `prx` is not found,
 choose *Install command-line tool…* under Settings → General in the app; see
-[The `prx` command](install.md#the-prx-command).
+[The `prx` command](install.md#the-prx-command). With PRX.app you can also skip the terminal:
+see [With PRX.app](#with-prxapp-macos) below.
 
 ## Set up and review one PR
 
 ```bash
-prx init                      # writes ~/.config/prx/config.yml (the review prompt is built in)
+prx init                      # writes ~/.config/prx/config.yml; not needed once PRX.app has run
 prx repos add org/repo        # watch a repository (inherits all defaults)
 prx doctor                    # verify config, gh binary + auth, engines, prompts, data dir
 prx status                    # see your open PRs (polls once; PRs enter "pending" with a cooldown)
@@ -23,6 +24,10 @@ prx status                    # now served by the daemon; insights/history too
 ```
 
 ![A terminal running prx status for every watched repository, prx brief for one pull request, and prx usage by week](../media/screenshots/cli.png)
+
+`prx init` never overwrites a config: if PRX.app (or an earlier `prx init`) already wrote one, it
+says `config already exists` and changes nothing. The review prompt is built in, so there is no
+prompt file to create.
 
 `--dry-run` is the safe way to see what prx would post: it runs the whole pipeline locally and
 writes nothing to GitHub or to prx's own state. See [First review](first-review.md) for what
@@ -39,9 +44,10 @@ open /Applications/PRX.app
 
 PRX.app starts the daemon for you (or attaches to one that is already running), opens its window,
 and offers *Open at login* and *Install command-line tool…* under Settings → General — see
-[PRX.app](../guides/prx-app.md). It needs the config file that `prx init` writes; without one the
-daemon does not start and the menu shows *Daemon stopped*. Repositories can be added on the
-window's *Repos & Orgs* page as well as with `prx repos add`.
+[PRX.app](../guides/prx-app.md). You do not run `prx init` either: on a first launch with no
+config file, PRX.app (v0.1.1 or later) writes the same default config that `prx init` does. The
+Dashboard then offers *Add a repo*; repositories can be added on the window's *Repos & Orgs* page
+as well as with `prx repos add`.
 
 ## Day to day
 

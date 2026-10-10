@@ -14,6 +14,26 @@ Newest first. One entry per decision, in this format:
 What changed, why, and what to do differently from now on. Link the files or docs involved.
 ```
 
+### 2026-10-11: PRX.app creates the default config on first launch (v0.1.1); install is three steps
+
+A fresh PRX.app v0.1.0 was dead on arrival: with no config file the daemon refused to start and
+the supervisor gave up with *Daemon stopped*, unless the user had run `prx init`. From v0.1.1 the
+app's supervisor calls `prx::config::ensure_starter_config` before it spawns the daemon
+(`menubar/src/supervisor.rs`, `ensure_first_run_config`). That function and `STARTER_CONFIG` live
+in `src/config.rs` and are also what `prx init` uses, so there is one definition of a default
+config. From now on:
+
+- Never tell an app user to run `prx init`. `prx init` remains the explicit setup step for
+  CLI-only use, and `prx daemon start` without a config still fails with ``run `prx init` first``.
+- `ensure_starter_config` only ever creates a missing file. It must not overwrite, repair, or
+  rewrite an existing config; an invalid one has to keep surfacing its own error.
+- The starter config has to load and validate with no agent CLI and no `gh` installed
+  (`tests/daemon_lifecycle.rs` checks this with an empty `PATH`).
+- Install docs for the app are three steps: get PRX.app (option 1 the Releases page, option 2 the
+  command line), one shared quarantine step in a `> [!IMPORTANT]` block, open it. Release asset
+  names carry the version, so there is no version-free `releases/latest/download/…` URL; the
+  command-line option uses `gh release download --pattern`.
+
 ### 2026-10-10: Install docs are download-first; building from source is a development topic
 
 "Install" in `README.md` and `docs/getting-started/install.md` now means what a user does:
@@ -90,7 +110,7 @@ maintainer first.
 ## Repo layout
 
 ```
-Cargo.toml            workspace root and the `prx` crate (v0.1.0)
+Cargo.toml            workspace root and the `prx` crate (v0.1.1)
 src/                  core crate: CLI, daemon, state machine, review pipeline, IPC API (no GUI)
   main.rs, cli.rs       entry point and clap command types
   daemon.rs, ipc.rs     background daemon; localhost API and the CLI's thin client
@@ -98,7 +118,7 @@ src/                  core crate: CLI, daemon, state machine, review pipeline, I
   review.rs, prompt.rs  review orchestration and briefs; prompt rendering and the output contract
   agent.rs, llm.rs      agent-CLI engines; LLM API engines
   github.rs             all GitHub I/O, through the `gh` CLI
-  config.rs, config_edit.rs   YAML config load/validate/merge; `prx config set|edit`
+  config.rs, config_edit.rs   YAML config load/validate/merge and the starter config; `prx config set|edit`
   history.rs, insights.rs, usage.rs   history log, analytics, token usage
   notify.rs, effects.rs, browser.rs, pause.rs, autostart.rs, discover.rs, status.rs,
   paths.rs, logging.rs  supporting modules
@@ -203,7 +223,11 @@ Do not commit or push unless asked.
 - **Signing.** PRX.app is ad-hoc signed and not notarized. A copy downloaded with a browser is
   quarantined and macOS refuses to open it until `xattr -dr com.apple.quarantine PRX.app`; the
   same goes for a `prx` unpacked from a browser-downloaded tarball. The user-facing steps are in
-  [Install](docs/getting-started/install.md#clear-the-quarantine-flag).
+  [Install](docs/getting-started/install.md#step-2-allow-it-to-open).
+- **First launch.** PRX.app writes the default config itself when none exists
+  (`ensure_first_run_config` in `menubar/src/supervisor.rs`), so no doc or message may ask an
+  app user to run `prx init`. Tests that start a `Supervisor` must point `PRX_CONFIG` as well as
+  `PRX_DATA_DIR` into a sandbox, or the spawn path would create a config in the real home.
 - **launchd PATH.** launchd plists written by `prx daemon install` snapshot the installing
   shell's `PATH`. Engines should be configured with absolute paths.
 - **Release tags.** A release tag `vX.Y.Z` must equal the version in both `Cargo.toml` and

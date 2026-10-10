@@ -8,8 +8,8 @@ request read-only, and posts the result itself. Only you approve. New here? Read
 
 | Page | What it covers |
 |------|----------------|
-| [Install](getting-started/install.md) | Download PRX.app or the CLI from a release, the macOS quarantine step, first launch, updating, uninstalling |
-| [Quickstart](getting-started/quickstart.md) | From `prx init` to a running daemon |
+| [Install](getting-started/install.md) | Get PRX.app or the CLI from a release (browser or command line), the one macOS quarantine step, first launch, updating, uninstalling |
+| [Quickstart](getting-started/quickstart.md) | From a fresh install to a first review and a running daemon, with the CLI or PRX.app |
 | [Your first review](getting-started/first-review.md) | What happens to one PR, step by step |
 
 ## Guides

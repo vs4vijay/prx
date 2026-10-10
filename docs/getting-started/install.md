@@ -11,99 +11,68 @@ compiled.
 | An Intel Mac | The [CLI](#cli-and-daemon-macos-and-linux). There is no prebuilt PRX.app for Intel; you can [build it from source](../development.md#building-from-source). |
 | Linux | The [CLI](#cli-and-daemon-macos-and-linux). |
 
-> **On macOS, one step is easy to miss.** A PRX.app or `prx` downloaded with a browser will not
-> open until you clear its quarantine flag, with one command:
-> [Clear the quarantine flag](#clear-the-quarantine-flag).
-
-To compile prx yourself instead, see
-[Building from source](../development.md#building-from-source).
-
-## Before you start
-
-prx needs two things on your machine to do anything useful:
-
-- **The [GitHub CLI](https://cli.github.com/) (`gh`), signed in.** `gh auth status` must succeed.
-  prx makes every GitHub call through `gh` and stores no tokens of its own.
-- **Something to do the reviewing.** Either a coding-agent CLI (`pi`, `claude`, and `codex` work
-  without configuration; others can be [configured](../guides/engines.md)), or an API key for an
-  [LLM API engine](../guides/engines.md).
-
-And the system has to be recent enough:
-
-| | Requirement |
-|---|-------------|
-| PRX.app | macOS 12 or later, Apple silicon |
-| `prx` on macOS | macOS 11 or later, Apple silicon or Intel |
-| `prx` on Linux | x86_64 or arm64, glibc 2.39 or later (Ubuntu 24.04, Debian 13, or newer) |
-
-On a Linux with an older glibc, `prx` reports ``version `GLIBC_2.39' not found`` and, on arm64,
-does not start; [build from source](../development.md#building-from-source) there.
-
-Desktop notifications use `osascript` on macOS and `notify-send` on Linux. They are optional.
-
-## What a release contains
-
-Every release carries the same six files. `<tag>` is the version, for example `v0.1.0`:
-
-| File | Contents |
-|------|----------|
-| `PRX-<tag>-macos-arm64.zip` | PRX.app for Apple silicon: the menu bar app with `prx` inside |
-| `prx-<tag>-aarch64-apple-darwin.tar.gz` | `prx` for macOS, Apple silicon |
-| `prx-<tag>-x86_64-apple-darwin.tar.gz` | `prx` for macOS, Intel |
-| `prx-<tag>-x86_64-unknown-linux-gnu.tar.gz` | `prx` for Linux, x86_64 |
-| `prx-<tag>-aarch64-unknown-linux-gnu.tar.gz` | `prx` for Linux, arm64 |
-| `SHA256SUMS` | Checksums of the five files above |
-
-You can download a file in two ways:
-
-- **In a browser**, from the [latest release](https://github.com/vs4vijay/prx/releases/latest).
-  On macOS, a browser marks what it downloads as quarantined, and unpacking passes the mark on to
-  the app or to `prx`.
-- **In a terminal**, with the `gh` you already have. This is what the commands on this page use.
-  Without a version it fetches the newest release, so the commands stay the same for later
-  versions; to get a particular one, put its tag after `download`
-  (`gh release download v0.1.0 --repo …`).
+Before either, have the [GitHub CLI](https://cli.github.com/) signed in (`gh auth status`) and a
+coding-agent CLI or an LLM API key at hand; [Requirements](#requirements) has the details. To
+compile prx yourself instead, see [Building from source](../development.md#building-from-source).
 
 ## PRX.app (macOS)
 
-### Download and unpack
+Three steps: get the app, allow it to open, open it. This describes v0.1.1 and later.
+
+### Step 1: get PRX.app
+
+There are two ways. They end in the same place: `PRX.app` in your Applications folder.
+
+**Option 1: download it from the Releases page.** No terminal needed.
+
+1. Open the [latest release](https://github.com/vs4vijay/prx/releases/latest) in your browser.
+2. Under *Assets*, click `PRX-<version>-macos-arm64.zip` to download it.
+3. In Finder, open your Downloads folder and double-click the zip. Safari may already have
+   unpacked it for you. You now have **PRX** (`PRX.app`) next to the zip.
+4. Drag **PRX** into the Applications folder.
+
+**Option 2: use the command line.**
 
 ```bash
 cd ~/Downloads
-gh release download --repo vs4vijay/prx --pattern 'PRX-*-macos-arm64.zip' --pattern SHA256SUMS
-shasum -a 256 -c SHA256SUMS --ignore-missing     # optional; prints "PRX-<tag>-macos-arm64.zip: OK"
-ditto -x -k PRX-*-macos-arm64.zip .              # unpacks PRX.app into the current folder
+gh release download --repo vs4vijay/prx --pattern 'PRX-*-macos-arm64.zip'
+ditto -x -k PRX-*-macos-arm64.zip /Applications    # unpacks PRX.app into Applications
 ```
 
-If you downloaded the zip in a browser, double-click it in Finder instead of running `ditto`
-(Safari may already have unpacked it). Either way you end up with `PRX.app` in `~/Downloads`. The
-`PRX-*` pattern expects one PRX zip in the folder; delete older ones first.
+`gh release download` without a version fetches the newest release, so these lines stay the same
+for later versions; for a particular one, put its tag after `download`
+(`gh release download v0.1.1 --repo …`). The `PRX-*` pattern expects one PRX zip in the folder:
+delete older ones first. When a `/Applications/PRX.app` is already there, follow
+[Update](#update) instead, which removes the old copy first.
 
-### Move it to Applications
+The commands use `gh` because the file names carry the version (`PRX-v0.1.1-macos-arm64.zip`),
+so there is no fixed download address that always points at the newest file. `gh` finds the
+newest release and matches the name by pattern, and prx needs `gh` anyway.
 
-Drag `PRX.app` into the Applications folder, or:
+`~/Applications` works as well as `/Applications`. The rest of this page assumes `/Applications`.
 
-```bash
-mv PRX.app /Applications/
-```
+### Step 2: allow it to open
 
-`~/Applications` works too. The rest of this page assumes `/Applications`.
+This step is the same for both options. Do it once, before you open PRX for the first time.
 
-### Clear the quarantine flag
+> [!IMPORTANT]
+> Run this in Terminal before the first open:
+>
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/PRX.app
+> ```
+>
+> PRX.app is not yet notarized by Apple, so macOS blocks a downloaded copy. The app is not
+> damaged; this command clears the download flag macOS objects to.
 
-**Do this before you open the app for the first time:**
+It prints nothing when it works, and does no harm if the app was not quarantined (a download made
+with `gh` usually is not; one made with a browser always is).
 
-```bash
-xattr -dr com.apple.quarantine /Applications/PRX.app
-```
-
-It prints nothing when it works, and does no harm if the app was not quarantined.
-
-Why it is needed: PRX.app is signed ad hoc and is not notarized by Apple. macOS puts a
-quarantine flag on anything a browser downloads, and refuses to open a quarantined app that Apple
-has not notarized. The command removes that flag from the app and from the `prx` inside it. A
-later release may be signed and notarized; until then this step is needed after every browser
-download, including updates.
+Why it is needed: PRX.app is signed ad hoc and is not notarized by Apple. macOS puts a quarantine
+flag on anything a browser downloads, and refuses to open a quarantined app that Apple has not
+notarized. The command removes that flag from the app and from the `prx` inside it. A later
+release may be signed and notarized; until then this step is needed after every browser download,
+including updates.
 
 **If you skip it**, macOS stops the app when you open it. The wording depends on the macOS
 version; it is one of these, or close to it:
@@ -122,27 +91,32 @@ Security, scroll down to the message about PRX, choose *Open Anyway*, and confir
 allows the app itself. If macOS showed the "damaged" message, or offers no *Open Anyway* button,
 or `prx` is later stopped with `killed` in a terminal, use the `xattr` command.
 
-### First launch
+### Step 3: open it
 
-prx reads its settings from `~/.config/prx/config.yml`, and the daemon does not start without
-that file. Create it once, with the `prx` inside the app, then open the app:
+Double-click PRX in the Applications folder, open it from Spotlight, or run:
 
 ```bash
-/Applications/PRX.app/Contents/Helpers/prx init
 open /Applications/PRX.app
 ```
 
-You can also double-click PRX in Finder or open it from Spotlight. What to expect:
+There is nothing to set up first. What to expect:
 
 - A PRX icon appears in the menu bar, and the PRX window opens on the Dashboard. PRX has a Dock
   icon only while its window is open; closing the window leaves the menu bar icon running.
-- The app starts the daemon for you, or attaches to one that is already running. You do not run
-  `prx daemon start` yourself.
-- Nothing is watched yet, so the Dashboard offers *Add a repo*. From there, continue with the
-  [Quickstart](quickstart.md).
+- On the first launch PRX writes a default config file, `~/.config/prx/config.yml`, and starts
+  the daemon (or attaches to one that is already running). You do not run `prx init` or
+  `prx daemon start` yourself. A config file that is already there is used as it is and never
+  overwritten.
+- Nothing is watched yet, so the Dashboard offers *Add a repo*, and the menu says *No PRs tracked
+  yet*. From there, continue with the [Quickstart](quickstart.md#with-prxapp-macos).
 
-If you opened the app before running `prx init`, the menu shows *Daemon restarting* and then
-*Daemon stopped*. Run the `init` command above, then choose *Start daemon* in the menu.
+The default config reviews with the `pi` CLI. If you use `claude`, `codex`, or an LLM API
+instead, choose it in Settings; see [Engines](../guides/engines.md).
+
+> [!NOTE]
+> **v0.1.0 only:** that version does not create the config file. Its menu shows *Daemon
+> restarting* and then *Daemon stopped* until you either update to v0.1.1 or later, or run
+> `/Applications/PRX.app/Contents/Helpers/prx init` once and choose *Start daemon* in the menu.
 
 To have PRX start when you log in, switch on *Open at login* under Settings → General. See
 [Autostart](../guides/autostart.md).
@@ -164,32 +138,68 @@ With PRX.app installed you do not need the CLI download below.
 
 ## CLI and daemon (macOS and Linux)
 
-Set `target` to the line for your machine, then run the rest as written:
+Three steps here too: get the tarball, on macOS allow `prx` to run, put it on your `PATH`.
+
+### Step 1: get the tarball and unpack it
+
+Pick the file for your machine. `<version>` is the release, for example `v0.1.1`:
+
+| Machine | File | `target` |
+|---------|------|----------|
+| macOS, Apple silicon | `prx-<version>-aarch64-apple-darwin.tar.gz` | `aarch64-apple-darwin` |
+| macOS, Intel | `prx-<version>-x86_64-apple-darwin.tar.gz` | `x86_64-apple-darwin` |
+| Linux, x86_64 | `prx-<version>-x86_64-unknown-linux-gnu.tar.gz` | `x86_64-unknown-linux-gnu` |
+| Linux, arm64 | `prx-<version>-aarch64-unknown-linux-gnu.tar.gz` | `aarch64-unknown-linux-gnu` |
+
+**Option 1: download it from the Releases page.** Open the
+[latest release](https://github.com/vs4vijay/prx/releases/latest) in your browser, download the
+file under *Assets*, and unpack it: double-click it in Finder on macOS, or run
+`tar -xzf prx-*.tar.gz` in the folder it was saved to.
+
+**Option 2: use the command line**, in the folder you want the download in:
 
 ```bash
-target=aarch64-apple-darwin          # macOS, Apple silicon
-# target=x86_64-apple-darwin         # macOS, Intel
-# target=x86_64-unknown-linux-gnu    # Linux, x86_64
-# target=aarch64-unknown-linux-gnu   # Linux, arm64
-
-gh release download --repo vs4vijay/prx --pattern "prx-*-$target.tar.gz" --pattern SHA256SUMS
-shasum -a 256 -c SHA256SUMS --ignore-missing     # optional; on Linux: sha256sum -c SHA256SUMS --ignore-missing
+target=aarch64-apple-darwin    # the `target` column for your machine
+gh release download --repo vs4vijay/prx --pattern "prx-*-$target.tar.gz"
 tar -xzf prx-*-"$target".tar.gz
-xattr -dr com.apple.quarantine prx-*-"$target"   # macOS only
-mkdir -p ~/.local/bin
-install -m 755 prx-*-"$target"/prx ~/.local/bin/prx
-prx --version
 ```
+
+Either way you now have a folder of the same name as the tarball, `prx-<version>-<target>/`,
+holding `prx`, `README.md`, and `LICENSE`. Only `prx` is needed. Run the next two steps in the
+folder that contains it (`~/Downloads` after a browser download). They expect one unpacked prx
+folder there: delete older ones first.
+
+### Step 2 (macOS only): allow it to run
+
+The same for both options, before you run `prx` for the first time:
+
+> [!IMPORTANT]
+> ```bash
+> xattr -dr com.apple.quarantine prx-v*/
+> ```
+>
+> `prx` is not yet notarized by Apple, so macOS stops a downloaded copy the moment it starts: the
+> shell prints `killed` and nothing else. Nothing is damaged; this clears the download flag.
+
+The reason is the same as for [PRX.app](#step-2-allow-it-to-open): `tar` and Finder pass the
+browser's quarantine flag on to `prx`. If you already copied `prx` somewhere, clear it there:
+`xattr -d com.apple.quarantine ~/.local/bin/prx`. Linux has no such step.
+
+### Step 3: put `prx` on your `PATH` and create the config
+
+```bash
+mkdir -p ~/.local/bin
+install -m 755 prx-v*/prx ~/.local/bin/prx    # or any directory on your PATH
+prx --version
+prx init                                      # writes ~/.config/prx/config.yml
+```
+
+`prx init` creates the config file and the data directory, and leaves an existing config alone.
+Without the app it is how the config gets created: `prx daemon start` does not start without one
+and says ``run `prx init` first``.
 
 Notes:
 
-- The tarball unpacks to a folder of the same name (`prx-<tag>-<target>/`) holding `prx`,
-  `README.md`, and `LICENSE`. Only `prx` is needed; it can live in any directory on your `PATH`.
-- **macOS:** the `xattr` line matters when the tarball came from a browser. `tar` passes the
-  quarantine flag on to `prx`, and macOS then stops it the moment it starts: the shell prints
-  `killed` and nothing else. The reason is the same as for
-  [PRX.app](#clear-the-quarantine-flag). If you already copied `prx` somewhere, clear it there:
-  `xattr -d com.apple.quarantine ~/.local/bin/prx`.
 - **Linux:** `tar` prints *Ignoring unknown extended header keyword
   'LIBARCHIVE.xattr.com.apple.provenance'* a few times. The archives are made on a Mac; the
   warning is harmless.
@@ -200,10 +210,50 @@ Notes:
 Continue with the [Quickstart](quickstart.md). To start the daemon at login, see
 [Autostart](../guides/autostart.md).
 
+## Requirements
+
+prx needs two things on your machine to do anything useful:
+
+- **The [GitHub CLI](https://cli.github.com/) (`gh`), signed in.** `gh auth status` must succeed.
+  prx makes every GitHub call through `gh` and stores no tokens of its own.
+- **Something to do the reviewing.** Either a coding-agent CLI (`pi`, `claude`, and `codex` work
+  without configuration; others can be [configured](../guides/engines.md)), or an API key for an
+  [LLM API engine](../guides/engines.md).
+
+PRX.app opens and its daemon runs without either; they are needed once there is something to
+review.
+
+And the system has to be recent enough:
+
+| | Requirement |
+|---|-------------|
+| PRX.app | macOS 12 or later, Apple silicon |
+| `prx` on macOS | macOS 11 or later, Apple silicon or Intel |
+| `prx` on Linux | x86_64 or arm64, glibc 2.39 or later (Ubuntu 24.04, Debian 13, or newer) |
+
+On a Linux with an older glibc, `prx` reports ``version `GLIBC_2.39' not found`` and, on arm64,
+does not start; [build from source](../development.md#building-from-source) there.
+
+Desktop notifications use `osascript` on macOS and `notify-send` on Linux. They are optional.
+
+## What a release contains
+
+Every release carries the same six files. `<tag>` is the version, for example `v0.1.1`:
+
+| File | Contents |
+|------|----------|
+| `PRX-<tag>-macos-arm64.zip` | PRX.app for Apple silicon: the menu bar app with `prx` inside |
+| `prx-<tag>-aarch64-apple-darwin.tar.gz` | `prx` for macOS, Apple silicon |
+| `prx-<tag>-x86_64-apple-darwin.tar.gz` | `prx` for macOS, Intel |
+| `prx-<tag>-x86_64-unknown-linux-gnu.tar.gz` | `prx` for Linux, x86_64 |
+| `prx-<tag>-aarch64-unknown-linux-gnu.tar.gz` | `prx` for Linux, arm64 |
+| `SHA256SUMS` | Checksums of the five files above |
+
 ## Verify a download
 
-`SHA256SUMS` lists the SHA-256 checksum of every other file in the release. Run the check in the
-folder that holds `SHA256SUMS` and whatever you downloaded:
+`SHA256SUMS` lists the SHA-256 checksum of every other file in the release. Download it from the
+release page next to the other files, or add `--pattern SHA256SUMS` to the `gh release download`
+line. Then run the check in the folder that holds `SHA256SUMS` and whatever you downloaded:
 
 ```bash
 shasum -a 256 -c SHA256SUMS --ignore-missing     # macOS
@@ -223,12 +273,12 @@ A newer release replaces the old files. Your configuration (`~/.config/prx`) and
 
 1. Choose *Quit PRX* in the menu. This also stops the daemon the app started. (A daemon you
    started yourself keeps running: stop it with `prx daemon stop`.)
-2. Download and unpack the new zip as in [Download and unpack](#download-and-unpack).
-3. Replace the app and clear the quarantine flag again:
+2. Remove the old app: drag it from Applications to the Trash, or
+   `rm -rf /Applications/PRX.app`.
+3. Get the new one as in [Step 1](#step-1-get-prxapp), then allow it to open again
+   ([Step 2](#step-2-allow-it-to-open)) and open it:
 
    ```bash
-   rm -rf /Applications/PRX.app
-   mv PRX.app /Applications/
    xattr -dr com.apple.quarantine /Applications/PRX.app
    open /Applications/PRX.app
    ```
@@ -240,8 +290,8 @@ working without changes.
 
 ```bash
 prx daemon stop
-# download and unpack the new tarball as above, then:
-install -m 755 prx-*-"$target"/prx ~/.local/bin/prx
+# download and unpack the new tarball as above (on macOS, clear the quarantine flag), then:
+install -m 755 prx-v*/prx ~/.local/bin/prx
 prx daemon start
 ```
 

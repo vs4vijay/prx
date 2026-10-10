@@ -11,11 +11,12 @@ repositories.
 
 ## Install
 
-See [Install](../getting-started/install.md#prxapp-macos): download the release zip, move
-`PRX.app` to Applications, and
-[clear the quarantine flag](../getting-started/install.md#clear-the-quarantine-flag) before the
-first open, or macOS refuses to open it. The daemon needs a config file, so run `prx init` once
-(the install page shows how before `prx` is on your `PATH`). After the first launch, Settings →
+See [Install](../getting-started/install.md#prxapp-macos): download the release zip (in a browser
+or with `gh`), put `PRX.app` in Applications, and
+[clear the quarantine flag](../getting-started/install.md#step-2-allow-it-to-open) before the
+first open, or macOS refuses to open it. Then open it; there is no other setup. On a first launch
+with no config file the app (v0.1.1 or later) writes the default config itself, the same one
+`prx init` writes, and the Dashboard offers *Add a repo*. After the first launch, Settings →
 General offers *Open at login* and *Install command-line tool…*. To build the app yourself, see
 [Building from source](../development.md#building-from-source).
 
@@ -37,7 +38,8 @@ the app did not start (CLI, launchd) keeps running either way.
 
 ## The daemon
 
-On launch the app attaches to a daemon that is already running, or starts one itself and
+On launch the app attaches to a daemon that is already running, or starts one itself (creating
+the default config first when there is no config file; an existing one is never touched) and
 supervises it: a crashed daemon is restarted with a growing delay, and after 5 failures within 10
 minutes the menu shows *Daemon stopped* with *Start daemon* and *Show daemon log*. The details are
 in [PRX.app internals](../concepts/prx-app-internals.md#one-app-two-processes).

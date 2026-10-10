@@ -120,23 +120,41 @@ LLM API.
 
 ### PRX.app (macOS 12 or later, Apple silicon)
 
-The menu bar app, with the CLI and the daemon inside. Download `PRX-v0.1.0-macos-arm64.zip` in a
-browser, or with the `gh` line here:
+The menu bar app, with the CLI and the daemon inside. Three steps.
 
-```bash
-cd ~/Downloads
-gh release download --repo vs4vijay/prx --pattern 'PRX-*-macos-arm64.zip'
-ditto -x -k PRX-*-macos-arm64.zip .                     # unzip; or double-click the zip in Finder
-mv PRX.app /Applications/
-xattr -dr com.apple.quarantine /Applications/PRX.app    # needed before the first open, see below
-/Applications/PRX.app/Contents/Helpers/prx init         # writes ~/.config/prx/config.yml
-open /Applications/PRX.app                              # PRX appears in the menu bar
-```
+**1. Get PRX.app**, whichever way you prefer:
 
-> **Do not skip the `xattr` line.** PRX.app is not yet notarized by Apple, so macOS refuses to
-> open a copy downloaded with a browser, saying that Apple could not verify "PRX", or that "PRX"
-> is damaged. The app is fine: the command clears the download flag macOS is objecting to.
-> [More about this step](docs/getting-started/install.md#clear-the-quarantine-flag).
+- **Option 1: download it from the Releases page.** Open the
+  [latest release](https://github.com/vs4vijay/prx/releases/latest) in your browser and download
+  `PRX-<version>-macos-arm64.zip`. Double-click the zip in Finder (Safari may already have
+  unpacked it), then drag **PRX** into your Applications folder.
+- **Option 2: use the command line.**
+
+  ```bash
+  cd ~/Downloads
+  gh release download --repo vs4vijay/prx --pattern 'PRX-*-macos-arm64.zip'
+  ditto -x -k PRX-*-macos-arm64.zip /Applications    # unpacks PRX.app into Applications
+  ```
+
+**2. Allow it to open.** The same for both options, once, before you open PRX:
+
+> [!IMPORTANT]
+> Run this in Terminal before the first open:
+>
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/PRX.app
+> ```
+>
+> PRX.app is not yet notarized by Apple, so macOS blocks a downloaded copy, saying that Apple
+> could not verify "PRX" or that "PRX" is damaged (the wording varies by macOS version). The app
+> is not damaged; this command clears the download flag macOS objects to. Without a terminal: try
+> to open PRX once, then choose *Open Anyway* under System Settings → Privacy & Security.
+> [More about this step](docs/getting-started/install.md#step-2-allow-it-to-open).
+
+**3. Open it.** Double-click PRX in Applications, or run `open /Applications/PRX.app`. A PRX icon
+appears in the menu bar and the PRX window opens on the Dashboard, where *Add a repo* gets you
+started. There is nothing to set up first: PRX writes its default config
+(`~/.config/prx/config.yml`) and starts its daemon by itself.
 
 For a `prx` command in your terminal, open Settings → General in PRX and choose *Install
 command-line tool…*.
@@ -144,20 +162,43 @@ command-line tool…*.
 ### CLI and daemon (macOS and Linux)
 
 On an Intel Mac, on Linux, or without the app. The release has one tarball per platform,
-`prx-v0.1.0-<target>.tar.gz`:
+`prx-<version>-<target>.tar.gz`, where `<target>` is `aarch64-apple-darwin` (macOS, Apple
+silicon), `x86_64-apple-darwin` (macOS, Intel), `x86_64-unknown-linux-gnu` (Linux, x86_64) or
+`aarch64-unknown-linux-gnu` (Linux, arm64).
+
+**1. Get the tarball and unpack it**, whichever way you prefer:
+
+- **Option 1: download it from the Releases page.** Download the tarball for your machine from
+  the [latest release](https://github.com/vs4vijay/prx/releases/latest) and unpack it:
+  double-click it on macOS, or `tar -xzf prx-*.tar.gz`.
+- **Option 2: use the command line**, in the folder you want the download in:
+
+  ```bash
+  target=aarch64-apple-darwin    # or one of the other three targets above
+  gh release download --repo vs4vijay/prx --pattern "prx-*-$target.tar.gz"
+  tar -xzf prx-*-"$target".tar.gz
+  ```
+
+Either way you now have a folder named `prx-<version>-<target>`, with `prx` inside.
+
+**2. On macOS, allow it to run.** The same for both options, in the folder that holds the
+unpacked folder:
+
+> [!IMPORTANT]
+> ```bash
+> xattr -dr com.apple.quarantine prx-v*/
+> ```
+>
+> `prx` is not yet notarized by Apple either. A quarantined copy is stopped the moment it starts:
+> the shell prints `killed` and nothing else. Not needed on Linux.
+
+**3. Put `prx` on your `PATH` and create the config:**
 
 ```bash
-target=aarch64-apple-darwin          # macOS, Apple silicon
-# target=x86_64-apple-darwin         # macOS, Intel
-# target=x86_64-unknown-linux-gnu    # Linux, x86_64
-# target=aarch64-unknown-linux-gnu   # Linux, arm64
-
-gh release download --repo vs4vijay/prx --pattern "prx-*-$target.tar.gz"
-tar -xzf prx-*-"$target".tar.gz
-xattr -dr com.apple.quarantine prx-*-"$target"         # macOS only
 mkdir -p ~/.local/bin
-install -m 755 prx-*-"$target"/prx ~/.local/bin/prx    # or any directory on your PATH
+install -m 755 prx-v*/prx ~/.local/bin/prx    # or any directory on your PATH
 prx --version
+prx init                                      # writes ~/.config/prx/config.yml
 ```
 
 [Install](docs/getting-started/install.md) has the details: system requirements, checksums,
@@ -166,8 +207,9 @@ updating, and uninstalling. To build prx yourself, see
 
 ## Quickstart
 
-If you installed PRX.app, skip `prx init` (done above) and `prx daemon start` (the app starts the
-daemon). Watching a repository, reviewing, and approving can also be done from the app.
+If you installed PRX.app, skip `prx init` and `prx daemon start`: the app creates the config and
+starts the daemon itself. Watching a repository, reviewing, and approving can also be done from
+the app.
 
 ```bash
 prx init                            # write ~/.config/prx/config.yml

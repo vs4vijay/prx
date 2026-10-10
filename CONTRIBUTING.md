@@ -24,7 +24,9 @@ PRX_CONFIG=/tmp/prx/config.yml PRX_DATA_DIR=/tmp/prx/data cargo run -- init
 
 PRX.app (the `menubar/` crate) builds on macOS only: `cargo run -p prx-menubar`, or
 `scripts/bundle-macos.sh --no-install` for an app bundle. Without `--no-install` that script
-replaces `~/Applications/PRX.app`.
+replaces `~/Applications/PRX.app`. The app needs no `prx init`: started with no config file, it
+writes the default config (to `PRX_CONFIG` when set) before it starts its daemon, so set
+`PRX_CONFIG` and `PRX_DATA_DIR` as above to keep an experiment out of your own setup.
 
 [Building from source](docs/development.md#building-from-source) has the full build
 instructions. The [Install](docs/getting-started/install.md) page is for users and covers the
