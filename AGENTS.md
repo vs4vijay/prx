@@ -14,6 +14,45 @@ Newest first. One entry per decision, in this format:
 What changed, why, and what to do differently from now on. Link the files or docs involved.
 ```
 
+### 2026-10-29: HistoryEntry tolerates unknown variants; new variants are fine
+
+`HistoryEntry` (`src/history.rs`) has a catch-all `#[serde(other)] Unknown` variant. A history
+line or a `GET /history` entry whose `event` this build does not know decodes as `Unknown`
+instead of failing the whole payload: `history::query` skips it, compaction keeps its line as it
+is, and PRX.app's poller drops it. The first new variant that relies on this is `new_pr`, which
+the machine writes wherever it raises `on_new_pr`, so PRX.app can banner new PRs while the daemon
+defers to it. From now on, adding a history variant is a compatible change: handle it in the
+`match`es on `HistoryEntry` (`src/main.rs`, `src/insights.rs`, `menubar/src/banners.rs`,
+`menubar/src/model.rs`) and in `overview.js` `EVENTS`, and never match `Unknown` as if it had
+data. See `openspec/changes/ready-blocked-alerts/`.
+
+### 2026-10-14: Tests must not raise real desktop banners
+
+The daemon's macOS banners now really fire: `src/notify.rs` runs `osascript` with a fixed
+`on run argv` script and passes title, body, and sound as arguments, never spliced into
+AppleScript source. So `install_fake_gh` in `tests/common/mod.rs` also puts do-nothing `osascript`
+and `notify-send` stand-ins (`install_quiet_notifiers`) into the fake `gh` directory. From now on,
+any test that starts a daemon or raises a notification goes through that harness; a test that
+wants to observe banners installs its own recording fakes over the stand-ins. Keep notification
+text out of the script source.
+
+### 2026-10-14: Only PRX.app identifies itself as the menubar client
+
+`DaemonClient` (`src/ipc.rs`) no longer announces itself by default. PRX.app opts in with
+`DaemonClient::discover_as_menubar()` / `.as_menubar()`, and the daemon counts the `X-Prx-Client`
+header only when its value is `menubar` or `menubar/<version>`. From now on, CLI code uses the
+plain client (`discover()`), or a terminal command would mute the daemon's own banners, and
+menubar code that creates a client uses the opt-in constructor.
+
+### 2026-10-14: Settings UI pages are tested by booting the real scripts in a fake DOM
+
+Page suites under `menubar/settings-ui-tests/` load the scripts `index.html` lists into
+`fake-dom.js` with a fake daemon behind the bridge; `page-fixtures.js` holds the payloads and the
+helpers that drive a page. The fake DOM's `innerHTML`, `outerHTML`, and `insertAdjacentHTML`
+throw, so a page that injects markup fails its test. From now on, test a page change this way,
+and put new test payloads in `page-fixtures.js` or the test file, not in `preview-mock.js`, which
+is the demo dataset. See [Tests](docs/development.md#tests).
+
 ### 2026-10-11: PRX.app creates the default config on first launch (v0.1.1); install is three steps
 
 A fresh PRX.app v0.1.0 was dead on arrival: with no config file the daemon refused to start and
@@ -124,11 +163,11 @@ src/                  core crate: CLI, daemon, state machine, review pipeline, I
   paths.rs, logging.rs  supporting modules
 tests/                integration tests for the core crate (run the real binary)
   fixtures/gh, fixtures/fake-agent   shell fakes for `gh` and an agent
-  common/               shared test harness
+  common/               shared test harness (fake `gh`, fake agent, quiet notifier stand-ins)
 menubar/              `prx-menubar` crate: PRX.app (macOS only)
   src/                  AppKit/objc2 shell: menu model, poller, supervisor, banners, settings window
   settings-ui/          the window's pages: dependency-free vanilla JS, no npm, no build step
-  settings-ui-tests/    node:test suites and a preview server with a fake daemon
+  settings-ui-tests/    node:test suites, fake DOM and fixtures, preview server with a fake daemon
   tests/                menubar integration tests
 scripts/              bundle-macos.sh (build and install PRX.app), verify-upgrade.sh
   demo-sandbox.sh, demo-seed.js   throwaway prx setup filled with the fictional demo dataset
@@ -190,11 +229,20 @@ the copy the user is running. Build instructions live in
 - **Integration tests** in `tests/` run the real `prx` binary against the shell fakes
   `tests/fixtures/gh` and `tests/fixtures/fake-agent`, controlled with `FAKE_GH_DIR` and other
   `FAKE_GH_*` / `FAKE_AGENT_*` variables. Each test is isolated with `PRX_CONFIG` and
-  `PRX_DATA_DIR` in a temp dir and a redirected `HOME`. No network. Unix-only.
+  `PRX_DATA_DIR` in a temp dir and a redirected `HOME`. No network. Unix-only. Install the fake
+  `gh` with `install_fake_gh` (`tests/common/mod.rs`): it also installs do-nothing `osascript` /
+  `notify-send`, so no test raises a real desktop banner.
+- **CLI paths** each have a suite: `tests/cli_thin_client.rs` (the CLI against a scripted stand-in
+  daemon), `tests/cli_fallback.rs` (every command with no daemon), `tests/cli_pause_paths.rs`
+  (file locations, `prx pause` / `prx resume` without a daemon, argument errors).
+- **Invariant tests**: `tests/review_invariants.rs` runs the real pipeline in-process against
+  recording `Gh` doubles and shows that no automated path approves, blocks, or dismisses.
 - **Daemon and hardening tests** start a real detached daemon: IPC round-trips, single-instance
   guard, graceful stop, agent crash, `SIGKILL` mid-review, `gh` auth expiry, corrupt data files.
 - **Menubar tests** (`cargo test -p prx-menubar`) run on macOS.
-- **Settings UI tests** use `node --test`. Do not add npm dependencies.
+- **Settings UI tests** use `node --test`. Page suites boot the scripts `index.html` lists in
+  `fake-dom.js` (no HTML parser: `innerHTML` and friends throw) with payloads from
+  `page-fixtures.js`. Do not add npm dependencies.
 
 Never write a test that calls real GitHub, a real agent, or a real LLM API. New behaviour needs a
 test at the lowest tier that can show it.
@@ -228,6 +276,14 @@ Do not commit or push unless asked.
   (`ensure_first_run_config` in `menubar/src/supervisor.rs`), so no doc or message may ask an
   app user to run `prx init`. Tests that start a `Supervisor` must point `PRX_CONFIG` as well as
   `PRX_DATA_DIR` into a sandbox, or the spawn path would create a config in the real home.
+- **Formatting one file.** `cargo fmt -- <files>` formats the whole workspace, not just those
+  files. To format single files use `rustfmt --edition 2021 <file>`.
+- **Menubar client header.** A `DaemonClient` is anonymous unless it opts in with
+  `discover_as_menubar()` / `as_menubar()`. Only `menubar/` may opt in; a CLI command that did
+  would mute the daemon's banners for as long as a menubar client counts as recently seen.
+- **`prx daemon start` waits.** It returns only once the daemon has claimed the pid file and
+  published its IPC token (10 s limit), and on failure prints the reason the daemon gave, so a
+  command run right after it reaches the daemon.
 - **launchd PATH.** launchd plists written by `prx daemon install` snapshot the installing
   shell's `PATH`. Engines should be configured with absolute paths.
 - **Release tags.** A release tag `vX.Y.Z` must equal the version in both `Cargo.toml` and
@@ -263,22 +319,32 @@ obvious from one file.
 - **Review manifest**: the engine's only output. `manifest_version` 1; `verdict` is `approved`,
   `changes_requested`, or `comment_only`; findings have severity `blocking` or `nit`. Any
   `blocking` finding forces `changes_requested`. Invalid manifests, crashes, and timeouts are
-  retried once. See [docs/reference/review-manifest.md](docs/reference/review-manifest.md).
+  retried once. A finding with an empty body or `line: 0` makes the manifest invalid (lines are
+  1-based; omit `line` instead). See
+  [docs/reference/review-manifest.md](docs/reference/review-manifest.md).
 - **A verdict of `approved` is not a GitHub approval.** prx posts it as a comment review; the PR
   then waits for the human's approval.
 - **Engines**: `type: agent` (a local CLI; built-ins `pi`, `claude`, `codex`) or `type: llm_api`
   (`anthropic`, `openai`, `openai_compatible`). See [docs/guides/engines.md](docs/guides/engines.md).
 - **Review modes**: `review comment` (default), `monitor` (review, never post), `off` (no polling,
-  no reviews). A **pause** is different: daemon-wide, timed, and polling continues.
+  no reviews). A **pause** is different: daemon-wide, timed, and polling continues. `off` is a
+  stop switch for explicit reviews too: `prx review` declines with or without a daemon.
 - **Cooldowns** are anchored to the PR's GitHub creation time (first review) and to the detection
   of new commits (re-review). An explicit single-PR review bypasses them.
 - **Config resolution**: defaults ← org ← repo, most specific wins; partial structures merge field
   by field. A broken config file never stops the daemon: it keeps the last good config and
   reports `config_error`.
+- **Config validation**: a repo name is `org/repo` with one slash and only `[A-Za-z0-9._-]` on
+  each side (`validate_repo_name` in `src/config.rs`; `.` and `..` halves and an org starting
+  with `-` are refused too). `poll_interval_minutes`, `max_concurrent_reviews`, and
+  `agent_timeout_seconds` must be above zero in org and repo overrides as well as in `defaults`.
+- **`prx config set <key> null`** (or `~`) clears an optional key or an override.
 - **Brief**: a short plain-language description of a PR, taken from the manifest or generated on
   demand; best-effort and never part of the verdict.
 - **Notification tiers**: events map to `urgent`, `informational`, or `silent`. The daemon
-  suppresses its own banners while a menubar client has been seen recently.
+  suppresses its own banners while a menubar client has been seen recently. The tier decides the
+  banner; the sound is `notifications.sounds.<event>`, else the event's built-in sound (only
+  `on_review_complete_approved`: `Glass`), else the tier's (`Notifications::behavior_for`).
 - **Token usage** semantics are uniform: `input_tokens` is uncached input; cache reads and writes
   are separate; cost is recorded only when the engine reports it.
 - **Data locations**: config at `~/.config/prx/config.yml` (`PRX_CONFIG`), data at

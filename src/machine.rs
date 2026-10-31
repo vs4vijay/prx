@@ -84,6 +84,8 @@ pub enum HistoryEvent {
     },
     PrMerged,
     PrClosed,
+    /// prx started tracking an open PR (with `on_new_pr`).
+    NewPr,
     /// New commits on a reviewed PR (or an until-push snooze wake): the PR is
     /// re-review pending (A5/A9).
     NewCommits,
@@ -259,7 +261,13 @@ fn poll_new_pr(current: Option<&PrRecord>, snap: &PrSnapshot, ctx: &MachineCtx) 
             // so pre-existing PRs discovered on the first poll review
             // immediately once their window has passed.
             rec.review_anchor_at = Some(snap.created_at);
-            Transition::changed(rec, vec![Effect::Notify(NotifyEvent::NewPr)])
+            Transition::changed(
+                rec,
+                vec![
+                    Effect::HistoryAppend(HistoryEvent::NewPr),
+                    Effect::Notify(NotifyEvent::NewPr),
+                ],
+            )
         }
     }
 }
@@ -411,7 +419,13 @@ fn poll_reopened(current: Option<&PrRecord>, snap: &PrSnapshot, ctx: &MachineCtx
                 }
                 None => {
                     enter_pending(&mut rec, snap.created_at, ctx.now);
-                    Transition::changed(rec, vec![Effect::Notify(NotifyEvent::NewPr)])
+                    Transition::changed(
+                        rec,
+                        vec![
+                            Effect::HistoryAppend(HistoryEvent::NewPr),
+                            Effect::Notify(NotifyEvent::NewPr),
+                        ],
+                    )
                 }
             }
         }
@@ -551,6 +565,8 @@ fn review_done(
     rec.blocking_count = blocking_count;
     rec.nit_count = nit_count;
     rec.review_session = None;
+    // A completed review ends the run of consecutive failures.
+    rec.review_attempts = 0;
     // A fresh agent verdict supersedes any earlier human approval: the PR
     // is back to "awaiting the human" if the agent approved again.
     rec.human_approved_at = None;
@@ -872,11 +888,18 @@ pub fn cooldown_remaining(
     }
 }
 
+/// `None` only when the record has no anchor (due immediately). A cooldown
+/// too large to represent as an instant saturates to the far future: it
+/// means "never due", and must not read as "no cooldown".
 fn cooldown_ends_at(rec: &PrRecord, cooldown: &Cooldown) -> Option<DateTime<Utc>> {
     let anchor = rec.review_anchor_at?;
     let minutes = applicable_cooldown_minutes(rec, cooldown);
-    let duration = Duration::try_minutes(i64::try_from(minutes).ok()?)?;
-    anchor.checked_add_signed(duration)
+    let ends = i64::try_from(minutes)
+        .ok()
+        .and_then(Duration::try_minutes)
+        .and_then(|duration| anchor.checked_add_signed(duration))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    Some(ends)
 }
 
 #[cfg(test)]
@@ -985,7 +1008,8 @@ mod tests {
         assert_eq!(rec.review_anchor_at, Some(t(T0))); // A5: gh_created_at, not detection time
         assert_eq!(rec.gh_created_at, t(T0));
         assert_eq!(notifications(&tr), vec![NotifyEvent::NewPr]);
-        assert!(history(&tr).is_empty());
+        // Recorded too, so PRX.app can raise the banner the daemon defers.
+        assert_eq!(history(&tr), vec![HistoryEvent::NewPr]);
     }
 
     #[test]
@@ -1860,6 +1884,37 @@ mod tests {
         assert_eq!(record_of(&tr).review_attempts, 3);
     }
 
+    /// The count is of consecutive failures: a review that completes ends
+    /// the run, whatever its verdict and even when the head moved meanwhile.
+    #[test]
+    fn review_done_resets_the_failure_count() {
+        for (verdict, blocking_count, reviewed_sha) in [
+            (Verdict::Approved, 0, "aaaa"),
+            (Verdict::CommentOnly, 0, "aaaa"),
+            (Verdict::ChangesRequested, 1, "aaaa"),
+            (Verdict::Approved, 0, "an-older-sha"),
+        ] {
+            let mut rec = record_in(PrState::InReview, None);
+            rec.review_attempts = 2;
+            let tr = poll(
+                Event::ReviewDone {
+                    verdict,
+                    blocking_count,
+                    nit_count: 0,
+                    summary: None,
+                    reviewed_sha: reviewed_sha.into(),
+                },
+                &rec,
+                T0_61M,
+            );
+            assert_eq!(
+                record_of(&tr).review_attempts,
+                0,
+                "{verdict:?} at {reviewed_sha}"
+            );
+        }
+    }
+
     #[test]
     fn review_failed_outside_in_review_is_noop() {
         let rec = tracked();
@@ -2467,6 +2522,273 @@ mod tests {
             "cooling 30m"
         );
         assert_eq!(cooldown_remaining(&rec, &cooldown, t(T0_61M)), None);
+    }
+
+    /// A cooldown too large to turn into an instant means "never due". It
+    /// used to overflow into "no cooldown", so a huge value meant to hold
+    /// automatic reviews off reviewed the PR at once.
+    #[test]
+    fn unrepresentable_cooldown_is_never_due_not_immediately_due() {
+        let far = t("2999-01-01T00:00:00Z");
+        // Beyond i64 minutes, beyond a chrono duration, beyond the calendar.
+        for minutes in [u64::MAX, 1_000_000_000_000_000, 1_000_000_000_000] {
+            let cooldown = Cooldown {
+                before_first_review_minutes: minutes,
+                between_re_reviews_minutes: minutes,
+            };
+            let mut rec = tracked();
+            assert!(!machine_is_due(&rec, &cooldown, far), "{minutes}");
+            assert!(
+                cooldown_remaining(&rec, &cooldown, far).is_some(),
+                "{minutes}"
+            );
+            rec.last_verdict = Some(Verdict::Approved);
+            assert!(!machine_is_due(&rec, &cooldown, far), "{minutes}");
+        }
+        // A large but representable cooldown still ends when it says.
+        let cooldown = Cooldown {
+            before_first_review_minutes: 1_000_000, // ~1.9 years
+            between_re_reviews_minutes: 30,
+        };
+        let rec = tracked();
+        assert!(!machine_is_due(&rec, &cooldown, t("2028-01-01T00:00:00Z")));
+        assert!(machine_is_due(&rec, &cooldown, t("2029-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn zero_cooldown_is_due_at_the_anchor() {
+        let cooldown = Cooldown {
+            before_first_review_minutes: 0,
+            between_re_reviews_minutes: 0,
+        };
+        let rec = tracked();
+        assert!(machine_is_due(&rec, &cooldown, t(T0)));
+        assert_eq!(cooldown_remaining(&rec, &cooldown, t(T0)), None);
+        // Before the anchor (a PR created "in the future" by clock skew) it
+        // is still cooling.
+        assert!(!machine_is_due(&rec, &cooldown, t("2026-09-01T09:59:59Z")));
+    }
+
+    /// `cooldown_remaining` describes pending records only: a reviewed or
+    /// skipped record inside its window reports nothing.
+    #[test]
+    fn cooldown_remaining_is_none_outside_pending() {
+        let cooldown = Cooldown::default();
+        for state in [
+            PrState::InReview,
+            PrState::ReviewedApproved,
+            PrState::ReviewedChangesRequested,
+            PrState::Skipped,
+            PrState::Merged,
+            PrState::Closed,
+        ] {
+            let rec = record_in(state, None);
+            assert_eq!(
+                cooldown_remaining(&rec, &cooldown, t(T0_30M)),
+                None,
+                "{state:?}"
+            );
+            assert!(!machine_is_due(&rec, &cooldown, t(T0_61M)), "{state:?}");
+        }
+    }
+
+    // ------------------------------------------------- whole-table rules
+
+    /// Every event that carries no snapshot, applied to a PR prx has never
+    /// seen, changes nothing and emits nothing: there is no record to act on.
+    #[test]
+    fn snapshotless_events_on_an_untracked_pr_are_noops() {
+        let skip = SkipConfig::default();
+        for event in [
+            Event::PollMerged,
+            Event::PollClosed,
+            Event::ReviewStart,
+            Event::ReviewDone {
+                verdict: Verdict::Approved,
+                blocking_count: 0,
+                nit_count: 0,
+                summary: None,
+                reviewed_sha: "aaaa".into(),
+            },
+            Event::ReviewFailed,
+            Event::Snooze {
+                until: Some(t(T0_61M)),
+                until_push: false,
+            },
+            Event::SnoozeExpired,
+            Event::Unsnooze,
+            Event::Ignore,
+            Event::Unignore,
+            Event::Approve,
+            Event::RequestChanges,
+            Event::Unblock,
+        ] {
+            let tr = apply(None, event.clone(), &ctx_at(T0, &skip));
+            assert_eq!(tr.record, None, "{event:?}");
+            assert!(tr.effects.is_empty(), "{event:?}");
+        }
+    }
+
+    /// Merged and closed are absorbing: no event moves a merged record, and
+    /// only a reopen moves a closed one. Nothing is notified or logged twice.
+    #[test]
+    fn terminal_states_absorb_every_event_except_reopening_a_closed_pr() {
+        let skip = SkipConfig::default();
+        let events = || {
+            vec![
+                Event::PollNewPr {
+                    snapshot: snap("bbbb"),
+                },
+                Event::PollShaChanged {
+                    snapshot: snap("bbbb"),
+                },
+                Event::PollUnchanged {
+                    snapshot: snap("aaaa"),
+                },
+                Event::PollMerged,
+                Event::PollClosed,
+                Event::PollReopened {
+                    snapshot: snap("aaaa"),
+                },
+                Event::PollDraftFlipped {
+                    snapshot: PrSnapshot {
+                        is_draft: true,
+                        ..snap("aaaa")
+                    },
+                },
+                Event::ReviewStart,
+                Event::ReviewDone {
+                    verdict: Verdict::Approved,
+                    blocking_count: 0,
+                    nit_count: 0,
+                    summary: None,
+                    reviewed_sha: "aaaa".into(),
+                },
+                Event::ReviewFailed,
+                Event::Snooze {
+                    until: Some(t(T0_61M)),
+                    until_push: true,
+                },
+                Event::SnoozeExpired,
+                Event::Unsnooze,
+                Event::Ignore,
+                Event::Unignore,
+                Event::Approve,
+                Event::RequestChanges,
+                Event::Unblock,
+            ]
+        };
+        for terminal in [PrState::Merged, PrState::Closed] {
+            let rec = record_in(terminal, None);
+            for event in events() {
+                let reopening =
+                    terminal == PrState::Closed && matches!(event, Event::PollReopened { .. });
+                let tr = apply(Some(&rec), event.clone(), &ctx_at(T0_61M, &skip));
+                if reopening {
+                    assert_eq!(state_of(&tr), PrState::Pending);
+                    continue;
+                }
+                // The defensive PollNewPr resync may refresh metadata, but it
+                // never leaves the terminal state.
+                let state = tr.record.as_ref().map_or(terminal, |r| r.state);
+                assert_eq!(state, terminal, "{terminal:?} × {event:?}");
+                assert!(tr.effects.is_empty(), "{terminal:?} × {event:?}");
+            }
+        }
+    }
+
+    /// The engine never approves: no outcome of a review run, whatever the
+    /// manifest said, records a human approval. Only `Event::Approve` does.
+    #[test]
+    fn only_the_human_approve_event_sets_human_approved_at() {
+        let skip = SkipConfig::default();
+        for verdict in [
+            Verdict::Approved,
+            Verdict::CommentOnly,
+            Verdict::ChangesRequested,
+        ] {
+            let rec = record_in(PrState::InReview, None);
+            let tr = apply(
+                Some(&rec),
+                Event::ReviewDone {
+                    verdict,
+                    blocking_count: 0,
+                    nit_count: 0,
+                    summary: None,
+                    reviewed_sha: "aaaa".into(),
+                },
+                &ctx_at(T0_61M, &skip),
+            );
+            assert_eq!(record_of(&tr).human_approved_at, None, "{verdict:?}");
+        }
+        let rec = record_in(PrState::ReviewedApproved, None);
+        let tr = apply(Some(&rec), Event::Approve, &ctx_at(T0_61M, &skip));
+        assert_eq!(record_of(&tr).human_approved_at, Some(t(T0_61M)));
+    }
+
+    /// Going terminal drops everything that only made sense for an open PR:
+    /// the snooze, its restore target, and the retained agent session. The
+    /// review record itself is kept for history.
+    #[test]
+    fn terminal_transition_clears_snooze_and_session_but_keeps_the_review() {
+        let mut rec = record_in(PrState::Skipped, Some(SkipReason::Snoozed));
+        rec.previous_state = Some(PrState::ReviewedApproved);
+        rec.snooze_until = Some(t(T0_61M));
+        rec.snooze_until_push = true;
+        rec.review_session = Some("sess-1".into());
+        rec.last_verdict = Some(Verdict::Approved);
+        rec.last_reviewed_sha = Some("aaaa".into());
+        for event in [Event::PollMerged, Event::PollClosed] {
+            let out = record_of(&poll(event, &rec, T0_61M));
+            assert_eq!(out.skip_reason, None);
+            assert_eq!(out.previous_state, None);
+            assert_eq!(out.snooze_until, None);
+            assert!(!out.snooze_until_push);
+            assert_eq!(out.review_session, None);
+            assert_eq!(out.last_verdict, Some(Verdict::Approved));
+            assert_eq!(out.last_reviewed_sha.as_deref(), Some("aaaa"));
+        }
+    }
+
+    // ---------------------------------------------- skip rule edge cases
+
+    /// Authors match exactly and case-sensitively, a branch pattern must
+    /// match the whole branch name, and a pattern that is not a valid glob
+    /// matches nothing instead of panicking.
+    #[test]
+    fn skip_rules_match_exactly_and_tolerate_bad_globs() {
+        let skip = SkipConfig {
+            drafts: false,
+            authors: vec!["dependabot[bot]".into()],
+            labels: vec![],
+            branches: vec!["release/*".into(), "[unclosed".into()],
+        };
+        let with = |author: &str, branch: &str| PrSnapshot {
+            author: author.into(),
+            head_branch: branch.into(),
+            is_draft: true,
+            ..snap("aaaa")
+        };
+        // Draft skipping is off, so a draft is judged by the other rules.
+        assert_eq!(evaluate_skip(&with("alice", "feat/x"), &skip), None);
+        assert_eq!(
+            evaluate_skip(&with("dependabot[bot]", "feat/x"), &skip),
+            Some(SkipReason::Config)
+        );
+        assert_eq!(
+            evaluate_skip(&with("Dependabot[bot]", "feat/x"), &skip),
+            None
+        );
+        assert_eq!(evaluate_skip(&with("dependabot", "feat/x"), &skip), None);
+        assert_eq!(
+            evaluate_skip(&with("alice", "release/1.2"), &skip),
+            Some(SkipReason::Config)
+        );
+        assert_eq!(
+            evaluate_skip(&with("alice", "pre-release/1.2"), &skip),
+            None
+        );
+        assert_eq!(evaluate_skip(&with("alice", "[unclosed"), &skip), None);
     }
 
     // -------------------------------------------------- misc invariants

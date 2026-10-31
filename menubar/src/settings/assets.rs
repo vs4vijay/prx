@@ -242,12 +242,22 @@ mod tests {
         let sources =
             prx::config::Config::default().effective_sources(&prx::config::RepoConfig::default());
         assert!(!sources.is_empty());
+        // Event tiers and event sounds are generated from the EVENTS table,
+        // so a path is covered by its event's row there (plus, for sounds,
+        // the generated `notifications.sounds.` field).
+        let listed = |event: &str| schema.contains(&format!("[\"{event}\","));
         for path in sources.keys() {
-            let event = path.strip_prefix("notifications.");
-            let covered =
-                has_key(path) || event.is_some_and(|e| schema.contains(&format!("[\"{e}\",")));
+            let covered = has_key(path)
+                || match path.strip_prefix("notifications.sounds.") {
+                    Some(event) => {
+                        listed(event) && schema.contains("key: \"notifications.sounds.\" + e[0]")
+                    }
+                    None => path.strip_prefix("notifications.").is_some_and(listed),
+                };
             assert!(covered, "schema.js has no field for `{path}`");
         }
+        // Global, so not among the override sources.
+        assert!(has_key("notifications.menubar_bell"));
         let defaults = serde_json::to_value(prx::config::Defaults::default()).unwrap();
         for key in defaults.as_object().unwrap().keys() {
             assert!(

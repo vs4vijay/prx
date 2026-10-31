@@ -277,8 +277,14 @@ fn history_timeline_json_and_insights_in_process() {
     let parsed: Vec<prx::history::HistoryEntry> =
         serde_json::from_str(stdout_of(&out).trim()).expect("history --json must be a JSON array");
     // CR review, approval, re-review (each preceded by its review_started
-    // entry, design D6), merge, old fixture.
-    assert_eq!(parsed.len(), 8);
+    // entry, design D6), merge, old fixture, and the `new_pr` entries of
+    // the PRs the CLI's reviews started tracking.
+    let new_prs = parsed
+        .iter()
+        .filter(|e| matches!(e, prx::history::HistoryEntry::NewPr { .. }))
+        .count();
+    assert!(new_prs >= 1, "{parsed:?}");
+    assert_eq!(parsed.len(), 8 + new_prs);
     let started = parsed
         .iter()
         .filter(|e| matches!(e, prx::history::HistoryEntry::ReviewStarted { .. }))
@@ -395,4 +401,209 @@ fn history_and_insights_round_trip_through_the_daemon() {
     let out = env.run(&["daemon", "stop"], &[]);
     assert!(out.status.success(), "{}", stderr_of(&out));
     env.mark_stopped();
+}
+
+// ------------------------------------------- seeded history, no daemon
+
+/// Replace the history file with these raw JSONL lines.
+fn seed(env: &Env, lines: &[String]) {
+    write_file(&env.history_path(), &(lines.join("\n") + "\n"));
+}
+
+fn review_line(ts: &str, repo: &str, number: u64, verdict: &str) -> String {
+    format!(
+        r#"{{"event":"review_completed","ts":"{ts}","repo":"{repo}","number":{number},"title":"Change {number}","author":"alice","agent":"fake","verdict":"{verdict}","blocking_count":0,"nit_count":0}}"#
+    )
+}
+
+/// The PR keys of a rendered timeline, top to bottom.
+fn timeline_keys(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().find(|w| w.contains('#')))
+        .map(str::to_string)
+        .collect()
+}
+
+/// `prx history` in process: newest first, `--limit` counts from the newest
+/// end (0 = everything), `--repo` is an exact match, and `--json` prints
+/// the same entries as an array with no heading.
+#[test]
+fn history_limit_repo_and_json_flags_in_process() {
+    let env = Env::new("hist-flags");
+    seed(
+        &env,
+        &[
+            review_line("2026-09-01T10:00:00Z", "org/one", 1, "approved"),
+            review_line("2026-09-02T10:00:00Z", "org/two", 2, "changes_requested"),
+            review_line("2026-09-03T10:00:00Z", "org/one", 3, "comment_only"),
+            review_line("2026-09-04T10:00:00Z", "org/two", 4, "approved"),
+        ],
+    );
+
+    let out = env.run(&["history"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.starts_with("recent review history (newest first):\n"),
+        "{stdout}"
+    );
+    assert_eq!(
+        timeline_keys(&stdout),
+        ["org/two#4", "org/one#3", "org/two#2", "org/one#1"]
+    );
+
+    let keys = |args: &[&str]| timeline_keys(&stdout_of(&env.run(args, &[])));
+    assert_eq!(keys(&["history", "--limit", "1"]), ["org/two#4"]);
+    assert_eq!(keys(&["history", "--limit", "0"]).len(), 4);
+    assert_eq!(keys(&["history", "--limit", "99"]).len(), 4);
+    assert_eq!(
+        keys(&["history", "--repo", "org/one"]),
+        ["org/one#3", "org/one#1"]
+    );
+    // The limit applies after the repo filter.
+    assert_eq!(
+        keys(&["history", "--repo", "org/one", "--limit", "1"]),
+        ["org/one#3"]
+    );
+    let out = env.run(&["history", "--repo", "org/on"], &[]);
+    assert!(out.status.success());
+    assert_eq!(stdout_of(&out), "no history yet\n");
+
+    let out = env.run(&["history", "--json", "--limit", "2"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let entries: Vec<prx::history::HistoryEntry> =
+        serde_json::from_slice(&out.stdout).expect("--json is the bare entry array");
+    let numbers: Vec<u64> = entries.iter().map(|e| e.number()).collect();
+    assert_eq!(numbers, [4, 3]);
+    assert!(!stdout_of(&out).contains("recent review history"));
+
+    // Reading history never rewrites it.
+    assert_eq!(
+        std::fs::read_to_string(env.history_path())
+            .unwrap()
+            .lines()
+            .count(),
+        4
+    );
+    // A bad --limit is a usage error.
+    let out = env.run(&["history", "--limit", "-1"], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+}
+
+/// Regression: a history line torn inside a multi-byte character (a write
+/// cut short by a crash) made the whole file unreadable, so `prx history`,
+/// `prx insights`, and `prx usage` all failed with "stream did not contain
+/// valid UTF-8". The torn line is skipped; everything else is reported.
+#[test]
+fn history_insights_and_usage_skip_a_line_that_is_not_utf8() {
+    let env = Env::new("hist-utf8");
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(review_line(&now, "org/one", 1, "approved").as_bytes());
+    bytes.push(b'\n');
+    // "café" cut after the first byte of "é", with no closing quote.
+    bytes.extend_from_slice(b"{\"event\":\"pr_merged\",\"title\":\"caf\xc3\n");
+    bytes.extend_from_slice(review_line(&now, "org/one", 2, "changes_requested").as_bytes());
+    bytes.push(b'\n');
+    std::fs::create_dir_all(env.data_dir.path()).unwrap();
+    std::fs::write(env.history_path(), &bytes).unwrap();
+
+    let out = env.run(&["history"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(timeline_keys(&stdout_of(&out)), ["org/one#2", "org/one#1"]);
+
+    let out = env.run(&["insights"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("total: 2 (last 7 days: 2, last 30 days: 2)"),
+        "{}",
+        stdout_of(&out)
+    );
+
+    let out = env.run(&["usage", "--json"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let usage: prx::usage::Usage = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(usage.runs_without_usage, 2);
+
+    // The file itself is left exactly as it was found.
+    assert_eq!(std::fs::read(env.history_path()).unwrap(), bytes);
+}
+
+/// `--days` bounds: 0 is refused, anything else is a window, and a window
+/// longer than recorded time is simply all of it.
+///
+/// Regression: `--days 100000000` panicked (`DateTime - TimeDelta`
+/// overflowed) and `--days 18446744073709551615` wrapped into a cutoff in
+/// the future and reported an empty history.
+#[test]
+fn insights_days_window_bounds_in_process() {
+    let env = Env::new("ins-days");
+    let two_days_ago = (Utc::now() - TimeDelta::try_days(2).unwrap())
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string();
+    seed(
+        &env,
+        &[
+            review_line("2020-01-01T00:00:00Z", "org/one", 1, "approved"),
+            review_line(&two_days_ago, "org/two", 2, "approved"),
+        ],
+    );
+    let run = |days: &str| env.run(&["insights", "--days", days], &[]);
+
+    for days in ["100000000", "18446744073709551615"] {
+        let out = run(days);
+        assert!(out.status.success(), "--days {days}: {}", stderr_of(&out));
+        let stdout = stdout_of(&out);
+        assert!(
+            stdout.starts_with(&format!("prx insights (last {days} days · generated ")),
+            "{stdout}"
+        );
+        assert!(stdout.contains("total: 2 ("), "--days {days}: {stdout}");
+    }
+
+    let out = run("3");
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("total: 1 (last 7 days: 1, last 30 days: 1)"),
+        "{}",
+        stdout_of(&out)
+    );
+    let out = run("1");
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.starts_with("prx insights (last 1 day · "),
+        "{stdout}"
+    );
+    assert!(stdout.contains("no reviews recorded yet"), "{stdout}");
+
+    let out = run("0");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("error: --days must be at least 1"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert_eq!(stdout_of(&out), "");
+    for bad in ["-1", "abc", "1.5", "18446744073709551616"] {
+        assert_eq!(run(bad).status.code(), Some(2), "--days {bad}");
+    }
+
+    // --repo narrows the same report; an unknown repo is just empty.
+    let out = env.run(&["insights", "--repo", "org/one"], &[]);
+    let stdout = stdout_of(&out);
+    assert!(
+        stdout.contains("total: 1 (last 7 days: 0, last 30 days: 0)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("org/one: 1 reviews"), "{stdout}");
+    assert!(!stdout.contains("org/two"), "{stdout}");
+    let out = env.run(&["insights", "--repo", "org/none"], &[]);
+    assert!(out.status.success());
+    assert!(
+        stdout_of(&out).contains("no reviews recorded yet"),
+        "{}",
+        stdout_of(&out)
+    );
 }

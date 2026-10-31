@@ -366,3 +366,330 @@ fn doctor_warns_about_a_leftover_legacy_agent_beside_the_app_item() {
     assert!(stdout.contains("legacy agent com.prx.daemon"), "{stdout}");
     assert!(stdout.contains("all checks passed"), "{stdout}");
 }
+
+// ------------------------------------------------- hermetic doctor runs
+//
+// The tests below control everything doctor looks at: a PATH made only of
+// the fake-gh directory (so no host `gh`, agent, or browser opener leaks
+// in) and a redirected HOME (so the autostart lines never read the real
+// `~/Library/LaunchAgents` or `~/.config/systemd`).
+
+struct Sandbox {
+    cfg_dir: TempDir,
+    data_dir: TempDir,
+    home: TempDir,
+    gh: TempDir,
+}
+
+impl Sandbox {
+    fn new(tag: &str) -> Self {
+        Sandbox {
+            cfg_dir: TempDir::new(&format!("doctor-{tag}-cfg")),
+            data_dir: TempDir::new(&format!("doctor-{tag}-data")),
+            home: TempDir::new(&format!("doctor-{tag}-home")),
+            gh: fake_gh_dir(),
+        }
+    }
+
+    fn config(&self) -> std::path::PathBuf {
+        self.cfg_dir.child("config.yml")
+    }
+
+    /// A do-nothing executable named `name` in the fake-gh directory.
+    fn tool(&self, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = self.gh.child(name);
+        write_file(&path, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Both platform openers, so the browser line is green on any host.
+    fn with_system_opener(&self) {
+        self.tool("open");
+        self.tool("xdg-open");
+    }
+
+    fn doctor(&self, with_gh: bool, extra: &[(&str, &str)]) -> std::process::Output {
+        let home = self.home.path().to_str().expect("temp home is utf-8");
+        let mut env = vec![("HOME", home), ("PRX_APP_SEARCH_DIRS", "")];
+        env.extend_from_slice(extra);
+        run_cli_isolated(
+            &self.config(),
+            self.data_dir.path(),
+            &["doctor"],
+            with_gh.then(|| self.gh.path()),
+            &env,
+        )
+    }
+}
+
+/// The report line of the check labelled `name`, as `(marker, detail)`.
+#[track_caller]
+fn check_line<'a>(stdout: &'a str, name: &str) -> (&'a str, &'a str) {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.get(9..).is_some_and(|rest| rest.starts_with(name)))
+        .collect();
+    assert_eq!(lines.len(), 1, "one `{name}` line expected in:\n{stdout}");
+    let line = lines[0];
+    (&line[3..7], line[9 + name.len()..].trim_start())
+}
+
+/// A config whose engine is an absolute path, so the engine line does not
+/// depend on PATH.
+const SH_ENGINE_CONFIG: &str =
+    "defaults:\n  engine: local\nengines:\n  local:\n    type: agent\n    \
+                                command: /bin/sh\n    args: [\"-c\", \"true\", \"{{PROMPT}}\"]\n";
+
+/// A machine with nothing installed: the starter config and an empty PATH.
+/// Exactly the checks that need a tool fail (gh, gh auth, the engine), the
+/// missing browser opener is a warning, and everything that only needs the
+/// filesystem passes.
+#[test]
+fn doctor_with_an_empty_path_fails_only_the_checks_that_need_a_tool() {
+    let sb = Sandbox::new("emptypath");
+    run_cli(&sb.config(), sb.data_dir.path(), &["init"], None, &[]);
+
+    let out = sb.doctor(false, &[]);
+    let stdout = stdout_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.starts_with("prx doctor\n"), "{stdout}");
+
+    let (marker, detail) = check_line(&stdout, "config");
+    assert_eq!(marker, "ok  ");
+    assert_eq!(
+        detail,
+        format!("{} parsed (0 repos)", sb.config().display())
+    );
+    assert_eq!(
+        check_line(&stdout, "gh binary"),
+        ("FAIL", "gh not found on PATH")
+    );
+    assert_eq!(
+        check_line(&stdout, "gh auth"),
+        ("FAIL", "skipped (gh not found)")
+    );
+    assert_eq!(
+        check_line(&stdout, "engine (defaults.engine = pi)"),
+        ("FAIL", "agent 'pi' command 'pi' not found on PATH")
+    );
+    let (marker, detail) = check_line(&stdout, "browser");
+    assert_eq!(marker, "WARN");
+    assert!(
+        detail.starts_with("(defaults): `")
+            && detail.ends_with("` not found on PATH; prx cannot open PRs in a browser"),
+        "{detail}"
+    );
+    assert_eq!(
+        check_line(&stdout, "prompts"),
+        ("ok  ", "defaults -> built-in default")
+    );
+    let (marker, detail) = check_line(&stdout, "data dir");
+    assert_eq!(marker, "ok  ");
+    assert_eq!(detail, format!("{} writable", sb.data_dir.path().display()));
+    assert_eq!(
+        check_line(&stdout, "autostart"),
+        ("ok  ", "not installed (run `prx daemon install`)")
+    );
+    assert_eq!(
+        check_line(&stdout, "menubar autostart"),
+        (
+            "ok  ",
+            "not installed (run `prx daemon install --include-menubar`)"
+        )
+    );
+
+    // The failures are counted (the warning is not), on stderr, and there is
+    // no success line.
+    assert!(
+        stderr_of(&out).contains("error: doctor found 3 problem(s)"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!stdout.contains("all checks passed"), "{stdout}");
+}
+
+/// Everything in place: every line is `ok`, the summary has no warning
+/// count, and the exit code is zero. Each warning then shows up in the
+/// count without failing the run.
+#[test]
+fn doctor_summary_counts_warnings_and_only_failures_fail() {
+    let sb = Sandbox::new("summary");
+    sb.with_system_opener();
+    write_file(&sb.config(), SH_ENGINE_CONFIG);
+
+    let out = sb.doctor(true, &[]);
+    let stdout = stdout_of(&out);
+    assert!(out.status.success(), "{stdout}\n{}", stderr_of(&out));
+    assert!(
+        !stdout.contains("[WARN]") && !stdout.contains("[FAIL]"),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("\n\nall checks passed\n"), "{stdout}");
+    assert_eq!(
+        check_line(&stdout, "gh auth"),
+        ("ok  ", "authenticated as testuser")
+    );
+    assert_eq!(
+        check_line(&stdout, "engine (defaults.engine = local)"),
+        ("ok  ", "local -> /bin/sh")
+    );
+    let (marker, detail) = check_line(&stdout, "browser");
+    assert_eq!(marker, "ok  ");
+    assert!(
+        detail.starts_with("(defaults): system default (via "),
+        "{detail}"
+    );
+
+    // One warning: a leftover prompt file with the user's own text.
+    let legacy = sb.data_dir.child("prompts/default.md");
+    write_file(&legacy, "my own review prompt\n");
+    let out = sb.doctor(true, &[]);
+    let stdout = stdout_of(&out);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(&format!(
+            "[WARN] prompts                      {} is no longer read; paste its text into \
+             defaults.review_prompt to keep your edits",
+            legacy.display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.ends_with("\n\nall checks passed (1 warning)\n"),
+        "{stdout}"
+    );
+
+    // Two: an llm_api engine whose key variable is not set here.
+    let mut yaml = SH_ENGINE_CONFIG.to_string();
+    yaml.push_str(
+        "  cloud:\n    type: llm_api\n    provider: anthropic\n    model: claude-haiku\n    \
+         api_key_env: PRX_DOCTOR_TEST_UNSET_KEY\nrepos:\n  - name: org/one\n    engine: cloud\n",
+    );
+    write_file(&sb.config(), &yaml);
+    let out = sb.doctor(true, &[]);
+    let stdout = stdout_of(&out);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.ends_with("\n\nall checks passed (2 warnings)\n"),
+        "{stdout}"
+    );
+
+    // A leftover file that is just the shipped default is not worth a word.
+    write_file(&legacy, prx::prompt::DEFAULT_PROMPT);
+    let out = sb.doctor(true, &[("PRX_DOCTOR_TEST_UNSET_KEY", "set")]);
+    let stdout = stdout_of(&out);
+    assert!(stdout.ends_with("\n\nall checks passed\n"), "{stdout}");
+    assert!(!stdout.contains("no longer read"), "{stdout}");
+}
+
+/// Regression: an engine command was always searched on PATH, even when it
+/// was a path. With an empty PATH an absolute command (what the docs
+/// recommend for launchd) was reported "not found on PATH", and a relative
+/// path was "found" whenever some PATH directory happened to contain it,
+/// although running it resolves against the working directory.
+///
+/// Every level that names an engine gets its own line: defaults, an org,
+/// a repo, and the brief engines.
+#[test]
+fn doctor_checks_engine_commands_given_as_paths_without_consulting_path() {
+    let sb = Sandbox::new("engine-paths");
+    sb.with_system_opener();
+    // `<gh dir>/sub/agent` exists and the gh dir is on PATH, but
+    // `sub/agent` is not a file relative to where doctor runs.
+    sb.tool("sub/agent");
+    write_file(
+        &sb.config(),
+        "defaults:\n  engine: abs\n  brief:\n    engine: rel\n\
+         engines:\n  abs:\n    type: agent\n    command: /bin/sh\n    args: [\"-c\", \"true\", \"{{PROMPT}}\"]\n  \
+         rel:\n    type: agent\n    command: sub/agent\n    args: [\"{{PROMPT}}\"]\n  \
+         ghost:\n    type: agent\n    command: /no/such/agent\n    args: [\"{{PROMPT}}\"]\n  \
+         named:\n    type: agent\n    command: gh\n    args: [\"{{PROMPT}}\"]\n\
+         orgs:\n  - org: org\n    engine: ghost\n\
+         repos:\n  - name: org/one\n    engine: named\n    brief:\n      engine: abs\n",
+    );
+
+    let expect = |stdout: &str, gh_line: (&str, String)| {
+        assert_eq!(
+            check_line(stdout, "engine (defaults.engine = abs)"),
+            ("ok  ", "abs -> /bin/sh")
+        );
+        assert_eq!(
+            check_line(stdout, "engine (org/one: brief.engine = abs)"),
+            ("ok  ", "abs -> /bin/sh")
+        );
+        assert_eq!(
+            check_line(stdout, "engine (orgs[org]: engine = ghost)"),
+            (
+                "FAIL",
+                "agent 'ghost' command '/no/such/agent' does not exist or is not executable"
+            )
+        );
+        assert_eq!(
+            check_line(stdout, "engine (defaults: brief.engine = rel)"),
+            (
+                "FAIL",
+                "agent 'rel' command 'sub/agent' does not exist or is not executable"
+            )
+        );
+        let (marker, detail) = check_line(stdout, "engine (org/one: engine = named)");
+        assert_eq!((marker, detail), (gh_line.0, gh_line.1.as_str()));
+    };
+
+    // A bare name is still a PATH lookup: found with the gh dir on PATH...
+    let out = sb.doctor(true, &[]);
+    let stdout = stdout_of(&out);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    expect(
+        &stdout,
+        ("ok  ", format!("named -> {}", sb.gh.child("gh").display())),
+    );
+    assert!(
+        stderr_of(&out).contains("doctor found 2 problem(s)"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // ...and not with PATH empty, where the absolute path still resolves.
+    let out = sb.doctor(false, &[("PATH", "")]);
+    let stdout = stdout_of(&out);
+    expect(
+        &stdout,
+        (
+            "FAIL",
+            "agent 'named' command 'gh' not found on PATH".to_string(),
+        ),
+    );
+    assert_eq!(
+        check_line(&stdout, "gh binary"),
+        ("FAIL", "gh not found on PATH")
+    );
+}
+
+/// Doctor is read-only where the user's setup is concerned: with no config
+/// it reports the failure and creates none.
+#[test]
+fn doctor_never_creates_a_config() {
+    let sb = Sandbox::new("no-config");
+    let out = sb.doctor(true, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let stdout = stdout_of(&out);
+    let (marker, detail) = check_line(&stdout, "config");
+    assert_eq!(marker, "FAIL");
+    assert!(detail.ends_with("run `prx init` first"), "{detail}");
+    assert_eq!(
+        check_line(&stdout, "engines"),
+        ("FAIL", "skipped (config failed)")
+    );
+    assert_eq!(
+        check_line(&stdout, "prompts"),
+        ("FAIL", "skipped (config failed)")
+    );
+    // gh is independent of the config and is still checked.
+    assert_eq!(
+        check_line(&stdout, "gh auth"),
+        ("ok  ", "authenticated as testuser")
+    );
+    assert!(!sb.config().exists());
+}

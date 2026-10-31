@@ -50,11 +50,15 @@ A monochrome template glyph, the Verdict X (macOS tints it for light, dark and t
 bars), rendered at 1x/2x/3x. States differ by shape, in precedence order: **offline** (dimmed mark
 + slashed ring — daemon unreachable; it reconnects automatically, since discovery re-reads
 `daemon.port`/`daemon.token` on every poll), **paused / stopped** (pause bars — a pause, or review
-mode `off`), **reviewing** (three dots — reviews in flight), **attention** (a solid dot), and
-**idle** (the bare mark). The number of PRs needing attention (`reviewed_changes_requested` +
-`in_review`) is the status item's **title**, beside the glyph in the menu bar's font — shown in
-every online state, capped at `99+`, hidden offline; the tooltip says the state in words. See
-`assets/menubar-glyph-states.png`.
+mode `off`), **bell** (a small bell — ready or blocked PRs you have not opened yet),
+**reviewing** (three dots — reviews in flight), **attention** (a solid dot), and **idle** (the
+bare mark). The number of PRs needing attention (`reviewed_changes_requested` + `in_review`) is
+the status item's **title**, beside the glyph in the menu bar's font — shown in every online
+state, capped at `99+`, hidden offline; the tooltip says the state in words. While the bell is
+on, the title adds `✓N` for ready PRs and `✕N` for blocked PRs not opened yet (for example
+`3 ✓1 ✕2`). Opening the PR from its menu row, its banner, or a window link clears it from the
+bell. See [Ready and blocked PRs](notifications.md#ready-and-blocked-prs) and
+`assets/menubar-glyph-states.png` (which does not show the bell).
 
 ## The menu
 
@@ -85,7 +89,8 @@ running, app is 1.1.0 — Show log*.
 
 *Check GitHub now* ⌘R (`POST /review-now`: a config reload check, then an
 immediate poll of every repo and the due-scan — nothing is enqueued while paused), *Review PR…*
-⌘N (a panel taking any [target form](../reference/cli.md#prx-review) — `org/repo#N`, a URL, `repo#N`, `N`, `#N` —
+⌘N (a panel taking any [target form](../reference/cli.md#prx-review) — `org/repo#N`, a pasted GitHub PR URL such as
+`https://github.com/acme/api/pull/42/files`, `repo#N`, `N`, `#N` —
 plus the engine / post / prompt options; the daemon's error or note, such as the candidates of
 an ambiguous number, is shown verbatim).
 
@@ -294,8 +299,10 @@ item running.
   review), the inline-comments toggle and review body template, and the Block and Approve messages. Fields show the built-in text until you change it.
 - *Schedule* — presets (hourly, weekday mornings, …) or a custom cron expression, with the next
   run times.
-- *Notifications* — the global *Deliver notifications* switch, event tiers (including review
-  started), and each tier's banner and sound (a menu of the macOS alert sounds).
+- *Notifications* — the global *Deliver notifications* switch, the *Bell in the menu bar*
+  switch, each event's on/off switch and tier (including review started), each event's own sound
+  (built in, the tier's, none, or a macOS alert sound), and each tier's banner and sound (a menu
+  of the macOS alert sounds).
 - *Engines* — the agent CLIs the daemon found on this machine (built-ins plus presets for Gemini
   CLI, OpenCode, Cursor Agent, Copilot CLI and Amp), your own agents, and LLM API engines (provider,
   base URL, model, key variable name, sampling) with whether each key variable is set.

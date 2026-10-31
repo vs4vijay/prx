@@ -1380,6 +1380,12 @@ async fn run_review_one(
         .ok_or_else(|| {
             anyhow!("repo '{repo_name}' is not configured; add it with `prx repos add {repo_name}`")
         })?;
+    // `off` is a stop switch: no polling and no reviews, forced or not. The
+    // daemon declines such a review; so does this daemon-less path.
+    if repo.review_mode == ReviewMode::Off {
+        println!("review mode is off for {repo_name}; {key} was not reviewed");
+        return Ok(());
+    }
 
     let gh = GhCli::new();
     let adapter: EngineAdapter = EngineAdapter::default();
@@ -1435,6 +1441,13 @@ async fn run_review_all(config: &Config, dry_run: bool) -> Result<()> {
         .context("configuration is invalid")?;
     if repos.is_empty() {
         bail!("no repositories configured; add one with `prx repos add <org/repo>`");
+    }
+    // `off` repos are neither polled nor reviewed (see `run_review_one`).
+    let (repos, off): (Vec<EffectiveRepo>, Vec<EffectiveRepo>) = repos
+        .into_iter()
+        .partition(|repo| repo.review_mode != ReviewMode::Off);
+    for repo in &off {
+        println!("review mode is off for {}; not reviewed", repo.name);
     }
 
     let gh = GhCli::new();
@@ -1954,30 +1967,45 @@ pub enum PrRef {
 pub const PR_REF_FORMS: &str =
     "org/repo#N, a GitHub PR URL (https://github.com/org/repo/pull/N), repo#N, N, or #N";
 
-/// Parse a PR reference (design D5): `org/repo#N`, a GitHub PR URL (any
-/// trailing path, query, or fragment), `repo#N`, `N`, or `#N`. Surrounding
-/// whitespace is ignored; `N` must be a positive integer.
+/// Parse a PR reference (design D5): `org/repo#N`, a GitHub PR URL (with or
+/// without `http(s)://` and `www.`; any trailing path such as `/files`, a
+/// query, a fragment, or a trailing slash), `repo#N`, `N`, or `#N`.
+/// Surrounding whitespace is ignored; `N` must be a positive integer. A URL
+/// on another host, or a github.com URL that is not a pull request (an
+/// issue, say), is rejected with the reason.
 pub fn parse_pr_ref(input: &str) -> Result<PrRef> {
     let text = input.trim();
     let invalid = || anyhow!("invalid PR target '{text}': expected {PR_REF_FORMS}");
+    let invalid_because =
+        |why: &str| anyhow!("invalid PR target '{text}': {why}; expected {PR_REF_FORMS}");
     let number = |n: &str| -> Result<u64> {
         if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
             return Err(invalid());
         }
         n.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(invalid)
     };
-    let url_path = ["https://", "http://", ""].iter().find_map(|scheme| {
-        let rest = text.strip_prefix(scheme)?;
-        rest.strip_prefix("github.com/")
-            .or_else(|| rest.strip_prefix("www.github.com/"))
-    });
+    // The scheme and host are case-insensitive; the path is kept as typed.
+    let after_scheme = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| strip_prefix_ci(text, scheme));
+    let rest = after_scheme.unwrap_or(text);
+    let url_path = ["github.com/", "www.github.com/"]
+        .iter()
+        .find_map(|host| strip_prefix_ci(rest, host));
+    if url_path.is_none() && after_scheme.is_some() {
+        return Err(invalid_because(
+            "only github.com pull request URLs are supported",
+        ));
+    }
     if let Some(path) = url_path {
         let path = path.split(['?', '#']).next().unwrap_or_default();
         let mut parts = path.split('/');
-        let (Some(org), Some(name), Some("pull"), Some(n)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(invalid());
+        let (org, name, kind, n) = (parts.next(), parts.next(), parts.next(), parts.next());
+        if kind == Some("issues") {
+            return Err(invalid_because("that is an issue URL, not a pull request"));
+        }
+        let (Some(org), Some(name), Some("pull"), Some(n)) = (org, name, kind, n) else {
+            return Err(invalid_because("not a GitHub pull request URL"));
         };
         let repo = format!("{org}/{name}");
         crate::config::validate_repo_name(&repo).map_err(|_| invalid())?;
@@ -2002,12 +2030,27 @@ pub fn parse_pr_ref(input: &str) -> Result<PrRef> {
     }
 }
 
-/// Parse `org/repo#123` into (repo, number).
+/// `text` without `prefix`, compared ASCII case-insensitively.
+fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
+}
+
+/// Parse `org/repo#123` into (repo, number). As in [`parse_pr_ref`], the
+/// number is decimal digits only and positive: no sign, no `#0`.
 pub fn parse_pr_key(target: &str) -> Result<(String, u64)> {
     let invalid = || anyhow!("invalid PR target '{target}': expected org/repo#123");
     let (repo, number) = target.rsplit_once('#').ok_or_else(invalid)?;
     crate::config::validate_repo_name(repo).map_err(|_| invalid())?;
-    let number: u64 = number.parse().map_err(|_| invalid())?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(invalid)?;
     Ok((repo.to_string(), number))
 }
 
@@ -2690,6 +2733,29 @@ mod tests {
             ),
             ("http://www.github.com/acme/api/pull/7", full("acme/api", 7)),
             ("github.com/acme/api/pull/7", full("acme/api", 7)),
+            ("www.github.com/acme/api/pull/7", full("acme/api", 7)),
+            (
+                "https://github.com/ren3-ai/ren3/pull/1063",
+                full("ren3-ai/ren3", 1063),
+            ),
+            (
+                "https://github.com/acme/api/pull/42/commits",
+                full("acme/api", 42),
+            ),
+            (
+                "https://github.com/acme/api/pull/42/changes",
+                full("acme/api", 42),
+            ),
+            ("https://github.com/acme/api/pull/42/", full("acme/api", 42)),
+            (
+                "https://github.com/acme/api/pull/42?w=1",
+                full("acme/api", 42),
+            ),
+            (
+                "\t https://github.com/my-org/my.repo_x/pull/3 \n",
+                full("my-org/my.repo_x", 3),
+            ),
+            ("HTTPS://GitHub.com/acme/api/pull/5", full("acme/api", 5)),
             ("api#42", PrRef::Short("api".into(), 42)),
             ("my.repo-x_1#3", PrRef::Short("my.repo-x_1".into(), 3)),
             ("42", PrRef::Bare(42)),
@@ -2716,9 +2782,44 @@ mod tests {
             "https://github.com/acme/api/pull/",
             "https://github.com/acme/api/pull/x",
             "https://gitlab.com/acme/api/pull/1",
+            "https://github.com/acme/api/pull/0",
+            "https://github.com/acme/api/pull/42abc",
+            "https://github.com/acme/api",
+            "https://github.com/acme/api/pulls/42",
+            "https://github.com/-acme/api/pull/42",
+            "https://github.com/acme/../pull/42",
+            "https://github.com.evil.com/acme/api/pull/1",
+            "https://notgithub.com/acme/api/pull/1",
+            "ftp://github.com/acme/api/pull/1",
         ] {
             let err = parse_pr_ref(bad).unwrap_err().to_string();
             assert!(err.contains(PR_REF_FORMS), "{bad:?}: {err}");
+        }
+        // URL mistakes name the reason, not only the accepted forms.
+        for (bad, why) in [
+            (
+                "https://gitlab.com/acme/api/pull/1",
+                "only github.com pull request URLs",
+            ),
+            (
+                "http://example.com/acme/api/pull/1",
+                "only github.com pull request URLs",
+            ),
+            (
+                "https://github.com/acme/api/issues/42",
+                "an issue URL, not a pull request",
+            ),
+            (
+                "github.com/acme/api/issues/42",
+                "an issue URL, not a pull request",
+            ),
+            (
+                "https://github.com/acme/api/tree/main",
+                "not a GitHub pull request URL",
+            ),
+        ] {
+            let err = parse_pr_ref(bad).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad:?}: {err}");
         }
     }
 
@@ -2809,5 +2910,151 @@ mod tests {
         .normalized();
         assert_eq!(o.engine.as_deref(), Some("codex"));
         assert_eq!(o.extra_prompt.as_deref(), Some("focus"));
+    }
+
+    /// Manifest text is rendered once and never treated as template: a
+    /// summary or finding made of placeholders stays literal, in the
+    /// default body and in a custom template.
+    #[test]
+    fn manifest_text_is_never_expanded_as_a_template() {
+        let hostile = "{{IDENTITY}} {{PR}} {{VERDICT}} {{FINDINGS_NITS}} {{BLOCKING_COUNT}}";
+        let m = ReviewManifest {
+            summary: hostile.to_string(),
+            findings: vec![finding(
+                Some("{{PR_KEY}}.rs"),
+                Some(1),
+                Severity::Nit,
+                hostile,
+            )],
+            ..manifest(Verdict::Approved)
+        };
+        let default = body_with(&m, "org/a#7", None, None);
+        assert_eq!(
+            default,
+            format!(
+                "## prx review of `org/a#7` \u{2014} approved \u{2014} no blocking issues\n\n{hostile}\n\n\
+                 ### Nits (1)\n- `{{{{PR_KEY}}}}.rs:1` \u{2014} {hostile}\n\n\u{2014} automated review by prx\n"
+            )
+        );
+        let custom = render(
+            &m,
+            "{{SUMMARY}}\n{{FINDINGS_NITS}}\n{{BRIEF}}",
+            None,
+            Some(hostile),
+        );
+        assert_eq!(
+            custom,
+            format!(
+                "{hostile}\n### Nits (1)\n- `{{{{PR_KEY}}}}.rs:1` \u{2014} {hostile}\n{hostile}"
+            )
+        );
+    }
+
+    /// The three verdicts read differently in the posted heading, and
+    /// "approved" always carries its qualifier: the body never says a bare
+    /// "approved" that could be taken for a GitHub approval.
+    #[test]
+    fn verdict_labels_in_the_posted_heading() {
+        let heading = |v| {
+            let body = body_with(&manifest(v), "org/a#7", None, None);
+            body.lines().next().unwrap().to_string()
+        };
+        assert_eq!(
+            heading(Verdict::Approved),
+            "## prx review of `org/a#7` \u{2014} approved \u{2014} no blocking issues"
+        );
+        assert_eq!(
+            heading(Verdict::ChangesRequested),
+            "## prx review of `org/a#7` \u{2014} changes requested"
+        );
+        assert_eq!(
+            heading(Verdict::CommentOnly),
+            "## prx review of `org/a#7` \u{2014} comment-only review"
+        );
+    }
+
+    /// `prx approve` takes exactly `org/repo#N`: nothing looser reaches the
+    /// one command that approves on GitHub.
+    #[test]
+    fn approve_target_must_be_a_full_reference() {
+        assert_eq!(
+            parse_pr_key("acme/api#42").unwrap(),
+            ("acme/api".to_string(), 42)
+        );
+        for bad in [
+            "",
+            "42",
+            "#42",
+            "api#42",
+            "acme/api",
+            "acme/api#",
+            "acme/api#x",
+            "acme/api#-1",
+            "acme/api#+5",
+            "acme/api#0",
+            "acme/api#00",
+            "acme/api#1.5",
+            "acme/api# 1",
+            "acme/api#1 --approve",
+            "acme/a pi#1",
+            "https://github.com/acme/api/pull/42",
+        ] {
+            let err = parse_pr_key(bad).unwrap_err().to_string();
+            assert!(err.contains("expected org/repo#123"), "{bad:?}: {err}");
+        }
+    }
+
+    /// The brief prompt bounds the PR description as well as the diff, on
+    /// a character boundary, and says so.
+    #[test]
+    fn brief_prompt_bounds_a_long_description() {
+        let mut view = brief_view();
+        view.body = format!("  {}TAIL  ", "\u{e9}".repeat(BRIEF_BODY_MAX_CHARS));
+        let prompt = brief_prompt("org/a#7", &view, "");
+        let start = prompt.find("-----BEGIN PR DESCRIPTION-----\n").unwrap();
+        let end = prompt.find("\n-----END PR DESCRIPTION-----").unwrap();
+        let shown = &prompt[start + "-----BEGIN PR DESCRIPTION-----\n".len()..end];
+        assert_eq!(
+            shown,
+            format!(
+                "{}\n[description truncated]",
+                "\u{e9}".repeat(BRIEF_BODY_MAX_CHARS)
+            )
+        );
+        assert!(!prompt.contains("TAIL"));
+
+        // At the bound nothing is cut and nothing is claimed.
+        view.body = "d".repeat(BRIEF_BODY_MAX_CHARS);
+        assert!(!brief_prompt("org/a#7", &view, "").contains("[description truncated]"));
+    }
+
+    /// A diff with no `diff --git` header (or text before the first one)
+    /// is still bounded, and counts no files it cannot see.
+    #[test]
+    fn brief_diff_without_file_headers_is_still_bounded() {
+        let raw = "\u{1F600} line\n".repeat(50);
+        let t = truncate_diff_for_brief(&raw, 20);
+        assert!(t.truncated);
+        assert!(t.text.chars().count() <= 20 && !t.text.is_empty());
+        assert_eq!((t.files_shown, t.files_total), (0, 0));
+
+        let with_preamble = format!("warning: something\n{}", file_diff("a.rs", 3));
+        let whole = truncate_diff_for_brief(&with_preamble, usize::MAX);
+        assert_eq!(
+            (whole.truncated, whole.files_shown, whole.files_total),
+            (false, 1, 1)
+        );
+        // "diff --git" inside a changed line is content, not a new file.
+        let quoted = format!(
+            "{}+see diff --git a/x b/x for details\n",
+            file_diff("a.rs", 1)
+        );
+        assert_eq!(truncate_diff_for_brief(&quoted, usize::MAX).files_total, 1);
+
+        let empty = truncate_diff_for_brief("", 10);
+        assert_eq!(
+            (empty.text.as_str(), empty.truncated, empty.files_total),
+            ("", false, 0)
+        );
     }
 }

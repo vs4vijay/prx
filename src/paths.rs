@@ -105,3 +105,95 @@ fn is_executable_file(path: &Path) -> bool {
         Err(_) => false,
     }
 }
+
+// The `PRX_CONFIG` / `PRX_DATA_DIR` / `HOME` resolution itself is covered in
+// `tests/cli_pause_paths.rs`, which runs the binary with a controlled
+// environment: unit tests share one process, so they must not set variables.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The on-disk layout is a compatibility surface: an upgrade must find
+    /// the files the previous version wrote, under the same names.
+    #[test]
+    fn data_files_keep_their_names_under_the_data_dir() {
+        let data = data_dir();
+        assert_eq!(state_file(), data.join("state.json"));
+        assert_eq!(history_file(), data.join("history.jsonl"));
+        assert_eq!(logs_dir(), data.join("logs"));
+        assert_eq!(daemon_pid_file(), data.join("daemon.pid"));
+        assert_eq!(daemon_port_file(), data.join("daemon.port"));
+        assert_eq!(daemon_token_file(), data.join("daemon.token"));
+        assert_eq!(
+            legacy_default_prompt_path(),
+            data.join("prompts").join("default.md")
+        );
+        assert_eq!(config_path().parent(), Some(config_dir().as_path()));
+    }
+
+    #[test]
+    fn tilde_expands_only_as_a_leading_home_reference() {
+        let home = expand_tilde("~");
+        assert!(home.is_absolute(), "{home:?}");
+        assert_eq!(expand_tilde("  ~/bin/agent  "), home.join("bin/agent"));
+        // Another user's home, a tilde mid-path, and plain paths are as written.
+        for literal in ["~other/bin", "/opt/~/x", "relative/~", "bin/agent", ""] {
+            assert_eq!(expand_tilde(literal), PathBuf::from(literal), "{literal:?}");
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("prx-paths-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_with_mode(path: &Path, mode: u32) {
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Only a regular file with an execute bit counts: not a plain file,
+    /// not a directory (which has execute bits), not a missing path.
+    #[test]
+    fn executable_means_a_regular_file_with_an_execute_bit() {
+        let dir = scratch("exec");
+        let tool = dir.join("tool");
+        write_with_mode(&tool, 0o755);
+        let owner_only = dir.join("owner-only");
+        write_with_mode(&owner_only, 0o700);
+        let data = dir.join("data");
+        write_with_mode(&data, 0o644);
+        std::fs::create_dir(dir.join("subdir")).unwrap();
+
+        assert!(is_executable_file(&tool));
+        assert!(is_executable_file(&owner_only));
+        assert!(!is_executable_file(&data));
+        assert!(!is_executable_file(&dir.join("subdir")));
+        assert!(!is_executable_file(&dir.join("missing")));
+        // A symlink is judged by what it points at.
+        std::os::unix::fs::symlink(&tool, dir.join("link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("dangling")).unwrap();
+        assert!(is_executable_file(&dir.join("link")));
+        assert!(!is_executable_file(&dir.join("dangling")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An engine configured with an absolute path is found without being on
+    /// `PATH` (the launchd advice in the docs depends on it); a name that
+    /// exists nowhere is not found.
+    #[test]
+    fn find_in_path_accepts_absolute_paths_and_misses_unknown_names() {
+        let dir = scratch("find");
+        let tool = dir.join("my-agent");
+        write_with_mode(&tool, 0o755);
+        assert_eq!(find_in_path(tool.to_str().unwrap()), Some(tool.clone()));
+        let plain = dir.join("not-executable");
+        write_with_mode(&plain, 0o644);
+        assert_eq!(find_in_path(plain.to_str().unwrap()), None);
+        assert_eq!(find_in_path("prx-no-such-binary-anywhere"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -524,4 +524,300 @@ mod tests {
         let back: PrRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, rec);
     }
+
+    /// A unique directory per test, so tests that list a directory never
+    /// see another test's files.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("prx-state-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A state file exactly as the first release wrote it: no `brief`, no
+    /// `exec_summary`, no `human_approved_at`, no `paused_until`.
+    const V1_STATE: &str = r#"{
+  "schema_version": 1,
+  "prs": {
+    "org/repo#7": {
+      "repo": "org/repo", "number": 7, "title": "Add cache", "author": "alice",
+      "head_branch": "feat/cache", "head_sha": "abc", "is_draft": false,
+      "gh_created_at": "2026-09-01T10:00:00Z",
+      "state": "reviewed_changes_requested",
+      "previous_state": null, "skip_reason": null,
+      "snooze_until": null, "snooze_until_push": false,
+      "review_anchor_at": "2026-09-01T10:00:00Z",
+      "last_reviewed_sha": "abc", "last_review_at": "2026-09-01T11:05:00Z",
+      "last_verdict": "changes_requested", "last_summary": "1 blocker",
+      "blocking_count": 1, "nit_count": 2,
+      "review_session": null, "review_attempts": 0, "diff_too_large": false,
+      "updated_at": "2026-09-01T11:05:00Z"
+    }
+  },
+  "last_poll": "2026-09-01T11:10:00Z"
+}"#;
+
+    /// Wire compatibility: the oldest file shape still loads, with every
+    /// field added since defaulting to "absent".
+    #[test]
+    fn oldest_state_file_shape_still_loads() {
+        let dir = scratch("v1");
+        let path = dir.join("state.json");
+        std::fs::write(&path, V1_STATE).unwrap();
+        let state = StateStore::new(path).load().unwrap();
+        assert_eq!(state.paused_until, None);
+        let rec = &state.prs["org/repo#7"];
+        assert_eq!(rec.state, PrState::ReviewedChangesRequested);
+        assert_eq!(rec.last_verdict, Some(Verdict::ChangesRequested));
+        assert_eq!((rec.blocking_count, rec.nit_count), (1, 2));
+        assert_eq!(rec.brief, None);
+        assert_eq!(rec.exec_summary, None);
+        assert_eq!(rec.human_approved_at, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Forward compatibility: fields a newer prx added (at the top level, on
+    /// a record, inside a brief) are ignored, so a downgrade keeps working.
+    #[test]
+    fn unknown_fields_from_a_newer_version_are_ignored() {
+        let json = V1_STATE
+            .replace(
+                "\"schema_version\": 1,",
+                "\"schema_version\": 1, \"future_top\": {\"a\": 1},",
+            )
+            .replace(
+                "\"diff_too_large\": false,",
+                "\"diff_too_large\": false, \"future_field\": [1, 2], \"brief\": {\"text\": \"t\", \
+                 \"created_at\": \"2026-09-01T11:05:00Z\", \"updated_at\": \"2026-09-01T11:05:00Z\", \
+                 \"head_sha\": \"abc\", \"source\": \"review\", \"future_brief_field\": true},",
+            );
+        let state: StateFile = serde_json::from_str(&json).unwrap();
+        let brief = state.prs["org/repo#7"].brief.as_ref().unwrap();
+        assert_eq!(brief.text, "t");
+        assert_eq!(brief.engine, None);
+    }
+
+    /// The JSON tokens of the lifecycle enums are a wire format: state.json,
+    /// history, the IPC API and the menu bar app all carry them.
+    #[test]
+    fn lifecycle_enum_tokens_are_stable() {
+        let token = |v: serde_json::Value| v.as_str().unwrap().to_string();
+        let states = [
+            (PrState::Pending, "pending"),
+            (PrState::InReview, "in_review"),
+            (PrState::ReviewedApproved, "reviewed_approved"),
+            (
+                PrState::ReviewedChangesRequested,
+                "reviewed_changes_requested",
+            ),
+            (PrState::Skipped, "skipped"),
+            (PrState::Merged, "merged"),
+            (PrState::Closed, "closed"),
+        ];
+        for (state, name) in states {
+            assert_eq!(token(serde_json::to_value(state).unwrap()), name);
+            assert_eq!(
+                serde_json::from_value::<PrState>(name.into()).unwrap(),
+                state
+            );
+        }
+        let reasons = [
+            (SkipReason::Draft, "draft"),
+            (SkipReason::Config, "config"),
+            (SkipReason::Snoozed, "snoozed"),
+            (SkipReason::Ignored, "ignored"),
+        ];
+        for (reason, name) in reasons {
+            assert_eq!(token(serde_json::to_value(reason).unwrap()), name);
+            assert_eq!(
+                serde_json::from_value::<SkipReason>(name.into()).unwrap(),
+                reason
+            );
+        }
+        let verdicts = [
+            (Verdict::Approved, "approved"),
+            (Verdict::ChangesRequested, "changes_requested"),
+            (Verdict::CommentOnly, "comment_only"),
+        ];
+        for (verdict, name) in verdicts {
+            assert_eq!(token(serde_json::to_value(verdict).unwrap()), name);
+            assert_eq!(
+                serde_json::from_value::<Verdict>(name.into()).unwrap(),
+                verdict
+            );
+        }
+        for (source, name) in [
+            (BriefSource::Review, "review"),
+            (BriefSource::OnDemand, "on_demand"),
+        ] {
+            assert_eq!(token(serde_json::to_value(source).unwrap()), name);
+        }
+    }
+
+    /// Anything that is not a whole, well-typed state file is `Corrupt` and
+    /// names the file. It is never read as "no PRs", and loading never
+    /// rewrites or removes the damaged file.
+    #[test]
+    fn damaged_state_files_are_corrupt_errors_and_left_untouched() {
+        let dir = scratch("damaged");
+        let path = dir.join("state.json");
+        let store = StateStore::new(path.clone());
+        let truncated = &V1_STATE[..V1_STATE.len() / 2];
+        let unknown_state = V1_STATE.replace("reviewed_changes_requested", "reviewed_maybe");
+        let missing_field = V1_STATE.replace("\"number\": 7,", "");
+        for damaged in [
+            "",
+            "   \n",
+            "null",
+            "[]",
+            "{}",
+            truncated,
+            unknown_state.as_str(),
+            missing_field.as_str(),
+            r#"{"schema_version":"one","prs":{},"last_poll":null}"#,
+        ] {
+            std::fs::write(&path, damaged).unwrap();
+            let err = store.load().unwrap_err();
+            assert!(
+                matches!(err, StateError::Corrupt { path: ref p, .. } if p == &path),
+                "{damaged:?}: {err}"
+            );
+            assert!(err.to_string().contains("state.json is corrupt"), "{err}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), damaged);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path that exists but cannot be read as a file is an I/O error, not
+    /// an empty state.
+    #[test]
+    fn unreadable_state_path_is_an_io_error() {
+        let dir = scratch("unreadable");
+        let err = StateStore::new(dir.clone()).load().unwrap_err();
+        assert!(matches!(err, StateError::Io { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_creates_the_data_directory() {
+        let dir = scratch("mkdir");
+        let path = dir.join("nested").join("deeper").join("state.json");
+        let store = StateStore::new(path.clone());
+        assert_eq!(store.path(), path.as_path());
+        store.save(&StateFile::default()).unwrap();
+        assert_eq!(store.load().unwrap(), StateFile::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed save reports a write error and leaves no temp file behind;
+    /// whatever was at the target stays.
+    #[test]
+    fn failed_save_leaves_the_target_and_no_temp_file() {
+        let dir = scratch("save-fail");
+        // The target is a non-empty directory, so the final rename fails.
+        let path = dir.join("state.json");
+        std::fs::create_dir_all(path.join("child")).unwrap();
+        let err = StateStore::new(path.clone())
+            .save(&StateFile::default())
+            .unwrap_err();
+        assert!(matches!(err, StateError::Write { .. }), "{err}");
+        assert!(path.join("child").is_dir());
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["state.json"], "temp file left behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Loading migrates in memory only: the file on disk is not rewritten
+    /// until something saves, and saving keeps the legacy field next to the
+    /// brief so an older binary still finds its summary.
+    #[test]
+    fn exec_summary_migration_does_not_write_until_saved() {
+        let dir = scratch("migrate-lazy");
+        let path = dir.join("state.json");
+        let on_disk = V1_STATE.replace(
+            "\"diff_too_large\": false,",
+            "\"diff_too_large\": false, \"exec_summary\": \"  Adds a cache.  \",",
+        );
+        std::fs::write(&path, &on_disk).unwrap();
+        let store = StateStore::new(path.clone());
+        let loaded = store.load().unwrap();
+        let brief = loaded.prs["org/repo#7"].brief.clone().unwrap();
+        assert_eq!(brief.text, "Adds a cache."); // trimmed
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), on_disk);
+
+        store.save(&loaded).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"exec_summary\""), "{saved}");
+        assert!(saved.contains("\"brief\""), "{saved}");
+        // Loading the migrated file again changes nothing.
+        assert_eq!(store.load().unwrap(), loaded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blank legacy summary is not a brief.
+    #[test]
+    fn blank_exec_summary_is_not_migrated() {
+        for blank in ["", "   ", "\n\t"] {
+            let mut rec = sample_record("org/repo", 12);
+            rec.exec_summary = Some(blank.into());
+            assert!(!rec.migrate_exec_summary(), "{blank:?}");
+            assert_eq!(rec.brief, None);
+        }
+    }
+
+    #[test]
+    fn rereview_pending_needs_pending_state_and_a_prior_verdict() {
+        let mut rec = sample_record("org/repo", 13);
+        assert!(!rec.is_rereview_pending()); // first review
+        rec.last_verdict = Some(Verdict::CommentOnly);
+        assert!(rec.is_rereview_pending());
+        rec.state = PrState::ReviewedApproved;
+        assert!(!rec.is_rereview_pending());
+    }
+
+    /// The state-file key and a record's own key agree, including for repo
+    /// names with dots and dashes; `#` separates the number.
+    #[test]
+    fn record_key_matches_key_for() {
+        let rec = sample_record("my-org/repo.name", 4096);
+        assert_eq!(rec.key(), "my-org/repo.name#4096");
+        assert_eq!(rec.key(), PrRecord::key_for(&rec.repo, rec.number));
+    }
+
+    /// Every field, set to a non-default value, survives a save and load:
+    /// the loaded state compares equal to what was saved, sub-second
+    /// timestamps and awkward text included.
+    #[test]
+    fn full_record_round_trips_through_disk_exactly() {
+        let dir = scratch("exact");
+        let store = StateStore::new(dir.join("state.json"));
+        let mut rec = sample_record("org/repo", 21);
+        rec.state = PrState::Skipped;
+        rec.previous_state = Some(PrState::ReviewedApproved);
+        rec.skip_reason = Some(SkipReason::Snoozed);
+        rec.snooze_until = Some(Utc::now());
+        rec.snooze_until_push = true;
+        rec.last_reviewed_sha = Some("abc".into());
+        rec.last_review_at = Some(Utc::now());
+        rec.last_verdict = Some(Verdict::CommentOnly);
+        rec.last_summary = Some("line one\nline \"two\" \u{1F600}".into());
+        rec.blocking_count = 3;
+        rec.nit_count = 4;
+        rec.review_session = Some("sess".into());
+        rec.review_attempts = 2;
+        rec.diff_too_large = true;
+        rec.human_approved_at = Some(Utc::now());
+        let mut state = StateFile {
+            last_poll: Some(Utc::now()),
+            paused_until: Some(Utc::now()),
+            ..StateFile::default()
+        };
+        state.prs.insert(rec.key(), rec);
+        store.save(&state).unwrap();
+        assert_eq!(store.load().unwrap(), state);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -39,11 +39,13 @@
     { value: "informational", label: "Info" },
     { value: "silent", label: "Silent" },
   ];
-  // [key, label, built-in tier] (config::Notifications::default).
+  // [key, label, built-in tier, built-in sound] (config::Notifications::
+  // default; the sound is notify::builtin_event_sound and, when there is
+  // none, the event plays its tier's sound).
   const EVENTS = [
     ["on_new_pr", "New PR", "informational"],
     ["on_review_started", "Review started", "informational"],
-    ["on_review_complete_approved", "Review complete: approved", "informational"],
+    ["on_review_complete_approved", "Review complete: approved", "informational", "Glass"],
     ["on_review_complete_blocking", "Review complete: blocking", "urgent"],
     ["on_new_commits", "New commits", "informational"],
     ["on_re_review_triggered", "Re-review triggered", "informational"],
@@ -52,6 +54,9 @@
     ["on_failure", "Review failed", "urgent"],
     ["on_skipped", "Skipped", "silent"],
   ];
+  // macOS alert sounds (/System/Library/Sounds), offered in the tier and
+  // event sound menus. Any other name set in config.yml stays listed.
+  const SOUNDS = ["Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero", "Morse", "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink"];
   // Built-in agent engines (config::builtin_engines); `engines:` entries
   // override them.
   const BUILTIN_ENGINES = ["pi", "claude", "codex"];
@@ -88,7 +93,7 @@
     "FINDINGS_BLOCKING", "FINDINGS_NITS", "PR_KEY", "IDENTITY"];
 
   // type: number | text | textarea | prompt | template | choice | mode |
-  //       tier | bool | tokens | engine | model | schedule | browser
+  //       tier | sound | bool | tokens | engine | model | schedule | browser
   // optional: unset is meaningful (empty input removes the key).
   // global: defaults only; org/repo entries cannot override it.
   // top: the key is a top-level config path (`menu.sort`), not under
@@ -156,8 +161,13 @@
     { key: "schedule", label: "Review schedule", type: "schedule", optional: true, stack: true, bare: true, page: "schedule", section: "Schedule" },
     { key: "notifications.enabled", label: "Deliver notifications", type: "bool", fallback: true, global: true, page: "notifications", section: "Delivery",
       help: "Off silences every banner and sound. History still records each event." },
+    { key: "notifications.menubar_bell", label: "Bell in the menu bar", type: "bool", fallback: true, global: true, page: "notifications", section: "Delivery",
+      help: "PRX.app adds a bell to its icon and counts ready (✓) and blocked (✕) PRs until you open them." },
   ].concat(EVENTS.map(function (e) {
     return { key: "notifications." + e[0], label: e[1], type: "tier", options: TIER_OPTIONS, fallback: e[2], page: "notifications", section: "Events" };
+  })).concat(EVENTS.map(function (e) {
+    // `builtin`: what an unset sound plays (null: the tier's sound).
+    return { key: "notifications.sounds." + e[0], label: e[1], type: "sound", optional: true, builtin: e[3] || null, page: "notifications", section: "Sounds" };
   })).concat([
     { key: "identity.login", label: "GitHub login", type: "text", optional: true, page: "identity", section: "GitHub account",
       placeholder: "The account gh is signed in as",
@@ -236,7 +246,7 @@
   // Fields an org or repo entry may override (everything but `global`).
   const OVERRIDE_FIELDS = FIELDS.filter(function (f) { return !f.global; });
 
-  const api = { MODES: MODES, MODE_OPTIONS: MODE_OPTIONS, TIERS: TIERS, EVENTS: EVENTS, BUILTIN_ENGINES: BUILTIN_ENGINES,
+  const api = { MODES: MODES, MODE_OPTIONS: MODE_OPTIONS, TIERS: TIERS, EVENTS: EVENTS, SOUNDS: SOUNDS, BUILTIN_ENGINES: BUILTIN_ENGINES,
     LLM_PROVIDERS: LLM_PROVIDERS, USAGE_FIELDS: USAGE_FIELDS, FIELDS: FIELDS, OVERRIDE_FIELDS: OVERRIDE_FIELDS,
     PAGES: PAGES, PAGE_GROUPS: PAGE_GROUPS, navGroups: navGroups, pageGroup: pageGroup, pageFromHash: pageFromHash,
     fieldFor: fieldFor, pageForField: pageForField };

@@ -435,3 +435,211 @@ fn snooze_expiry_restores_previous_state_on_status() {
     assert_eq!(rec.skip_reason, None);
     assert_eq!(rec.snooze_until, None);
 }
+
+/// `prx status --json` with no daemon: stdout is the entry array and
+/// nothing else, in the shape `GET /status` serves under `prs`. Scripts and
+/// the app read these fields, so each one is pinned by name.
+#[test]
+fn status_json_is_the_bare_entry_array() {
+    let (cfg_dir, data_dir, gh_dir, _fixture) = setup();
+    write_list_fixture(
+        gh_dir.path(),
+        "org/one",
+        &[
+            pr_json(
+                7,
+                "Add feature",
+                "alice",
+                "feature/x",
+                "aaaa",
+                false,
+                "2026-09-09T10:00:00Z",
+            ),
+            pr_json(
+                8,
+                "WIP draft",
+                "bob",
+                "spike/y",
+                "bbbb",
+                true,
+                "2026-09-09T11:00:00Z",
+            ),
+        ],
+    );
+    write_list_fixture(gh_dir.path(), "org/two", &[]);
+
+    let out = status(&cfg_dir, &data_dir, &gh_dir, &["status", "--json"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is one JSON value");
+    let entries = json.as_array().expect("an array of entries");
+    assert_eq!(entries.len(), 2, "{stdout}");
+
+    let ready = &entries[0];
+    for (field, value) in [
+        ("key", serde_json::json!("org/one#7")),
+        ("icon", serde_json::json!("\u{1f195}")),
+        ("state", serde_json::json!("pending")),
+        ("skip_reason", serde_json::Value::Null),
+        ("title", serde_json::json!("Add feature")),
+        ("author", serde_json::json!("alice")),
+        ("head_branch", serde_json::json!("feature/x")),
+        ("is_draft", serde_json::json!(false)),
+        ("last_verdict", serde_json::Value::Null),
+        ("blocking_count", serde_json::json!(0)),
+        ("nit_count", serde_json::json!(0)),
+        ("last_review_at", serde_json::Value::Null),
+        ("summary", serde_json::json!("ready for review")),
+        ("last_review_age", serde_json::json!("never")),
+        ("created_at", serde_json::json!("2026-09-09T10:00:00Z")),
+        ("brief_pending", serde_json::json!(false)),
+        ("brief_available", serde_json::json!(true)),
+        (
+            "html_url",
+            serde_json::json!("https://github.com/org/one/pull/7"),
+        ),
+        ("engine", serde_json::json!("pi")),
+    ] {
+        assert_eq!(ready.get(field), Some(&value), "field `{field}`: {ready}");
+    }
+    let draft = &entries[1];
+    assert_eq!(draft["key"], "org/one#8");
+    assert_eq!(draft["state"], "skipped");
+    assert_eq!(draft["skip_reason"], "draft");
+    assert_eq!(draft["is_draft"], true);
+    assert_eq!(draft["summary"], "skipped: draft");
+
+    // The same payload type the thin client reads from the daemon.
+    let typed: Vec<prx::status::StatusEntry> = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(typed[1].skip_reason, Some(SkipReason::Draft));
+    // --json still syncs: the poll ran and was persisted.
+    assert_eq!(load_state(&data_dir).prs.len(), 2);
+    assert_eq!(log_lines(&gh_dir).len(), 2);
+
+    // The repo filter applies to the array as it does to the table.
+    let out = status(
+        &cfg_dir,
+        &data_dir,
+        &gh_dir,
+        &["status", "org/two", "--json"],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "[]\n");
+}
+
+/// Watched repos with no open PRs: an empty table is a success, with the
+/// poll recorded, not an error.
+#[test]
+fn status_with_no_open_prs_says_so_and_succeeds() {
+    let (cfg_dir, data_dir, gh_dir, _fixture) = setup();
+    write_list_fixture(gh_dir.path(), "org/one", &[]);
+    write_list_fixture(gh_dir.path(), "org/two", &[]);
+
+    let out = status(&cfg_dir, &data_dir, &gh_dir, &["status"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "No PRs tracked yet.\n");
+    let state = load_state(&data_dir);
+    assert!(state.prs.is_empty());
+    assert!(state.last_poll.is_some(), "the poll itself is recorded");
+}
+
+/// One repo failing to poll does not hide the others: the table for what
+/// did sync is printed and saved, and the command still exits non-zero
+/// naming the repo that failed.
+#[test]
+fn status_prints_what_synced_when_one_repo_fails_to_poll() {
+    let (cfg_dir, data_dir, gh_dir, _fixture) = setup();
+    for (repo, number) in [("org/one", 1), ("org/two", 2)] {
+        write_list_fixture(
+            gh_dir.path(),
+            repo,
+            &[pr_json(
+                number,
+                "Add feature",
+                "alice",
+                "feature/x",
+                "aaaa",
+                false,
+                "2026-09-09T10:00:00Z",
+            )],
+        );
+    }
+
+    // The first `gh pr list` (org/one) fails, the second (org/two) works.
+    let out = run_cli(
+        cfg_dir.child("config.yml").as_path(),
+        data_dir.path(),
+        &["status"],
+        Some(gh_dir.path()),
+        &[("FAKE_GH_LIST_FAIL", "1")],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("error: failed to poll: org/one"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(!stderr_of(&out).contains("org/two"), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains("org/two#2"), "{stdout}");
+    assert!(!stdout.contains("org/one#1"), "{stdout}");
+    assert!(stdout.contains("last poll: "), "{stdout}");
+
+    let state = load_state(&data_dir);
+    assert!(state.prs.contains_key("org/two#2"));
+    assert!(!state.prs.contains_key("org/one#1"));
+
+    // The next poll picks the failed repo up.
+    let out = status(&cfg_dir, &data_dir, &gh_dir, &["status"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(stdout_of(&out).contains("org/one#1"), "{}", stdout_of(&out));
+}
+
+/// The review-control lines above the table come from the config and the
+/// state file when there is no daemon: mode `off`, and an active pause.
+#[test]
+fn status_shows_mode_off_and_the_pause_without_a_daemon() {
+    let (cfg_dir, data_dir, gh_dir, _fixture) = setup();
+    write_file(
+        &cfg_dir.child("config.yml"),
+        &config_with(&["org/one"], "  review_mode: off\n"),
+    );
+    write_list_fixture(
+        gh_dir.path(),
+        "org/one",
+        &[pr_json(
+            1,
+            "Add feature",
+            "alice",
+            "feature/x",
+            "aaaa",
+            false,
+            "2026-09-09T10:00:00Z",
+        )],
+    );
+    let state = prx::state::StateFile {
+        paused_until: Some(ts("2099-01-01T00:00:00Z")),
+        ..Default::default()
+    };
+    save_state(&data_dir, &state);
+
+    let out = status(&cfg_dir, &data_dir, &gh_dir, &["status"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let stdout = stdout_of(&out);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[0].starts_with("reviews paused until 2099-01-01 00:00 UTC ("),
+        "{stdout}"
+    );
+    assert_eq!(lines[1], "review mode: off — polling and reviews stopped");
+    assert!(lines[2].trim_start().starts_with("PR "), "{stdout}");
+    // The pause survives the status run's own save.
+    assert_eq!(
+        load_state(&data_dir).paused_until,
+        Some(ts("2099-01-01T00:00:00Z"))
+    );
+
+    // --json carries the entries only.
+    let out = status(&cfg_dir, &data_dir, &gh_dir, &["status", "--json"]);
+    assert!(stdout_of(&out).starts_with('['), "{}", stdout_of(&out));
+}

@@ -29,7 +29,8 @@ prx usage [--by day|week|month] [--window 7d|30d|90d|all] [--group none|engine|r
 prx config                        show the fully-merged effective configuration
 prx config edit                   open the config file in $VISUAL (or $EDITOR)
 prx config set <key> <value>      set a dotted config key, validated before saving
-prx daemon start [--foreground]   detached background daemon (single instance)
+prx daemon start [--foreground]   detached background daemon (single instance); returns once it
+                                  answers, or prints why it could not start
 prx daemon stop                   SIGTERM the daemon and wait for exit
 prx daemon status                 is the daemon running (pid + IPC port)?
 prx daemon logs                   tail the newest daemon log file
@@ -52,7 +53,7 @@ daemon at all — it runs the pipeline locally and prints what *would* have happ
 | Form | Example | Resolves to |
 |------|---------|-------------|
 | `org/repo#N` | `acme/api#42` | that PR (the repo must be watched) |
-| GitHub PR URL | `https://github.com/acme/api/pull/42/files` | the same (trailing path, query, and fragment are ignored) |
+| GitHub PR URL | `https://github.com/acme/api/pull/42/files` | the same. `https://` (or `http://`) and `www.` are optional, and a trailing path (`/files`, `/commits`, `/changes`), query, fragment, or slash is ignored |
 | `repo#N` | `api#42` | the watched repo with that short name |
 | `N` / `#N` | `42`, `#42` | the one watched repo (mode not `off`) with an open PR #42 — tracked PRs match without a gh call, the rest are looked up concurrently |
 
@@ -62,6 +63,15 @@ the spot — exactly as a poll would have found it, skip rules included (an untr
 as skipped and reported not eligible) — and then reviewed; a merged or closed PR is rejected with its
 state. `--dry-run`, and the in-process fallback when the daemon is down, accept only `org/repo#N`
 and URLs (with a hint saying so).
+
+Surrounding whitespace is ignored, so a pasted URL works as is. Only `github.com` pull request
+URLs are accepted: a URL on another host, an issue URL (`…/issues/N`), or any other github.com
+page is rejected with the reason and the accepted forms. The same forms work in PRX.app's
+*Review PR…* panel and the window's *Review PR* box.
+
+A repo whose [review mode](../guides/review-modes.md) is `off` is never reviewed, with or without
+the daemon: `prx review <target>` (also with `--dry-run`) prints that the mode is off and makes no
+`gh` call, and `prx review --all` leaves that repo out.
 
 The per-run options apply to that run only and are never saved:
 
@@ -106,7 +116,8 @@ locally with the same aggregation.
 
 Checks that everything prx needs is in place and prints one line per check: the config file parses
 and validates, `gh` is on PATH and authenticated (via `gh auth status`), every referenced engine
-resolves — agent binaries on PATH, `llm_api` engines with their key variable set (a warning
+resolves — agent binaries on PATH (a `command` that contains a `/` is checked as that path, without
+PATH), `llm_api` engines with their key variable set (a warning
 otherwise), including `brief.engine` references — which levels use the built-in vs a custom review prompt
 (warning when an edited legacy `prompts/default.md` would be lost; an informational hint when a custom
 prompt still carries its own manifest schema), and the data directory is

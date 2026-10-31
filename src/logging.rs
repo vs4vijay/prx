@@ -123,4 +123,96 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// A fresh directory for one test.
+    fn logs_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("prx-logs-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The name of the rotated log file dated `days_ago` days back.
+    fn rotated(days_ago: i64) -> String {
+        let date = Local::now().date_naive() - TimeDelta::try_days(days_ago).unwrap();
+        format!("prx.log.{}", date.format("%Y-%m-%d"))
+    }
+
+    /// Retention is inclusive: the file dated exactly `LOG_RETENTION_DAYS`
+    /// ago is the oldest one kept, and the day before it is the first to go.
+    #[test]
+    fn prune_keeps_the_last_day_inside_the_retention_window() {
+        let dir = logs_dir("boundary");
+        let kept = [0, 1, LOG_RETENTION_DAYS - 1, LOG_RETENTION_DAYS];
+        let pruned = [LOG_RETENTION_DAYS + 1, LOG_RETENTION_DAYS + 2, 400];
+        for days_ago in kept.iter().chain(&pruned) {
+            std::fs::write(dir.join(rotated(*days_ago)), b"x").unwrap();
+        }
+
+        prune_old_logs(&dir, LOG_RETENTION_DAYS);
+
+        for days_ago in kept {
+            assert!(dir.join(rotated(days_ago)).exists(), "{days_ago} days old");
+        }
+        for days_ago in pruned {
+            assert!(!dir.join(rotated(days_ago)).exists(), "{days_ago} days old");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Zero retention keeps today's file (the one being written) and files
+    /// dated ahead of the local clock; everything older goes.
+    #[test]
+    fn prune_with_zero_retention_never_removes_the_current_file() {
+        let dir = logs_dir("zero");
+        for days_ago in [-1, 0, 1] {
+            std::fs::write(dir.join(rotated(days_ago)), b"x").unwrap();
+        }
+
+        prune_old_logs(&dir, 0);
+
+        assert!(dir.join(rotated(-1)).exists(), "a future-dated log is kept");
+        assert!(dir.join(rotated(0)).exists(), "today's log is kept");
+        assert!(!dir.join(rotated(1)).exists(), "yesterday's log is pruned");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Only files named exactly `prx.log.<date>` are the daemon's to
+    /// delete. Old-looking neighbors — the stderr capture, backups, other
+    /// prefixes, a directory of that name — are left alone.
+    #[test]
+    fn prune_touches_nothing_but_its_own_rotated_files() {
+        let dir = logs_dir("foreign");
+        let old = "2020-01-01";
+        let foreign = [
+            "daemon-stderr.log".to_string(),
+            "prx.log".to_string(),
+            format!("prx.log.{old}.bak"),
+            format!("prx.log.{old} "),
+            format!("other.log.{old}"),
+            format!("PRX.LOG.{old}"),
+            format!("prx.log.{}", old.replace('-', "")),
+        ];
+        for name in &foreign {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let old_dir = dir.join("nested").join(format!("prx.log.{old}"));
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(dir.join(format!("prx.log.{old}")), b"x").unwrap();
+
+        prune_old_logs(&dir, LOG_RETENTION_DAYS);
+        prune_old_logs(&dir.join("nested"), LOG_RETENTION_DAYS);
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "nested")
+            .collect();
+        left.sort();
+        let mut expected = foreign.to_vec();
+        expected.sort();
+        assert_eq!(left, expected, "only prx.log.{old} may be removed");
+        assert!(old_dir.is_dir(), "a directory is never removed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

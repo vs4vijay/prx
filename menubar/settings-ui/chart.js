@@ -19,6 +19,12 @@
     return nice * exp;
   }
 
+  // A token count as drawn: missing, negative and non-finite values are 0,
+  // so one bad number never bends the axis or pushes a bar below it.
+  function amount(value) {
+    return typeof value === "number" && isFinite(value) && value > 0 ? value : 0;
+  }
+
   // data: {labels: [..], series: [{name, values: [{input, output}]}]}
   // opts: {width, height, format(value) -> axis text, title(series, i, part, value) -> tooltip}
   // -> {width, height, plot, max, ticks: [{y, label}], bars: [{x, width, label, showLabel, total, segments: [{y, height, series, part, value, cls}]}]}
@@ -28,7 +34,7 @@
     const plot = { x: MARGIN.left, y: MARGIN.top, width: width - MARGIN.left - MARGIN.right, height: height - MARGIN.top - MARGIN.bottom };
     const n = data.labels.length;
     const totals = data.labels.map(function (_, i) {
-      return data.series.reduce(function (sum, s) { const v = s.values[i] || {}; return sum + (v.input || 0) + (v.output || 0); }, 0);
+      return data.series.reduce(function (sum, s) { const v = s.values[i] || {}; return sum + amount(v.input) + amount(v.output); }, 0);
     });
     const max = niceMax(Math.max.apply(null, [0].concat(totals)));
     const scale = function (v) { return (v / max) * plot.height; };
@@ -41,7 +47,7 @@
       const segments = [];
       data.series.forEach(function (s, si) {
         const v = s.values[i] || {};
-        [["input", v.input || 0], ["output", v.output || 0]].forEach(function (part) {
+        [["input", amount(v.input)], ["output", amount(v.output)]].forEach(function (part) {
           if (!part[1]) return;
           const h = scale(part[1]);
           base -= h;

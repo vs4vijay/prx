@@ -15,10 +15,12 @@ The agent's only output artifact is a JSON file (versioned, strictly validated):
 ```
 
 Validation rules: `manifest_version` must be `1`; unknown extra fields are tolerated; unknown
-`verdict`/`severity` values are rejected; and the **verdict consistency rule** — any finding with
-severity `blocking` forces `verdict: "changes_requested"`. A manifest that fails validation, an
-agent crash, or a timeout is retried **once**; if the retry fails too, the review fails cleanly
-(state returns to reviewable, an `on_failure` notification fires, history records the failure).
+`verdict`/`severity` values are rejected; a finding's `body` must not be empty or only whitespace,
+and its `line`, when given, is 1-based (`0` is rejected; omit `line` instead); and the **verdict
+consistency rule** — any finding with severity `blocking` forces `verdict: "changes_requested"`. A
+manifest that fails validation, an agent crash, or a timeout is retried **once**; if the retry fails
+too, the review fails cleanly (state returns to reviewable, an `on_failure` notification fires,
+history records the failure).
 Findings without both `file` and `line` are included in the review body but not posted inline.
 
 The manifest may also carry an optional `brief` string — a plain-language description of the PR

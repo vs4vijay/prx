@@ -410,11 +410,12 @@ pub fn log_to_show() -> PathBuf {
     prx::daemon::newest_log_file(&prx::paths::logs_dir()).unwrap_or_else(stderr_log_path)
 }
 
-/// A live daemon other than `except`: the pid file names a live process,
-/// or discovery answers.
+/// A live daemon other than `except`: the pid file names the live process
+/// that wrote it (not one that reused its pid after a reboot), or
+/// discovery answers.
 fn other_daemon_alive(except: Option<u32>) -> bool {
-    if let Some(pid) = prx::daemon::read_pid(&prx::paths::daemon_pid_file()) {
-        if Some(pid) != except && process_alive(pid) {
+    if let Some(pid) = prx::daemon::pid_file_owner(&prx::paths::daemon_pid_file()) {
+        if Some(pid) != except {
             return true;
         }
     }
@@ -425,10 +426,11 @@ fn other_daemon_alive(except: Option<u32>) -> bool {
         return false;
     };
     runtime
-        .block_on(prx::ipc::DaemonClient::discover())
+        .block_on(prx::ipc::DaemonClient::discover_as_menubar())
         .is_some()
 }
 
+#[cfg(test)]
 fn process_alive(pid: u32) -> bool {
     // SAFETY: kill(2) with signal 0 only probes for existence.
     unsafe { libc::kill(pid as i32, 0) == 0 }

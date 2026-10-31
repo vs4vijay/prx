@@ -4,6 +4,12 @@ The daemon serves a JSON API on `127.0.0.1:<ephemeral>` — this is the backend 
 client and the menu bar shell. Every request must carry `Authorization: Bearer <token>` with the
 token from `daemon.token`; anything else gets `401`. Discover the port from `daemon.port`.
 
+PRX.app also sends `X-Prx-Client: menubar/<version>` on every request. The daemon reads an
+authenticated request whose `X-Prx-Client` is `menubar` or `menubar/<anything>` as "a menu bar app is
+running" and leaves desktop banners to it for the next 90 s
+(see [Notifications](../guides/notifications.md)). The CLI does not send the header; any other
+value is ignored. A client that does not show banners itself must not send it.
+
 | Endpoint | Body / query | Response |
 |----------|--------------|----------|
 | `GET /status` | — | `{version, pid, uptime_seconds, in_flight, queue_depth, last_poll: {repo: ts}, last_state_poll, review_mode, paused_until?, config_error?, engines, menu, prs: [StatusEntry]}` — served from a read cache, stays responsive during reviews. `review_mode` is the global mode; `paused_until` is present only while a pause is in effect; `config_error` (`{message, at}`) is present while the daemon runs on a last-good config. `engines` lists the resolved engine names (sorted); `menu` is the effective `{sort, group_by}`. |
@@ -12,7 +18,7 @@ token from `daemon.token`; anything else gets `401`. Discover the port from `dae
 | `POST /approve` | `{key}` | `{ok, changed, note?}` — the human-only approve path. |
 | `POST /block` | `{key}` | `{ok, changed, note?}` — post a request-changes review with the effective `block_message`. |
 | `POST /unblock` | `{key}` | `{ok, changed, note?}` — dismiss prx's latest request-changes review; the PR returns to pending. |
-| `POST /snooze` | `{key, hours? \| until_push?}` | `{ok, changed, note?}` — one of `hours` or `until_push` is required. |
+| `POST /snooze` | `{key, hours? \| until_push?}` | `{ok, changed, note?}` — one of `hours` or `until_push` is required; `hours` must be above 0 and at most 87600 (about 10 years), else `400`. |
 | `POST /unsnooze` | `{key}` | `{ok, changed, note?}` |
 | `POST /ignore` | `{key}` | `{ok, changed, note?}` |
 | `POST /unignore` | `{key}` | `{ok, changed, note?}` |
@@ -24,7 +30,7 @@ token from `daemon.token`; anything else gets `401`. Discover the port from `dae
 | `GET /discover/agents` | — | `{agents: [{name, label, command, args, model_args, models, builtin, path?, on_path}], configured, llm_apis: [{name, provider, model, api_key_env, key_present}]}` — the agent CLIs prx knows and where the daemon found each one, plus the configured `llm_api` engines and whether each key variable is set in the daemon's environment (never the value). |
 | `GET /discover/repos` | — | `{repos: [{name, private}]}` — non-archived repositories the gh account can see (most recently pushed first, up to 500). |
 | `POST /review-mode` | `{mode: "off" \| "monitor" \| "review comment"}` | `{ok, changed, persisted, note?}` — sets `defaults.review_mode`; `persisted: false` when the file is broken (applied in memory only). |
-| `GET /history` | `?repo=org/repo&limit=N&before=RFC3339` | `{entries: [HistoryEntry]}` — newest first; corrupt lines skipped. `before` pages back: only entries strictly older than that timestamp (invalid → `400`). |
+| `GET /history` | `?repo=org/repo&limit=N&before=RFC3339` | `{entries: [HistoryEntry]}` — newest first; corrupt lines skipped. Each entry carries an `event` tag (`new_pr`, `review_started`, `review_completed`, …); a client must skip a tag it does not know, as prx's own `HistoryEntry` does (it decodes as `unknown`). `before` pages back: only entries strictly older than that timestamp (invalid → `400`). |
 | `GET /usage` | `?bucket=day\|week\|month&window=7d\|30d\|90d\|all&group=none\|engine\|repo\|pr\|session&repo=org/repo` | `{bucket, window, group, series: [{group, points: [{bucket_start, totals}]}], groups: [{group, totals}], overall, runs_without_usage}` — [token usage](../guides/token-usage.md) aggregated from history (defaults `day` / `30d` / `none`; invalid values → `400` listing the allowed ones). Local-date buckets (`week` = ISO, Monday start); points cover every bucket in the window. `totals` = the four token fields, `cost_usd` (reported costs only), `runs` (runs **with** usage), `runs_with_cost`, and the `review` / `summary` split; groups appear only when they have usage, and `runs_without_usage` counts the rest. |
 | `GET /insights` | `?repo=org/repo&days=N` | The [`Insights`](../guides/insights.md) payload itself, self-describing (no envelope). |
 

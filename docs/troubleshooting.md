@@ -76,8 +76,8 @@ See [Autostart](guides/autostart.md).
 
 The daemon re-reads `config.yml` within about a second. If an edit breaks the file (bad YAML or a
 failed validation), the daemon keeps running on the last good config and reports the reason as
-`config_error` in `GET /status`, in the app's menu, and in the settings pages. Fixing the file
-clears it.
+`config_error` in `GET /status`, in the app's menu, and in the settings pages; `prx status` prints
+it as a `warning:` line on stderr. Fixing the file clears it.
 
 - `max_concurrent_reviews` does not hot-reload. Restart the daemon after changing it.
 - A `review_prompt` that is a file path is rejected: it is the prompt text now. Paste the file's

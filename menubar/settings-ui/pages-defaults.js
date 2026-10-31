@@ -171,8 +171,7 @@
       .concat(build(fieldSections(app, "schedule"))));
   };
 
-  // macOS alert sounds (/System/Library/Sounds), offered in each tier's sound menu.
-  const SOUNDS = ["Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero", "Morse", "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink"];
+  const SOUNDS = S.SOUNDS;
   const TIER_NOTES = {
     urgent: "Needs you now.",
     informational: "Good to know.",
@@ -208,7 +207,9 @@
   renderers.notifications = function (root, app) {
     const sections = fieldSections(app, "notifications");
     const events = sections.find(function (s) { return s.title === "Events"; });
-    if (events) events.note = "How loudly each event reaches you.";
+    if (events) events.note = "How loudly each event reaches you. Off puts the event in the Silent tier: history only.";
+    const sounds = sections.find(function (s) { return s.title === "Sounds"; });
+    if (sounds) sounds.note = "A sound for one event in place of its tier's. Only a review that approves has one of its own (Glass), so ready and blocked PRs sound different.";
     root.append.apply(root, [UI.header("Notifications", "Every event belongs to a tier, and each tier decides whether you get a banner and a sound.")]
       .concat(build(sections), [UI.section("Tiers", tierRows(app), "What each tier does when an event lands in it.")]));
     // With delivery off, the event and tier settings do nothing: dim them.

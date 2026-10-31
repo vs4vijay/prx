@@ -24,17 +24,25 @@
     return area;
   }
 
-  // Rename an `engines:` entry in place, following the defaults' engine.
+  // Rename an `engines:` entry in place, following every setting that names
+  // it.
   function renameEngine(app, engines, from, base) {
     return function (next) {
       if (!next || next === from) { app.rerender(); return; }
       if (engines[next]) { app.localError(base, "An engine named " + next + " already exists"); return; }
       // Rebuild the map so the renamed entry keeps its position, and
-      // follow the rename where the defaults point at it.
+      // follow the rename wherever the defaults, an org or a repo point at
+      // it as the review engine or the brief engine (a save would otherwise
+      // be refused for naming an unknown engine).
       const rebuilt = {};
       Object.keys(engines).forEach(function (k) { rebuilt[k === from ? next : k] = engines[k]; });
-      app.draft().engines = rebuilt;
-      if (app.draft().defaults.engine === from) app.draft().defaults.engine = next;
+      const draft = app.draft();
+      draft.engines = rebuilt;
+      [draft.defaults].concat(draft.orgs || [], draft.repos || []).forEach(function (level) {
+        if (!level) return;
+        if (level.engine === from) level.engine = next;
+        if (level.brief && level.brief.engine === from) level.brief.engine = next;
+      });
       app.localError(base, null);
       app.changed(base);
       app.rerender();

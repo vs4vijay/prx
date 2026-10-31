@@ -29,6 +29,9 @@ pub const HISTORY_LIMIT: usize = 10;
 pub struct Snapshot {
     pub status: StatusResponse,
     pub history: Vec<HistoryEntry>,
+    /// `defaults.notifications.menubar_bell` from the config file at this
+    /// poll (the bell is the app's own feature; the daemon does not report it).
+    pub menubar_bell: bool,
 }
 
 /// One poll outcome, ready for the GUI thread.
@@ -118,7 +121,7 @@ where
         // Re-discover on EVERY poll: fresh port/token files are re-read each
         // time, so a restarted daemon (rotated bearer token) needs no user
         // intervention, and a dead daemon yields None (offline model).
-        let outcome = match DaemonClient::discover().await {
+        let outcome = match DaemonClient::discover_as_menubar().await {
             Some(client) => match client.get_status().await {
                 Ok(status) => {
                     eprintln!(
@@ -130,13 +133,28 @@ where
                     // History rides the same tick (task 4.5): a failure only
                     // empties the submenu, never the status.
                     let history = match client.history(None, HISTORY_LIMIT).await {
-                        Ok(response) => response.entries,
+                        // A newer daemon's event this build cannot name
+                        // decodes as `Unknown`; it has nothing to show.
+                        Ok(response) => response
+                            .entries
+                            .into_iter()
+                            .filter(|entry| !matches!(entry, HistoryEntry::Unknown))
+                            .collect(),
                         Err(error) => {
                             eprintln!("prx-menubar: GET /history failed: {error:#}");
                             Vec::new()
                         }
                     };
-                    let snapshot = Snapshot { status, history };
+                    let menubar_bell = notification_config
+                        .current()
+                        .defaults
+                        .notifications
+                        .menubar_bell;
+                    let snapshot = Snapshot {
+                        status,
+                        history,
+                        menubar_bell,
+                    };
                     // Delta-detect NEW history events and raise the banner
                     // their configured tier asks for (cold start marks the
                     // backlog seen silently; bursts coalesce).

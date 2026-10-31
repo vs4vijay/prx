@@ -120,15 +120,17 @@ pub fn compute(entries: &[HistoryEntry], now: DateTime<Utc>, window_days: Option
     // Chronological working copy, optionally windowed. A stable sort keeps
     // same-timestamp entries in file (append) order, which matters for the
     // effectiveness "later review" relation.
+    // A window too large to represent (`--days 100000000`) reaches back
+    // before any entry: no cutoff, like all time.
+    let cutoff = window_days.and_then(|days| {
+        i64::try_from(days)
+            .ok()
+            .and_then(TimeDelta::try_days)
+            .and_then(|window| now.checked_sub_signed(window))
+    });
     let mut chrono_entries: Vec<&HistoryEntry> = entries
         .iter()
-        .filter(|e| match window_days {
-            Some(days) => {
-                let cutoff = now - TimeDelta::try_days(days as i64).unwrap_or_else(TimeDelta::zero);
-                e.ts() >= cutoff
-            }
-            None => true,
-        })
+        .filter(|e| cutoff.is_none_or(|cutoff| e.ts() >= cutoff))
         .collect();
     chrono_entries.sort_by_key(|e| e.ts());
 
@@ -210,6 +212,8 @@ pub fn compute(entries: &[HistoryEntry], now: DateTime<Utc>, window_days: Option
             HistoryEntry::ReviewStarted { .. } => {}
             // An on-demand brief run (design B3) is not a review outcome.
             HistoryEntry::Brief { .. } => {}
+            // Tracking began; a newer prx's event carries nothing to count.
+            HistoryEntry::NewPr { .. } | HistoryEntry::Unknown => {}
         }
     }
 
@@ -404,6 +408,7 @@ fn median(values: &[u32]) -> f64 {
 pub fn render(insights: &Insights) -> String {
     let mut out = String::new();
     let window = match insights.window_days {
+        Some(1) => "last 1 day".to_string(),
         Some(days) => format!("last {days} days"),
         None => "all time".to_string(),
     };
@@ -1017,5 +1022,392 @@ mod tests {
         assert_eq!(format_duration(5), "5s");
         assert_eq!(format_duration(3 * 86_400 + 2 * 3_600), "3d 2h");
         assert_eq!(format_duration(2 * 3_600 + 5 * 60), "2h 5m");
+    }
+
+    fn at(ts: &str) -> DateTime<Utc> {
+        ts.parse().unwrap()
+    }
+
+    fn approved(repo: &str, number: u64, author: &str, ts: DateTime<Utc>) -> HistoryEntry {
+        completed(repo, number, author, Verdict::Approved, 0, 0, ts, &[])
+    }
+
+    /// One review, nothing else: every ratio with a zero denominator is 0.0
+    /// (never NaN, which JSON cannot carry), and the report still serializes.
+    #[test]
+    fn single_review_reports_whole_rates_and_zero_for_empty_denominators() {
+        let now = at("2026-09-30T12:00:00Z");
+        let ins = compute(
+            &[approved("o/r", 1, "alice", at("2026-09-29T12:00:00Z"))],
+            now,
+            None,
+        );
+        assert_eq!(ins.reviews.total, 1);
+        assert_eq!((ins.reviews.last_7_days, ins.reviews.last_30_days), (1, 1));
+        assert_eq!(ins.per_author.len(), 1);
+        assert_eq!(ins.per_author[0].approval_rate, 1.0);
+        assert_eq!(ins.per_author[0].median_blocking_count, 0.0);
+        assert_eq!(ins.per_repo[0].approval_rate, 1.0);
+        assert_eq!(
+            ins.review_to_merge,
+            MergeLatency {
+                samples: 0,
+                average_seconds: None
+            }
+        );
+        assert_eq!(ins.effectiveness.changes_requested_reviews, 0);
+        assert_eq!(ins.effectiveness.rate, 0.0);
+
+        // Only a failure: no author or repo rows, so no 0/0 anywhere.
+        let ins = compute(&[failed("o/r", 1, "alice", now)], now, None);
+        assert!(ins.per_author.is_empty() && ins.per_repo.is_empty());
+        let json = serde_json::to_value(&ins).unwrap();
+        assert_eq!(json["effectiveness"]["rate"], 0.0);
+        assert!(json["review_to_merge"]["average_seconds"].is_null());
+        let text = render(&ins);
+        assert!(
+            text.contains("total: 0 (last 7 days: 0, last 30 days: 0) · failed: 1 · skipped: 0"),
+            "{text}"
+        );
+        assert!(!text.contains("per day"), "{text}");
+    }
+
+    /// The window cutoff and the 7- and 30-day rollups are all inclusive at
+    /// the boundary instant and exclusive one second before it.
+    #[test]
+    fn window_and_rollup_boundaries_are_inclusive() {
+        let now = at("2026-09-30T12:00:00Z");
+        let entries = [
+            approved("o/r", 1, "a", at("2026-09-23T12:00:00Z")), // exactly 7 days
+            approved("o/r", 2, "a", at("2026-09-23T11:59:59Z")),
+            approved("o/r", 3, "a", at("2026-08-31T12:00:00Z")), // exactly 30 days
+            approved("o/r", 4, "a", at("2026-08-31T11:59:59Z")),
+        ];
+        let all = compute(&entries, now, None);
+        assert_eq!(all.reviews.total, 4);
+        assert_eq!(all.reviews.last_7_days, 1);
+        assert_eq!(all.reviews.last_30_days, 3);
+
+        let week = compute(&entries, now, Some(7));
+        assert_eq!(week.reviews.total, 1);
+        assert_eq!(week.window_days, Some(7));
+        let month = compute(&entries, now, Some(30));
+        assert_eq!(month.reviews.total, 3);
+        // A zero-day window is "from now on": only an entry stamped now.
+        let none = compute(&entries, now, Some(0));
+        assert_eq!(none.reviews.total, 0);
+        let instant = compute(&[approved("o/r", 5, "a", now)], now, Some(0));
+        assert_eq!(instant.reviews.total, 1);
+    }
+
+    /// Regression: `prx insights --days 100000000` panicked (`DateTime -
+    /// TimeDelta` overflowed) and `--days 18446744073709551615` wrapped to a
+    /// cutoff in the future, reporting an empty history. A window that
+    /// reaches back further than time does is all of it.
+    #[test]
+    fn a_window_too_large_to_represent_covers_everything() {
+        let now = at("2026-09-30T12:00:00Z");
+        let entries = [
+            approved("o/r", 1, "a", at("2026-09-29T12:00:00Z")),
+            approved("o/r", 2, "a", at("1999-01-01T00:00:00Z")),
+        ];
+        for days in [100_000_000, i64::MAX as u64, u64::MAX] {
+            let ins = compute(&entries, now, Some(days));
+            assert_eq!(ins.reviews.total, 2, "{days} days");
+            assert_eq!(ins.window_days, Some(days));
+        }
+    }
+
+    /// The per-day series buckets by UTC calendar day, whatever the local
+    /// time zone: one second either side of midnight is two days.
+    #[test]
+    fn per_day_series_splits_at_utc_midnight() {
+        let now = at("2026-09-30T12:00:00Z");
+        let entries = [
+            approved("o/r", 1, "a", at("2026-09-28T23:59:59Z")),
+            approved("o/r", 2, "a", at("2026-09-29T00:00:00Z")),
+            approved("o/r", 3, "a", at("2026-09-29T23:59:59Z")),
+        ];
+        let ins = compute(&entries, now, None);
+        assert_eq!(
+            ins.reviews.per_day,
+            [
+                DailyCount {
+                    date: NaiveDate::from_ymd_opt(2026, 9, 28).unwrap(),
+                    reviews: 1
+                },
+                DailyCount {
+                    date: NaiveDate::from_ymd_opt(2026, 9, 29).unwrap(),
+                    reviews: 2
+                },
+            ]
+        );
+        let text = render(&ins);
+        assert!(text.contains("    2026-09-28   1 #\n"), "{text}");
+        assert!(text.contains("    2026-09-29   2 ##\n"), "{text}");
+    }
+
+    /// The caller's order is irrelevant: newest-first (what `history::query`
+    /// returns) and oldest-first give the same report, with authors and
+    /// repos in name order.
+    #[test]
+    fn report_does_not_depend_on_input_order() {
+        let now = at("2026-09-30T12:00:00Z");
+        let mut entries = vec![
+            completed(
+                "org/b",
+                1,
+                "zed",
+                Verdict::ChangesRequested,
+                3,
+                0,
+                at("2026-09-20T10:00:00Z"),
+                &["no tests"],
+            ),
+            approved("org/b", 1, "zed", at("2026-09-21T10:00:00Z")),
+            terminal(
+                &crate::machine::HistoryEvent::PrMerged,
+                "org/b",
+                1,
+                "zed",
+                at("2026-09-21T12:00:00Z"),
+            ),
+            completed(
+                "org/a",
+                9,
+                "amy",
+                Verdict::CommentOnly,
+                0,
+                2,
+                at("2026-09-22T10:00:00Z"),
+                &[],
+            ),
+        ];
+        let forward = compute(&entries, now, None);
+        entries.reverse();
+        let backward = compute(&entries, now, None);
+        assert_eq!(forward, backward);
+
+        let authors: Vec<&str> = forward
+            .per_author
+            .iter()
+            .map(|a| a.author.as_str())
+            .collect();
+        assert_eq!(authors, ["amy", "zed"]);
+        let repos: Vec<&str> = forward.per_repo.iter().map(|r| r.repo.as_str()).collect();
+        assert_eq!(repos, ["org/a", "org/b"]);
+        // Read chronologically even when handed newest-first: the approval
+        // follows the changes-requested review, the merge follows both.
+        assert_eq!(backward.effectiveness.followed_by_approved, 1);
+        assert_eq!(backward.review_to_merge.average_seconds, Some(2 * 3_600));
+        assert_eq!(forward.per_author[0].comment_only, 1);
+    }
+
+    /// A merge only counts after a review of that PR: a merge with no
+    /// review, a merge recorded before the review, and a review on another
+    /// PR are not samples. The average is whole seconds, rounded down.
+    #[test]
+    fn merges_without_a_prior_review_are_not_latency_samples() {
+        let now = at("2026-09-30T12:00:00Z");
+        let merged = |repo: &str, n: u64, ts: &str| {
+            terminal(
+                &crate::machine::HistoryEvent::PrMerged,
+                repo,
+                n,
+                "a",
+                at(ts),
+            )
+        };
+        let entries = [
+            merged("o/r", 1, "2026-09-20T10:00:00Z"),
+            merged("o/r", 2, "2026-09-20T10:00:00Z"),
+            approved("o/r", 2, "a", at("2026-09-20T11:00:00Z")),
+            approved("o/r", 3, "a", at("2026-09-20T10:00:00Z")),
+            merged("o/other", 3, "2026-09-20T12:00:00Z"),
+        ];
+        let ins = compute(&entries, now, None);
+        assert_eq!(ins.review_to_merge.samples, 0);
+        assert_eq!(ins.review_to_merge.average_seconds, None);
+
+        let entries = [
+            approved("o/r", 1, "a", at("2026-09-20T10:00:00Z")),
+            merged("o/r", 1, "2026-09-20T10:00:01Z"),
+            approved("o/r", 2, "a", at("2026-09-20T10:00:00Z")),
+            merged("o/r", 2, "2026-09-20T10:00:02Z"),
+            // Merged the instant it was reviewed: a zero-second sample.
+            approved("o/r", 3, "a", at("2026-09-20T10:00:00Z")),
+            merged("o/r", 3, "2026-09-20T10:00:00Z"),
+        ];
+        let ins = compute(&entries, now, None);
+        assert_eq!(
+            ins.review_to_merge,
+            MergeLatency {
+                samples: 3,
+                average_seconds: Some(1)
+            }
+        );
+    }
+
+    /// Closed PRs, new commits, review starts, and on-demand briefs are not
+    /// review outcomes: they add nothing to any count.
+    #[test]
+    fn non_outcome_events_change_nothing() {
+        let now = at("2026-09-30T12:00:00Z");
+        let base = [approved("o/r", 1, "a", at("2026-09-29T10:00:00Z"))];
+        let mut noisy = base.to_vec();
+        for event in [
+            crate::machine::HistoryEvent::PrClosed,
+            crate::machine::HistoryEvent::NewCommits,
+            crate::machine::HistoryEvent::ReviewStarted,
+        ] {
+            noisy.push(terminal(&event, "o/r", 1, "a", at("2026-09-29T11:00:00Z")));
+        }
+        noisy.push(HistoryEntry::Brief {
+            ts: at("2026-09-29T11:30:00Z"),
+            repo: "o/r".into(),
+            number: 1,
+            title: "t".into(),
+            author: "a".into(),
+            agent: Some("fake".into()),
+            brief: Some("what it does".into()),
+            usage: None,
+        });
+        assert_eq!(compute(&noisy, now, None), compute(&base, now, None));
+    }
+
+    /// The issue lists are capped (10 overall, 5 per repo), most frequent
+    /// first with ties in text order; blank texts are not issues.
+    #[test]
+    fn issue_lists_are_capped_and_blank_texts_ignored() {
+        let now = at("2026-09-30T12:00:00Z");
+        let texts: Vec<String> = (0..12).map(|i| format!("issue {i:02}")).collect();
+        let mut refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+        refs.extend(["", "   ", "\n\t"]);
+        let mut entries = vec![completed(
+            "o/r",
+            1,
+            "a",
+            Verdict::ChangesRequested,
+            12,
+            0,
+            at("2026-09-29T10:00:00Z"),
+            &refs,
+        )];
+        // "issue 11" blocks a second review: it leads both lists.
+        entries.push(completed(
+            "o/r",
+            2,
+            "a",
+            Verdict::ChangesRequested,
+            1,
+            0,
+            at("2026-09-29T11:00:00Z"),
+            &["Issue   11"],
+        ));
+        let ins = compute(&entries, now, None);
+        let top: Vec<(&str, u32)> = ins
+            .top_blocking_issues
+            .iter()
+            .map(|i| (i.text.as_str(), i.count))
+            .collect();
+        assert_eq!(top.len(), 10);
+        assert_eq!(top[0], ("issue 11", 2));
+        assert_eq!(top[1], ("issue 00", 1));
+        assert_eq!(top[9], ("issue 08", 1));
+        let repo = &ins.per_repo[0].top_blocking_issues;
+        assert_eq!(repo.len(), 5);
+        assert_eq!((repo[0].text.as_str(), repo[0].count), ("issue 11", 2));
+        assert_eq!(repo[4].text, "issue 03");
+    }
+
+    #[test]
+    fn median_handles_empty_odd_even_and_unsorted_input() {
+        assert_eq!(median(&[]), 0.0);
+        assert_eq!(median(&[5]), 5.0);
+        assert_eq!(median(&[3, 1, 2]), 2.0);
+        assert_eq!(median(&[4, 1, 3, 2]), 2.5);
+        assert_eq!(median(&[0, 0, 0, 9]), 0.0);
+        assert_eq!(median(&[u32::MAX, u32::MAX]), f64::from(u32::MAX));
+        assert_eq!(format_median(2.0), "2");
+        assert_eq!(format_median(2.5), "2.5");
+        assert_eq!(format_median(0.0), "0");
+    }
+
+    #[test]
+    fn rate_is_zero_for_an_empty_denominator() {
+        assert_eq!(rate(0, 0), 0.0);
+        assert_eq!(rate(3, 0), 0.0);
+        assert_eq!(rate(1, 4), 0.25);
+        assert_eq!(rate(4, 4), 1.0);
+    }
+
+    #[test]
+    fn durations_switch_units_at_the_minute_hour_and_day() {
+        for (seconds, text) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m"),
+            (3_599, "59m"),
+            (3_600, "1h 0m"),
+            (86_399, "23h 59m"),
+            (86_400, "1d 0h"),
+            (90_000, "1d 1h"),
+        ] {
+            assert_eq!(format_duration(seconds), text, "{seconds}s");
+        }
+    }
+
+    /// The header names the window: all time, N days, and the singular.
+    #[test]
+    fn header_names_the_window() {
+        let now = at("2026-09-30T12:34:56Z");
+        let header = |days| {
+            let text = render(&compute(&[], now, days));
+            text.lines().next().unwrap().to_string()
+        };
+        assert_eq!(
+            header(None),
+            "prx insights (all time · generated 2026-09-30 12:34 UTC)"
+        );
+        assert_eq!(
+            header(Some(30)),
+            "prx insights (last 30 days · generated 2026-09-30 12:34 UTC)"
+        );
+        assert_eq!(
+            header(Some(1)),
+            "prx insights (last 1 day · generated 2026-09-30 12:34 UTC)"
+        );
+    }
+
+    /// The `GET /insights` body: `window_days` is absent for all time, and a
+    /// report survives the trip to the CLI thin client unchanged.
+    #[test]
+    fn payload_omits_an_unset_window_and_round_trips() {
+        let now = at("2026-09-30T12:00:00Z");
+        let entries = [
+            completed(
+                "o/r",
+                1,
+                "a",
+                Verdict::ChangesRequested,
+                1,
+                2,
+                at("2026-09-29T10:00:00Z"),
+                &["no tests"],
+            ),
+            approved("o/r", 1, "a", at("2026-09-29T12:00:00Z")),
+        ];
+        let all = compute(&entries, now, None);
+        let json = serde_json::to_value(&all).unwrap();
+        assert!(json.get("window_days").is_none(), "{json}");
+        assert_eq!(json["generated_at"], "2026-09-30T12:00:00Z");
+        assert_eq!(json["reviews"]["per_day"][0]["date"], "2026-09-29");
+        assert_eq!(json["effectiveness"]["rate"], 1.0);
+        assert_eq!(serde_json::from_value::<Insights>(json).unwrap(), all);
+
+        let windowed = compute(&entries, now, Some(14));
+        let json = serde_json::to_value(&windowed).unwrap();
+        assert_eq!(json["window_days"], 14);
+        assert_eq!(serde_json::from_value::<Insights>(json).unwrap(), windowed);
     }
 }

@@ -187,7 +187,11 @@
       listBox.removeAttribute("aria-busy");
       const now = Date.now();
       const shown = filterEntries(view.entries, view.filter);
-      if (!view.entries.length) {
+      // "No history yet" is only true with no filter set: a filter that
+      // matches nothing (the repo filter is the daemon's, so it can leave no
+      // entries at all) says so instead.
+      const filtered = !!(view.filter.repo || view.filter.event || view.filter.engine);
+      if (!view.entries.length && !filtered) {
         listBox.replaceChildren(UI.empty("clock", "No history yet", "Reviews, skips and merges show up here as PRX sees them."));
       } else if (!shown.length) {
         listBox.replaceChildren(el("p", { class: "list-empty", text: "No loaded event matches these filters." + (view.done ? "" : " Load more to search further back.") }));
@@ -249,9 +253,11 @@
         view.entries = mergeNewer(view.entries, fresh);
       }
       remember();
-      // Don't rebuild a filter the user is choosing from.
+      // Don't rebuild a filter the user is choosing from: an open dropdown
+      // (form.js select) would lose its trigger and close. The next poll
+      // draws what this one loaded.
       const active = document.activeElement;
-      if (active && rootNode.contains(active) && active.tagName === "SELECT") return;
+      if (active && rootNode.contains(active) && active.getAttribute("role") === "combobox" && active.getAttribute("aria-expanded") === "true") return;
       draw();
     });
     draw();

@@ -90,8 +90,10 @@ fn notify_event(entry: &HistoryEntry) -> Option<NotifyEvent> {
         HistoryEntry::PrMerged { .. } => NotifyEvent::Merged,
         HistoryEntry::PrClosed { .. } => NotifyEvent::Closed,
         HistoryEntry::NewCommits { .. } => NotifyEvent::NewCommits,
-        // An on-demand brief run (design B3) has no notification event.
-        HistoryEntry::Brief { .. } => return None,
+        HistoryEntry::NewPr { .. } => NotifyEvent::NewPr,
+        // An on-demand brief run (design B3) has no notification event, and
+        // a newer daemon's event is not one this build can name.
+        HistoryEntry::Brief { .. } | HistoryEntry::Unknown => return None,
     })
 }
 
@@ -146,7 +148,9 @@ fn event_summary(entry: &HistoryEntry) -> String {
         HistoryEntry::PrMerged { .. } => "Merged".to_string(),
         HistoryEntry::PrClosed { .. } => "Closed".to_string(),
         HistoryEntry::NewCommits { .. } => "New commits: re-review pending".to_string(),
+        HistoryEntry::NewPr { title, .. } => format!("New PR: {title}"),
         HistoryEntry::Brief { .. } => "Brief written".to_string(),
+        HistoryEntry::Unknown => "Something happened".to_string(),
     }
 }
 
@@ -171,7 +175,11 @@ pub fn plan(entry: &HistoryEntry, config: &Config) -> Option<Banner> {
         return None;
     }
     let tier = tier_of(entry, event, config);
-    let behavior: &TierBehavior = config.notification_tiers.behavior(tier);
+    // The tier's banner, with the event's own sound (`notifications.sounds`,
+    // or the ready event's built-in `Glass`) — what the daemon delivers.
+    let behavior: TierBehavior = config
+        .notifications_for(entry.repo())
+        .behavior_for(event, &config.notification_tiers);
     eprintln!(
         "prx-menubar: notify {} {} -> tier {} -> {}",
         pr_key(entry),
@@ -678,20 +686,89 @@ mod tests {
         assert!(banner.body.contains("failed"), "{}", banner.body);
     }
 
+    /// The ready event (`on_review_complete_approved`, which comment-only
+    /// reviews share) is informational but plays its own `Glass`, so it is
+    /// told apart from a blocked review by ear; a click opens the PR.
     #[test]
-    fn informational_reviews_banner_without_sound() {
+    fn ready_reviews_banner_with_the_glass_sound() {
         for verdict in [Verdict::Approved, Verdict::CommentOnly] {
             let banner = plan(
                 &completed(1, "org/repo", 13, verdict, 0, 2),
                 &Config::default(),
             )
             .expect("informational -> banner");
-            assert_eq!(banner.sound, None, "informational tier has no sound");
+            assert_eq!(banner.sound.as_deref(), Some("Glass"));
             assert_eq!(
                 banner.url.as_deref(),
                 Some("https://github.com/org/repo/pull/13")
             );
         }
+    }
+
+    /// `notifications.sounds` picks the sound per event and per repo, the
+    /// same resolution the daemon uses; `none` keeps the banner silent.
+    #[test]
+    fn event_sounds_pick_the_banner_sound_per_repo() {
+        use prx::config::{EventSounds, PartialNotifications, PartialOverrides, RepoConfig};
+        let mut config = Config::default();
+        config
+            .defaults
+            .notifications
+            .sounds
+            .on_review_complete_blocking = Some("Sosumi".into());
+        config.repos.push(RepoConfig {
+            name: "acme/quiet".into(),
+            overrides: PartialOverrides {
+                notifications: Some(PartialNotifications {
+                    sounds: Some(EventSounds {
+                        on_review_complete_approved: Some("none".into()),
+                        ..EventSounds::default()
+                    }),
+                    ..PartialNotifications::default()
+                }),
+                ..PartialOverrides::default()
+            },
+        });
+        let blocked = |repo: &str| {
+            plan(
+                &completed(1, repo, 1, Verdict::ChangesRequested, 1, 0),
+                &config,
+            )
+            .unwrap()
+            .sound
+        };
+        let ready = |repo: &str| {
+            plan(&completed(1, repo, 1, Verdict::Approved, 0, 0), &config)
+                .unwrap()
+                .sound
+        };
+        assert_eq!(blocked("org/repo").as_deref(), Some("Sosumi"));
+        assert_eq!(blocked("acme/quiet").as_deref(), Some("Sosumi"));
+        assert_eq!(ready("org/repo").as_deref(), Some("Glass"));
+        assert_eq!(ready("acme/quiet"), None);
+    }
+
+    /// A new PR has a history entry now, so the app raises its banner
+    /// (while the app runs, the daemon leaves banners to it); an event this
+    /// build does not know raises nothing.
+    #[test]
+    fn new_pr_entries_banner_and_unknown_entries_do_not() {
+        let entry = HistoryEntry::NewPr {
+            ts: ts(1),
+            repo: "org/repo".into(),
+            number: 21,
+            title: "Add rate limits".into(),
+            author: "a".into(),
+        };
+        let banner = plan(&entry, &Config::default()).expect("on_new_pr is informational");
+        assert_eq!(banner.key, "org/repo#21");
+        assert_eq!(banner.body, "New PR: Add rate limits");
+        assert_eq!(banner.sound, None);
+        assert_eq!(
+            banner.url.as_deref(),
+            Some("https://github.com/org/repo/pull/21")
+        );
+        assert!(plan(&HistoryEntry::Unknown, &Config::default()).is_none());
     }
 
     #[test]
@@ -976,7 +1053,13 @@ mod tests {
             "{}",
             banners[0].body
         );
-        assert_eq!(banners[0].sound, None, "newest event's tier wins the sound");
+        // Comment-only shares `on_review_complete_approved`, whose built-in
+        // sound is Glass; the blocking event's Basso loses to the newer one.
+        assert_eq!(
+            banners[0].sound.as_deref(),
+            Some("Glass"),
+            "newest event's sound wins"
+        );
     }
 
     #[test]

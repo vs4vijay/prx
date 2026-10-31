@@ -71,12 +71,19 @@ impl Env {
             .expect("state.json should parse")
     }
 
-    /// Outcome history: without the per-run `review_started` markers (D6).
+    /// Outcome history: without the per-run `review_started` markers (D6)
+    /// and the `new_pr` entry tracking a PR writes.
     fn history(&self) -> Vec<prx::history::HistoryEntry> {
         prx::history::query(&self.data_dir.child("history.jsonl"), None, 0)
             .unwrap()
             .into_iter()
-            .filter(|e| !matches!(e, prx::history::HistoryEntry::ReviewStarted { .. }))
+            .filter(|e| {
+                !matches!(
+                    e,
+                    prx::history::HistoryEntry::ReviewStarted { .. }
+                        | prx::history::HistoryEntry::NewPr { .. }
+                )
+            })
             .collect()
     }
 }
@@ -279,5 +286,55 @@ fn daemon_start_compacts_history_beyond_90_days() {
 
     let out = env.run(&["daemon", "stop"], &[]);
     assert!(out.status.success());
+    env.mark_stopped();
+}
+
+// ------------------------------------------------- corrupt state + daemon
+
+/// The daemon refuses to start on a state file it cannot read — broken
+/// JSON, a file cut off mid-write, or an empty one — rather than starting
+/// from nothing and overwriting it. `daemon start` reports the reason, the
+/// file is left byte for byte as it was, and no daemon files stay behind.
+/// With a readable state file the same daemon starts.
+#[test]
+fn daemon_refuses_to_start_on_a_corrupt_or_truncated_state_file() {
+    let mut env = Env::new("hd-state-daemon");
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    // A good state file to cut down: let the CLI write one.
+    let out = env.run(&["status"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let state_path = env.data_dir.child("state.json");
+    let good = std::fs::read_to_string(&state_path).unwrap();
+    assert!(good.len() > 20, "{good}");
+
+    let truncated = &good[..good.len() / 2];
+    for (what, corrupt) in [
+        ("broken JSON", "{\"schema_version\": 1, \"prs\": { BROKEN"),
+        ("a truncated file", truncated),
+        ("an empty file", ""),
+    ] {
+        std::fs::write(&state_path, corrupt).unwrap();
+        let out = env.run(&["daemon", "start"], &[]);
+        assert!(!out.status.success(), "{what}: the daemon must not start");
+        let err = stderr_of(&out);
+        assert!(err.contains("failed to load PR state"), "{what}: {err}");
+        assert_eq!(
+            std::fs::read_to_string(&state_path).unwrap(),
+            corrupt,
+            "{what}: the state file must be left alone"
+        );
+        for file in ["daemon.pid", "daemon.port", "daemon.token"] {
+            assert!(!env.data_dir.child(file).exists(), "{what}: {file}");
+        }
+        let out = env.run(&["daemon", "status"], &[]);
+        assert!(stdout_of(&out).contains("daemon not running"), "{what}");
+    }
+
+    std::fs::write(&state_path, &good).unwrap();
+    let out = env.run(&["daemon", "start"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    env.mark_running();
+    let out = env.run(&["daemon", "stop"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
     env.mark_stopped();
 }

@@ -170,6 +170,15 @@ impl Env {
         std::env::set_var("PRX_DATA_DIR", self.data_dir.path().as_os_str());
         std::env::set_var("FAKE_GH_DIR", self.gh_dir.path().as_os_str());
         std::env::set_var("FAKE_GH_LOG", self.gh_dir.child("calls.log").as_os_str());
+        // The daemon looks its banner command up on PATH: this env's gh dir
+        // comes first, so banners go to its stand-ins (or a test's recording
+        // fakes) and never to the desktop of the machine running the tests.
+        static HOST_PATH: OnceLock<String> = OnceLock::new();
+        let host_path = HOST_PATH.get_or_init(|| std::env::var("PATH").unwrap_or_default());
+        std::env::set_var(
+            "PATH",
+            format!("{}:{host_path}", self.gh_dir.path().display()),
+        );
         for (k, v) in manifest_env {
             std::env::set_var(k, v);
         }
@@ -227,9 +236,15 @@ impl Env {
             .collect()
     }
 
-    /// Every history entry, `review_started` included (newest first).
+    /// Every review history entry, `review_started` included (newest
+    /// first). `new_pr` tracking markers are left out: every poll that
+    /// finds a PR writes one.
     fn raw_history(&self) -> Vec<HistoryEntry> {
-        prx::history::query(&self.data_dir.child("history.jsonl"), None, 0).unwrap()
+        prx::history::query(&self.data_dir.child("history.jsonl"), None, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|e| !matches!(e, HistoryEntry::NewPr { .. }))
+            .collect()
     }
 
     fn review_bodies(&self) -> Vec<PathBuf> {
@@ -293,9 +308,11 @@ async fn auth_requires_a_bearer_token() {
     handle.shutdown().await;
 }
 
-/// D3: the typed client announces the menubar (`X-Prx-Client`) on every
-/// request and the auth middleware records the last-seen instant; a valid
-/// request without the header (the raw auth probe) records nothing.
+/// D3: only the menu bar app counts as a menubar sighting. The auth
+/// middleware records the last-seen instant for `X-Prx-Client: menubar/…`,
+/// which the typed client sends once it opted in with `as_menubar`. The
+/// plain client (the CLI's), a request without the header, and a header
+/// naming some other client record nothing.
 #[tokio::test]
 async fn menubar_client_header_records_last_seen_through_ipc() {
     let _env = env_guard();
@@ -315,8 +332,23 @@ async fn menubar_client_header_records_last_seen_through_ipc() {
         200
     );
     assert!(!handle.shared.menubar_recently_seen(Duration::from_secs(90)));
-    // The DaemonClient announces itself on every request.
+    // The plain client is what the CLI uses: it does not announce.
     client.get_status().await.unwrap();
+    assert!(!handle.shared.menubar_recently_seen(Duration::from_secs(90)));
+    // A client header that names something other than the menubar (an
+    // older CLI sent `menubar/<version>`; anything else is not the app).
+    let raw = Raw::new(&handle);
+    let bearer = format!("Bearer {}", handle.token);
+    for other in ["cli/0.1.1", "", "menubarista/1", "Menubar/1", "x-menubar/1"] {
+        let headers = [("authorization", bearer.as_str()), ("x-prx-client", other)];
+        assert_eq!(raw.send("GET", "/status", &headers, None).await.status, 200);
+        assert!(
+            !handle.shared.menubar_recently_seen(Duration::from_secs(90)),
+            "{other:?} is not the menubar"
+        );
+    }
+    // PRX.app's client opts in and announces on every request.
+    client.clone().as_menubar().get_status().await.unwrap();
     assert!(handle.shared.menubar_recently_seen(Duration::from_secs(90)));
     handle.shutdown().await;
 }
@@ -332,7 +364,8 @@ async fn menubar_liveness_expires_after_the_window_through_ipc() {
     write_list_fixture(env.gh_dir.path(), "org/one", &[]);
     let handle = env.start(fast_opts()).await;
 
-    env.client(&handle).get_status().await.unwrap();
+    let menubar = env.client(&handle).as_menubar();
+    menubar.get_status().await.unwrap();
     assert!(handle.shared.menubar_recently_seen(Duration::from_secs(90)));
     assert!(!handle.shared.menubar_recently_seen(Duration::ZERO));
     handle.shutdown().await;
@@ -1001,17 +1034,22 @@ async fn history_endpoint_filters_by_repo_and_limit() {
     )
     .await;
 
-    // Each review wrote a `review_started` entry before its outcome (D6).
+    // Each review wrote a `review_started` entry before its outcome (D6),
+    // after the `new_pr` entry the poll that found the PR wrote.
     let all = client.history(None, 0).await.unwrap();
-    assert_eq!(all.entries.len(), 4);
+    assert_eq!(all.entries.len(), 6);
     let one = client.history(Some("org/one"), 0).await.unwrap();
-    assert_eq!(one.entries.len(), 2);
+    assert_eq!(one.entries.len(), 3);
     assert!(one.entries.iter().all(|e| e.repo() == "org/one"));
     assert!(matches!(
         one.entries[0],
         HistoryEntry::ReviewCompleted { .. }
     ));
     assert!(matches!(one.entries[1], HistoryEntry::ReviewStarted { .. }));
+    assert!(matches!(
+        one.entries[2],
+        HistoryEntry::NewPr { number: 1, .. }
+    ));
     let limited = client.history(None, 1).await.unwrap();
     assert_eq!(limited.entries.len(), 1);
     handle.shutdown().await;
@@ -4004,5 +4042,1357 @@ async fn post_true_does_not_escalate_a_monitor_repo() {
         [HistoryEntry::ReviewCompleted { posted, .. }] => assert_eq!(*posted, Some(false)),
         other => panic!("expected one completed review, got {other:?}"),
     }
+    handle.shutdown().await;
+}
+
+// ------------------------------------- raw requests: auth and bad input
+
+/// What the daemon answered to one raw request.
+#[derive(Debug)]
+struct Reply {
+    status: u16,
+    body: String,
+}
+
+impl Reply {
+    /// The message of a JSON error body (`{"error": "..."}`), else empty.
+    fn error(&self) -> String {
+        serde_json::from_str::<serde_json::Value>(&self.body)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+}
+
+/// Raw HTTP access to a daemon: unlike [`DaemonClient`], a request carries
+/// exactly the headers and bytes a test gives it.
+struct Raw {
+    http: reqwest::Client,
+    port: u16,
+    token: String,
+}
+
+impl Raw {
+    fn new(handle: &DaemonHandle) -> Raw {
+        Raw {
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            port: handle.port,
+            token: handle.token.clone(),
+        }
+    }
+
+    /// Send one request with only the given headers (no token, no content
+    /// type, no client announcement unless listed).
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&str>,
+    ) -> Reply {
+        let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut request = self
+            .http
+            .request(method, format!("http://127.0.0.1:{}{path}", self.port));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(body) = body {
+            request = request.body(body.to_string());
+        }
+        let response = request.send().await.expect("the daemon must answer");
+        Reply {
+            status: response.status().as_u16(),
+            body: response.text().await.unwrap_or_default(),
+        }
+    }
+
+    /// Send a request the way a well-behaved client does: this start's
+    /// bearer token, and a JSON content type with the body.
+    async fn authed(&self, method: &str, path: &str, body: Option<&str>) -> Reply {
+        let bearer = format!("Bearer {}", self.token);
+        self.send(
+            method,
+            path,
+            &[
+                ("authorization", &bearer),
+                ("content-type", "application/json"),
+            ],
+            body,
+        )
+        .await
+    }
+}
+
+const KEY_BODY: &str = r#"{"key": "org/one#1"}"#;
+
+/// Every route of the IPC API, with a body it accepts. A route added to
+/// `ipc::build_router` belongs here too, so the auth tests cover it.
+const ROUTES: &[(&str, &str, Option<&str>)] = &[
+    ("GET", "/status", None),
+    (
+        "POST",
+        "/review",
+        Some(r#"{"key": "org/one#1", "force": true}"#),
+    ),
+    ("POST", "/brief", Some(KEY_BODY)),
+    ("POST", "/approve", Some(KEY_BODY)),
+    (
+        "POST",
+        "/snooze",
+        Some(r#"{"key": "org/one#1", "hours": 1}"#),
+    ),
+    ("POST", "/ignore", Some(KEY_BODY)),
+    ("POST", "/unignore", Some(KEY_BODY)),
+    ("POST", "/unsnooze", Some(KEY_BODY)),
+    ("POST", "/review-now", None),
+    ("POST", "/pause", Some(r#"{"hours": 1}"#)),
+    ("POST", "/resume", Some("{}")),
+    ("GET", "/config", None),
+    ("PUT", "/config", Some(r#"{"yaml": "repos: []\n"}"#)),
+    ("POST", "/review-mode", Some(r#"{"mode": "off"}"#)),
+    ("POST", "/block", Some(KEY_BODY)),
+    ("POST", "/unblock", Some(KEY_BODY)),
+    ("GET", "/history", None),
+    ("GET", "/insights", None),
+    ("GET", "/usage", None),
+    ("GET", "/discover/agents", None),
+    ("GET", "/discover/repos", None),
+];
+
+/// A PR created just now: inside the default first-review cooldown, so the
+/// daemon tracks it and reviews nothing by itself.
+fn cooling_pr(number: u64) -> String {
+    pr_json(
+        number,
+        "Add feature",
+        "alice",
+        "f/x",
+        "aaaa",
+        false,
+        &fresh_now(),
+    )
+}
+
+/// Wait (without any IPC request) until the daemon tracks `key`.
+async fn tracked_on_disk(env: &Env, key: &str) {
+    wait_for(
+        || async { env.state().prs.contains_key(key) },
+        Duration::from_secs(5),
+        "the PR to be tracked",
+    )
+    .await;
+}
+
+/// The tracked PRs as stored, for before/after comparisons (the scheduler
+/// keeps moving `last_poll`, so whole-file equality would be meaningless).
+fn stored_prs(env: &Env) -> serde_json::Value {
+    serde_json::to_value(&env.state().prs).unwrap()
+}
+
+/// Core invariant 8: every route answers 401 — before it looks at the body
+/// or does anything — unless the request carries this start's token as
+/// `Authorization: Bearer <token>`. Near misses (another scheme, a changed
+/// character, the token in the URL) are refused the same way, change no
+/// state, write nothing to GitHub, and do not count as a menubar sighting.
+#[tokio::test]
+async fn every_route_rejects_requests_without_the_bearer_token() {
+    let _env = env_guard();
+    let env = Env::new("ipc-auth-all");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let raw = Raw::new(&handle);
+    tracked_on_disk(&env, "org/one#1").await;
+    let prs_before = stored_prs(&env);
+    let config_before = std::fs::read_to_string(&env.config).unwrap();
+
+    let token = handle.token.clone();
+    let mut altered = token.clone().into_bytes();
+    altered[63] = if altered[63] == b'0' { b'1' } else { b'0' };
+    let altered = String::from_utf8(altered).unwrap();
+    let credentials: Vec<(&str, Option<String>)> = vec![
+        ("no Authorization header", None),
+        ("an empty token", Some("Bearer ".to_string())),
+        ("an unrelated token", Some("Bearer wrong-token".to_string())),
+        ("one changed character", Some(format!("Bearer {altered}"))),
+        (
+            "a truncated token",
+            Some(format!("Bearer {}", &token[..63])),
+        ),
+        ("a token with a suffix", Some(format!("Bearer {token}0"))),
+        ("the bare token", Some(token.clone())),
+        ("a lower-case scheme", Some(format!("bearer {token}"))),
+        ("the Basic scheme", Some(format!("Basic {token}"))),
+        ("two spaces", Some(format!("Bearer  {token}"))),
+    ];
+    for (method, path, body) in ROUTES {
+        for (what, credential) in &credentials {
+            let mut headers = vec![
+                ("content-type", "application/json"),
+                ("x-prx-client", "menubar/test"),
+            ];
+            if let Some(credential) = credential {
+                headers.push(("authorization", credential.as_str()));
+            }
+            let reply = raw.send(method, path, &headers, *body).await;
+            assert_eq!(reply.status, 401, "{method} {path} with {what}: {reply:?}");
+            assert_eq!(
+                reply.error(),
+                "missing or invalid bearer token",
+                "{method} {path} with {what}"
+            );
+        }
+        // The token is a header, never a URL parameter.
+        for param in ["token", "access_token", "bearer"] {
+            let reply = raw
+                .send(method, &format!("{path}?{param}={token}"), &[], *body)
+                .await;
+            assert_eq!(reply.status, 401, "{method} {path}?{param}=…");
+        }
+    }
+
+    // Nothing happened: same PRs, same config, no pause, no GitHub write,
+    // no history, and no menubar "seen" (which would mute the banners).
+    assert_eq!(stored_prs(&env), prs_before);
+    assert_eq!(std::fs::read_to_string(&env.config).unwrap(), config_before);
+    assert_eq!(env.state().paused_until, None);
+    assert_eq!(
+        handle.shared.live().config.defaults.review_mode,
+        ReviewMode::ReviewComment
+    );
+    assert_eq!(github_writes(&env.gh_dir), 0);
+    assert!(env.raw_history().is_empty());
+    assert!(!handle.shared.menubar_recently_seen(Duration::from_secs(90)));
+
+    // The same request with the right header is served.
+    assert_eq!(raw.authed("GET", "/status", None).await.status, 200);
+    handle.shutdown().await;
+}
+
+/// The route table above matches the daemon: with the token, every listed
+/// method + path is routed to a handler (never 404 / 405, never 401).
+#[tokio::test]
+async fn every_listed_route_exists_and_accepts_the_token() {
+    let _env = env_guard();
+    let env = Env::new("ipc-routes");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let raw = Raw::new(&handle);
+    tracked_on_disk(&env, "org/one#1").await;
+
+    for (method, path, body) in ROUTES {
+        let reply = raw.authed(method, path, *body).await;
+        assert!(
+            ![401, 404, 405].contains(&reply.status),
+            "{method} {path} must be routed: {reply:?}"
+        );
+    }
+    handle.shutdown().await;
+}
+
+/// Core invariant 8: the token is minted per start. After a restart the
+/// previous start's token opens nothing, the discovery files describe the
+/// new start, and they are gone again once the daemon stops.
+#[tokio::test]
+async fn a_token_from_a_previous_start_is_rejected_after_a_restart() {
+    let _env = env_guard();
+    let env = Env::new("ipc-stale-token");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let token_file = env.data_dir.child("daemon.token");
+    let port_file = env.data_dir.child("daemon.port");
+
+    let first = env.start(fast_opts()).await;
+    let old_token = first.token.clone();
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap(), old_token);
+    assert_eq!(
+        std::fs::read_to_string(&port_file).unwrap(),
+        first.port.to_string()
+    );
+    assert_eq!(file_mode(&token_file), 0o600);
+    first.shutdown().await;
+    assert!(!token_file.exists(), "daemon.token must go with the daemon");
+    assert!(!port_file.exists(), "daemon.port must go with the daemon");
+
+    let second = env.start(fast_opts()).await;
+    assert_ne!(second.token, old_token, "every start mints a new token");
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap(), second.token);
+    tracked_on_disk(&env, "org/one#1").await;
+
+    let raw = Raw::new(&second);
+    let stale = format!("Bearer {old_token}");
+    for (method, path, body) in ROUTES {
+        let reply = raw
+            .send(
+                method,
+                path,
+                &[
+                    ("authorization", &stale),
+                    ("content-type", "application/json"),
+                ],
+                *body,
+            )
+            .await;
+        assert_eq!(reply.status, 401, "{method} {path} with the old token");
+    }
+    // The typed client reports it as an error, not as a daemon answer.
+    let stale_client =
+        DaemonClient::with_base(format!("http://127.0.0.1:{}", second.port), old_token);
+    let err = stale_client.approve("org/one#1").await.unwrap_err();
+    assert!(err.to_string().contains("401"), "{err}");
+    assert_eq!(github_writes(&env.gh_dir), 0);
+    second.shutdown().await;
+}
+
+/// A `daemon.token` left behind by a killed daemon may have any permissions
+/// by now. The next start must not put its token into a readable file.
+#[tokio::test]
+async fn a_leftover_token_file_is_made_private_again() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = env_guard();
+    let env = Env::new("ipc-token-perms");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    let token_file = env.data_dir.child("daemon.token");
+    write_file(&token_file, "a-token-from-a-daemon-that-was-killed");
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let handle = env.start(fast_opts()).await;
+    assert_eq!(std::fs::read_to_string(&token_file).unwrap(), handle.token);
+    assert_eq!(
+        file_mode(&token_file),
+        0o600,
+        "the token file must be readable by its owner only"
+    );
+    handle.shutdown().await;
+}
+
+/// Core invariant 8: the API listens on 127.0.0.1 and nowhere else. A
+/// connection to the same port on the IPv6 loopback, or on an address
+/// other machines could reach, finds nothing listening.
+#[tokio::test]
+async fn ipc_api_listens_on_the_ipv4_loopback_only() {
+    use std::net::{IpAddr, SocketAddr};
+    let _env = env_guard();
+    let env = Env::new("ipc-loopback");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    let handle = env.start(fast_opts()).await;
+
+    async fn connects(addr: SocketAddr) -> bool {
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+                .await,
+            Ok(Ok(_))
+        )
+    }
+    let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+    assert!(connects(SocketAddr::new(loopback, handle.port)).await);
+    let v6: IpAddr = "::1".parse().unwrap();
+    assert!(
+        !connects(SocketAddr::new(v6, handle.port)).await,
+        "the API must not listen on ::1"
+    );
+    // This machine's outward-facing address, if it has one: a connected
+    // UDP socket reveals the route's source address without sending.
+    let outward = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:9")?;
+            socket.local_addr()
+        })
+        .map(|addr| addr.ip())
+        .ok()
+        .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+    if let Some(ip) = outward {
+        assert!(
+            !connects(SocketAddr::new(ip, handle.port)).await,
+            "the API must not listen on {ip}"
+        );
+    }
+    handle.shutdown().await;
+}
+
+/// Requests the daemon cannot read — broken JSON, a missing or mistyped
+/// field, no content type, the wrong method, an unknown path, a bad query
+/// value — are refused with the matching 4xx. None of them changes state,
+/// reaches GitHub, or disturbs the daemon.
+#[tokio::test]
+async fn unreadable_requests_are_refused_without_side_effects() {
+    let _env = env_guard();
+    let env = Env::new("ipc-bad-requests");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let raw = Raw::new(&handle);
+    tracked_on_disk(&env, "org/one#1").await;
+    let prs_before = stored_prs(&env);
+
+    for (what, path, body, status) in [
+        ("truncated JSON", "/ignore", r#"{"key":"#, 400),
+        ("not JSON", "/approve", "org/one#1", 400),
+        ("an empty body", "/block", "", 400),
+        ("a missing field", "/ignore", "{}", 422),
+        ("a missing field", "/approve", "{}", 422),
+        ("a mistyped field", "/approve", r#"{"key": 1}"#, 422),
+        ("an array body", "/snooze", "[]", 422),
+        (
+            "a mistyped option",
+            "/review",
+            r#"{"key": "all", "force": "yes"}"#,
+            422,
+        ),
+        (
+            "an unknown mode",
+            "/review-mode",
+            r#"{"mode": "sometimes"}"#,
+            422,
+        ),
+        ("a mistyped pause", "/pause", r#"{"hours": "two"}"#, 422),
+    ] {
+        let reply = raw.authed("POST", path, Some(body)).await;
+        assert_eq!(reply.status, status, "{what} to {path}: {reply:?}");
+    }
+    // A JSON body must say it is JSON.
+    let bearer = format!("Bearer {}", handle.token);
+    let reply = raw
+        .send(
+            "POST",
+            "/approve",
+            &[("authorization", &bearer)],
+            Some(KEY_BODY),
+        )
+        .await;
+    assert_eq!(reply.status, 415, "{reply:?}");
+
+    for (method, path) in [
+        ("POST", "/status"),
+        ("DELETE", "/status"),
+        ("GET", "/approve"),
+        ("GET", "/review"),
+        ("GET", "/review-now"),
+        ("DELETE", "/config"),
+        ("POST", "/config"),
+        ("PUT", "/review-mode"),
+        ("POST", "/history"),
+    ] {
+        let reply = raw.authed(method, path, Some(KEY_BODY)).await;
+        assert_eq!(reply.status, 405, "{method} {path}: {reply:?}");
+    }
+    for path in ["/", "/nope", "/status/", "/approve/org/one/1", "/v1/status"] {
+        let reply = raw.authed("GET", path, None).await;
+        assert_eq!(reply.status, 404, "{path}: {reply:?}");
+        // Without the token an unknown path is a 401 like any other: the
+        // API does not tell strangers which routes exist.
+        assert_eq!(raw.send("GET", path, &[], None).await.status, 401, "{path}");
+    }
+    for path in [
+        "/history?limit=many",
+        "/history?limit=-1",
+        "/history?before=yesterday",
+        "/insights?days=-1",
+        "/insights?days=soon",
+        "/usage?bucket=fortnight",
+        "/usage?window=forever",
+        "/usage?group=color",
+    ] {
+        let reply = raw.authed("GET", path, None).await;
+        assert_eq!(reply.status, 400, "{path}: {reply:?}");
+    }
+    // The handlers' own 400s name the problem in the JSON error body.
+    let reply = raw.authed("GET", "/history?before=yesterday", None).await;
+    assert!(reply.error().contains("RFC 3339"), "{reply:?}");
+
+    assert_eq!(stored_prs(&env), prs_before);
+    assert_eq!(github_writes(&env.gh_dir), 0);
+    assert!(env.raw_history().is_empty());
+    assert_eq!(raw.authed("GET", "/status", None).await.status, 200);
+    handle.shutdown().await;
+}
+
+/// Well-formed requests that name the wrong thing: a reference that is not
+/// a PR, a repo this daemon does not watch, a PR it does not track, or
+/// values no handler accepts. Each gets a 4xx with a JSON `error`, and —
+/// for approve / block / unblock in particular — nothing is sent to GitHub.
+#[tokio::test]
+async fn requests_naming_the_wrong_thing_get_a_4xx_and_change_nothing() {
+    let _env = env_guard();
+    let env = Env::new("ipc-wrong-target");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let raw = Raw::new(&handle);
+    tracked_on_disk(&env, "org/one#1").await;
+    let prs_before = stored_prs(&env);
+    let config_before = std::fs::read_to_string(&env.config).unwrap();
+
+    let key = |key: &str| format!(r#"{{"key": "{key}"}}"#);
+    let snooze = |key: &str| format!(r#"{{"key": "{key}", "hours": 1}}"#);
+    let cases: Vec<(&str, String, u16, &str)> = vec![
+        // Not a PR reference at all.
+        ("/approve", key("bogus"), 400, "invalid PR target"),
+        ("/approve", key("org/one#x"), 400, "invalid PR target"),
+        ("/block", key("bogus"), 400, "invalid PR target"),
+        ("/unblock", key("org/one"), 400, "invalid PR target"),
+        ("/ignore", key("#"), 400, "invalid PR target"),
+        ("/unignore", key(""), 400, "invalid PR target"),
+        ("/unsnooze", key("one#1#2"), 400, "invalid PR target"),
+        ("/snooze", snooze("bogus"), 400, "invalid PR target"),
+        ("/brief", key("not a pr"), 400, ""),
+        // A repo this daemon does not watch.
+        ("/ignore", key("org/unknown#1"), 404, "not watched"),
+        ("/unignore", key("org/unknown#1"), 404, "not watched"),
+        ("/unsnooze", key("org/unknown#1"), 404, "not watched"),
+        ("/snooze", snooze("org/unknown#1"), 404, "not watched"),
+        ("/brief", key("org/unknown#1"), 404, "not watched"),
+        // A watched repo, but a PR the daemon does not track.
+        ("/ignore", key("org/one#99"), 404, "not tracked"),
+        ("/unignore", key("org/one#99"), 404, "not tracked"),
+        ("/unsnooze", key("org/one#99"), 404, "not tracked"),
+        ("/snooze", snooze("org/one#99"), 404, "not tracked"),
+        ("/brief", key("org/one#99"), 404, "not tracked"),
+        // Values no handler accepts.
+        ("/snooze", key("org/one#1"), 400, "hours or until_push"),
+        (
+            "/snooze",
+            r#"{"key": "org/one#1", "hours": 0}"#.into(),
+            400,
+            "must be > 0",
+        ),
+        (
+            "/snooze",
+            r#"{"key": "org/one#1", "hours": -2, "until_push": true}"#.into(),
+            400,
+            "must be > 0",
+        ),
+        (
+            "/review",
+            r#"{"key": "org/one#1", "force": true, "engine": "no-such-engine"}"#.into(),
+            400,
+            "no-such-engine",
+        ),
+        ("/pause", "{}".into(), 400, "--hours N or --until"),
+    ];
+    for (path, body, status, needle) in &cases {
+        let reply = raw.authed("POST", path, Some(body)).await;
+        assert_eq!(reply.status, *status, "{path} {body}: {reply:?}");
+        assert!(
+            !reply.error().is_empty() && reply.error().contains(needle),
+            "{path} {body}: {reply:?}"
+        );
+    }
+    for body in ["{}", r#"{"config": {}, "yaml": "repos: []\n"}"#] {
+        let reply = raw.authed("PUT", "/config", Some(body)).await;
+        assert_eq!(reply.status, 400, "{body}: {reply:?}");
+        assert!(reply.error().contains("exactly one"), "{reply:?}");
+    }
+
+    assert_eq!(stored_prs(&env), prs_before);
+    assert_eq!(std::fs::read_to_string(&env.config).unwrap(), config_before);
+    assert_eq!(env.state().paused_until, None);
+    assert_eq!(
+        github_writes(&env.gh_dir),
+        0,
+        "a refused request must not reach GitHub"
+    );
+    let (queued, in_flight) = handle.shared.queue_stats().await;
+    assert_eq!((queued, in_flight), (0, 0), "nothing may be enqueued");
+    handle.shutdown().await;
+}
+
+/// A timed snooze is capped at 87600 hours (~10 years), like a pause. A
+/// larger value used to overflow the end time and kill the request: the
+/// client saw a dropped connection instead of an answer.
+#[tokio::test]
+async fn snooze_hours_past_the_cap_are_a_400_not_a_dropped_connection() {
+    let _env = env_guard();
+    let env = Env::new("ipc-snooze-cap");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+    tracked_pending(&env, &client, "org/one#1").await;
+
+    for hours in [87_600.5, 1e9, 1e15, 1e300] {
+        let err = client
+            .snooze("org/one#1", Some(hours), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("400") && err.contains("too large (max 87600)"),
+            "{hours} hours: {err}"
+        );
+    }
+    assert_eq!(env.state().prs["org/one#1"].state, PrState::Pending);
+
+    // The cap itself is accepted.
+    let resp = client
+        .snooze("org/one#1", Some(87_600.0), false)
+        .await
+        .unwrap();
+    assert!(resp.changed, "{resp:?}");
+    let rec = &env.state().prs["org/one#1"];
+    assert_eq!(rec.skip_reason, Some(SkipReason::Snoozed));
+    let left = rec.snooze_until.expect("a timed snooze") - chrono::Utc::now();
+    assert!(
+        left > chrono::Duration::hours(87_599) && left <= chrono::Duration::hours(87_600),
+        "{left}"
+    );
+    handle.shutdown().await;
+}
+
+/// A request body past the 2 MB limit is refused with 413 before anything
+/// is parsed or written.
+#[tokio::test]
+async fn an_oversized_body_is_refused_and_the_config_stays_as_it_was() {
+    let _env = env_guard();
+    let env = Env::new("ipc-oversized");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    let handle = env.start(fast_opts()).await;
+    let raw = Raw::new(&handle);
+    let config_before = std::fs::read_to_string(&env.config).unwrap();
+
+    let padding = "# padding\n".repeat(300_000);
+    let body = serde_json::json!({ "yaml": format!("{config_before}{padding}") }).to_string();
+    assert!(body.len() > 2 * 1024 * 1024);
+    let reply = raw.authed("PUT", "/config", Some(&body)).await;
+    assert_eq!(reply.status, 413, "{}", reply.body);
+
+    assert_eq!(std::fs::read_to_string(&env.config).unwrap(), config_before);
+    assert_eq!(raw.authed("GET", "/status", None).await.status, 200);
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------ approve (invariant 1)
+
+/// Core invariant 1: only `POST /approve` posts a GitHub approval. An
+/// automated review with verdict `approved` is posted as a comment, and no
+/// other route — re-review, block, unblock, snooze, ignore, brief, pause,
+/// mode and config changes — ever runs `gh pr review --approve`.
+#[tokio::test]
+async fn only_the_approve_route_posts_a_github_approval() {
+    let _env = env_guard();
+    let env = Env::new("ipc-approve-only");
+    env.configure(
+        &["org/one"],
+        COOLDOWN_ZERO,
+        &[("FAKE_AGENT_MANIFEST_JSON", approved_manifest().as_str())],
+    );
+    write_list_fixture(
+        env.gh_dir.path(),
+        "org/one",
+        &[pr_json(1, "One", "alice", "f/x", "aaaa", false, OLD)],
+    );
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+
+    // The automated review: verdict approved, posted as a comment review.
+    wait_completed_and_idle(&env, &client, 1, "the automated review").await;
+    assert_eq!(
+        env.state().prs["org/one#1"].last_verdict,
+        Some(Verdict::Approved)
+    );
+    assert_eq!(
+        count_calls(&env.gh_dir, "pr review 1 -R org/one --comment"),
+        1
+    );
+
+    // Everything else a client can ask for.
+    let key = "org/one#1";
+    client.review(Some(key), false, true).await.unwrap();
+    wait_completed_and_idle(&env, &client, 2, "the forced re-review").await;
+    client.review(None, true, true).await.unwrap();
+    wait_completed_and_idle(&env, &client, 3, "the forced review of all").await;
+    client.block(key).await.unwrap();
+    client.unblock(key).await.unwrap();
+    client.snooze(key, Some(1.0), false).await.unwrap();
+    client.unsnooze(key).await.unwrap();
+    client.snooze(key, None, true).await.unwrap();
+    client.ignore(key).await.unwrap();
+    client.unignore(key).await.unwrap();
+    client.brief(key).await.unwrap();
+    client.review_now().await.unwrap();
+    client.pause(Some(1.0), None).await.unwrap();
+    client.resume().await.unwrap();
+    client.set_review_mode(ReviewMode::Monitor).await.unwrap();
+    client
+        .set_review_mode(ReviewMode::ReviewComment)
+        .await
+        .unwrap();
+    let yaml = std::fs::read_to_string(&env.config).unwrap();
+    client.put_config_yaml(&yaml).await.unwrap();
+    client.history(None, 10).await.unwrap();
+    client.insights(None, None).await.unwrap();
+    wait_for(
+        || async {
+            let s = client.get_status().await.unwrap();
+            s.in_flight == 0 && s.queue_depth == 0 && !s.prs[0].brief_pending
+        },
+        Duration::from_secs(15),
+        "the daemon to go idle",
+    )
+    .await;
+    assert!(
+        github_writes(&env.gh_dir) >= 4,
+        "reviews and a block were posted"
+    );
+    assert_eq!(
+        count_calls(&env.gh_dir, "--approve"),
+        0,
+        "no automated or indirect path may approve"
+    );
+
+    // The human's approve: exactly one approval, for exactly this PR.
+    let resp = client.approve(key).await.unwrap();
+    assert!(resp.ok && resp.changed, "{resp:?}");
+    assert_eq!(count_calls(&env.gh_dir, "--approve"), 1);
+    assert_eq!(
+        count_calls(&env.gh_dir, "pr review 1 -R org/one --approve"),
+        1
+    );
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------ config reload (D1/D2)
+
+/// D2: a config file that disappears or stops being text is a reload
+/// failure like any other — the daemon keeps polling on the last good
+/// config, reports `config_error`, and clears it once the file is back.
+#[tokio::test]
+async fn a_missing_or_unreadable_config_file_keeps_the_last_good_config() {
+    let _env = env_guard();
+    let env = Env::new("ipc-config-gone");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+    tracked_pending(&env, &client, "org/one#1").await;
+    let good = std::fs::read_to_string(&env.config).unwrap();
+
+    let error_reported = |want: bool| {
+        let client = client.clone();
+        move || {
+            let client = client.clone();
+            async move { client.get_status().await.unwrap().config_error.is_some() == want }
+        }
+    };
+    for breakage in ["removed", "binary"] {
+        match breakage {
+            "removed" => std::fs::remove_file(&env.config).unwrap(),
+            _ => std::fs::write(&env.config, [0xff, 0xfe, 0x00, 0xc3]).unwrap(),
+        }
+        wait_for(
+            error_reported(true),
+            Duration::from_secs(5),
+            "config_error to be reported",
+        )
+        .await;
+        let status = client.get_status().await.unwrap();
+        let error = status.config_error.expect("config_error");
+        assert!(!error.message.is_empty(), "{breakage}");
+        // Still on the last good config: the repo is watched and polled.
+        assert!(
+            status.prs.iter().any(|p| p.key == "org/one#1"),
+            "{breakage}"
+        );
+        let polled = status.last_poll["org/one"];
+        wait_for(
+            || async { client.get_status().await.unwrap().last_poll["org/one"] > polled },
+            Duration::from_secs(10),
+            "polling to continue on the last good config",
+        )
+        .await;
+
+        write_file(&env.config, &good);
+        wait_for(
+            error_reported(false),
+            Duration::from_secs(5),
+            "config_error to clear once the file is back",
+        )
+        .await;
+    }
+    handle.shutdown().await;
+}
+
+/// Sample the daemon's in-flight count until `completed` reviews of
+/// org/one are in history; returns the largest count seen.
+async fn max_in_flight_until(env: &Env, handle: &DaemonHandle, completed: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut max = 0;
+    while completed_reviews(env, "org/one") < completed {
+        assert!(Instant::now() < deadline, "the reviews did not complete");
+        max = max.max(handle.shared.queue_stats().await.1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    max
+}
+
+fn due_prs(numbers: std::ops::RangeInclusive<u64>) -> Vec<String> {
+    numbers
+        .map(|n| {
+            pr_json(
+                n,
+                &format!("PR {n}"),
+                "alice",
+                &format!("f/{n}"),
+                &format!("sha{n}"),
+                false,
+                OLD,
+            )
+        })
+        .collect()
+}
+
+/// `max_concurrent_reviews` is read once, at start: a reload that raises
+/// it changes the running config but not the number of review slots, and
+/// the new value applies from the next start.
+#[tokio::test]
+async fn max_concurrent_reviews_is_sized_at_start_and_ignores_reloads() {
+    let _env = env_guard();
+    let env = Env::new("ipc-cap-reload");
+    env.configure(
+        &["org/one"],
+        COOLDOWN_ZERO,
+        &[
+            ("FAKE_AGENT_MANIFEST_JSON", approved_manifest().as_str()),
+            ("FAKE_AGENT_SLEEP", "0.3"),
+        ],
+    );
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    let handle = env.start(fast_opts()).await;
+    assert_eq!(handle.shared.max_concurrent, 1);
+
+    let raised = format!("{COOLDOWN_ZERO}  max_concurrent_reviews: 3\n");
+    write_file(
+        &env.config,
+        &local_config(&["org/one"], &env.agent_path, &raised),
+    );
+    wait_for(
+        || async { handle.shared.live().config.defaults.max_concurrent_reviews == 3 },
+        Duration::from_secs(5),
+        "the reload to apply",
+    )
+    .await;
+    assert_eq!(handle.shared.max_concurrent, 1);
+    assert_eq!(handle.shared.semaphore.available_permits(), 1);
+
+    // Three due PRs still go through the one slot sized at start.
+    write_list_fixture(env.gh_dir.path(), "org/one", &due_prs(1..=3));
+    handle.shared.poll_requested.notify_one();
+    assert_eq!(max_in_flight_until(&env, &handle, 3).await, 1);
+    handle.shutdown().await;
+
+    let restarted = env.start(fast_opts()).await;
+    assert_eq!(restarted.shared.max_concurrent, 3);
+    assert_eq!(restarted.shared.semaphore.available_permits(), 3);
+    restarted.shutdown().await;
+}
+
+/// D6: with `max_concurrent_reviews: 2` and five PRs due at once, two
+/// reviews are in flight while the rest wait in the queue — never three —
+/// and every PR is reviewed exactly once.
+#[tokio::test]
+async fn in_flight_reviews_never_exceed_the_concurrency_cap() {
+    let _env = env_guard();
+    let env = Env::new("ipc-cap-two");
+    env.configure(
+        &["org/one"],
+        &format!("{COOLDOWN_ZERO}  max_concurrent_reviews: 2\n"),
+        &[
+            ("FAKE_AGENT_MANIFEST_JSON", approved_manifest().as_str()),
+            ("FAKE_AGENT_SLEEP", "0.3"),
+        ],
+    );
+    write_list_fixture(env.gh_dir.path(), "org/one", &due_prs(1..=5));
+    let handle = env.start(fast_opts()).await;
+    assert_eq!(handle.shared.max_concurrent, 2);
+
+    assert_eq!(max_in_flight_until(&env, &handle, 5).await, 2);
+    let client = env.client(&handle);
+    wait_completed_and_idle(&env, &client, 5, "all five reviews").await;
+    assert_eq!(completed_reviews(&env, "org/one"), 5, "one review per PR");
+    for n in 1..=5 {
+        assert_eq!(
+            env.state().prs[&format!("org/one#{n}")].state,
+            PrState::ReviewedApproved
+        );
+    }
+    handle.shutdown().await;
+}
+
+/// `in_review` exists in memory only: while the agent is running, the
+/// state file still shows the PR as pending (so a daemon killed at this
+/// point leaves nothing stranded), and the run's start is already in
+/// history.
+#[tokio::test]
+async fn the_state_file_never_shows_in_review_while_a_review_runs() {
+    let _env = env_guard();
+    let env = Env::new("ipc-in-review");
+    let prompt_out = env.data_dir.child("agent-started.txt");
+    env.configure(
+        &["org/one"],
+        COOLDOWN_ZERO,
+        &[
+            ("FAKE_AGENT_MANIFEST_JSON", approved_manifest().as_str()),
+            ("FAKE_AGENT_SLEEP", "1"),
+            ("FAKE_AGENT_PROMPT_OUT", prompt_out.to_str().unwrap()),
+        ],
+    );
+    write_list_fixture(
+        env.gh_dir.path(),
+        "org/one",
+        &[pr_json(1, "One", "alice", "f/x", "aaaa", false, OLD)],
+    );
+    let handle = env.start(fast_opts()).await;
+
+    wait_for(
+        || async { prompt_out.exists() },
+        Duration::from_secs(10),
+        "the agent to start",
+    )
+    .await;
+    assert!(handle.shared.is_in_flight("org/one#1").await);
+    let on_disk = env.state();
+    assert_eq!(on_disk.prs["org/one#1"].state, PrState::Pending);
+    assert_eq!(on_disk.prs["org/one#1"].last_verdict, None);
+    assert!(
+        matches!(
+            env.raw_history().as_slice(),
+            [HistoryEntry::ReviewStarted { .. }]
+        ),
+        "{:?}",
+        env.raw_history()
+    );
+
+    let client = env.client(&handle);
+    wait_completed_and_idle(&env, &client, 1, "the review to finish").await;
+    assert_eq!(
+        env.state().prs["org/one#1"].state,
+        PrState::ReviewedApproved
+    );
+    handle.shutdown().await;
+}
+
+/// A poll that fails is not reported as a poll: `last_poll` stays empty
+/// for the repo and nothing is tracked, while a retry is already planned.
+#[tokio::test]
+async fn a_failed_poll_is_not_reported_as_a_poll_and_a_retry_is_planned() {
+    let _env = env_guard();
+    let env = Env::new("ipc-poll-fail");
+    env.configure(&["org/one"], "", &[("FAKE_GH_LIST_FAIL", "999999")]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+
+    wait_for(
+        || async { count_calls(&env.gh_dir, "pr list") >= 2 },
+        Duration::from_secs(10),
+        "the failed poll to be retried",
+    )
+    .await;
+    let status = client.get_status().await.unwrap();
+    assert!(status.last_poll.is_empty(), "{:?}", status.last_poll);
+    assert_eq!(status.last_state_poll, None);
+    assert!(status.prs.is_empty());
+    let next = status.next_poll.expect("a retry must be planned");
+    assert!(next > chrono::Utc::now() - chrono::Duration::seconds(5));
+    assert!(env.state().prs.is_empty());
+    handle.shutdown().await;
+}
+
+/// `next_poll` in `/status` is the soonest planned poll: once a repo has
+/// been polled it lies after that poll, about one (scaled) interval away.
+#[tokio::test]
+async fn status_reports_the_next_planned_poll_after_the_last_one() {
+    let _env = env_guard();
+    let env = Env::new("ipc-next-poll");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    // One hour: with the 0.001 test scale, 3.6 s — long enough that the
+    // poll after the startup one cannot have happened yet.
+    write_file(
+        &env.config,
+        &local_config(&["org/one"], &env.agent_path, "")
+            .replace("poll_interval_minutes: 15", "poll_interval_minutes: 60"),
+    );
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+
+    wait_for(
+        || async { !client.get_status().await.unwrap().last_poll.is_empty() },
+        Duration::from_secs(5),
+        "the startup poll",
+    )
+    .await;
+    let status = client.get_status().await.unwrap();
+    let last = status.last_poll["org/one"];
+    let next = status.next_poll.expect("the next poll is planned");
+    let gap = (next - last).num_milliseconds();
+    // 60 min × 0.001 = 3.6 s, ±10 % jitter.
+    assert!((3_240..=3_960).contains(&gap), "{gap} ms");
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------------- discovery
+
+/// Replace this env's fake gh with one that answers `gh api user/repos…`
+/// the way the real one does with `--jq … @tsv` (first page only), or
+/// fails when `fail` is set. Everything else is answered with nothing.
+fn install_repo_listing_gh(env: &Env, fail: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let answer = if fail {
+        "echo 'gh: HTTP 401: Bad credentials' >&2; exit 1".to_string()
+    } else {
+        "case \"$2\" in *page=1) printf 'acme/api\\tfalse\\nacme/vault\\ttrue\\n';; esac"
+            .to_string()
+    };
+    let script = format!(
+        "#!/bin/sh\nprintf '%s %s\\n' \"${{GH_TOKEN:-<default>}}\" \"$*\" >> \"$FAKE_GH_LOG.tokens\"\n\
+         if [ \"$1\" = api ]; then {answer}; exit 0; fi\necho '[]'\n"
+    );
+    write_file(&env.gh_path, &script);
+    std::fs::set_permissions(&env.gh_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `GET /discover/repos` lists what the gh account can see, asking gh
+/// with the default identity's credential; a gh failure is a 502 with the
+/// reason, not an empty list.
+#[tokio::test]
+async fn discover_repos_lists_through_gh_with_the_identity_credential() {
+    let _env = env_guard();
+    let env = Env::new("ipc-discover-repos");
+    env.configure(
+        &["org/one"],
+        "  identity:\n    credential: PRX_TEST_CRED_DISCOVER\n",
+        &[],
+    );
+    std::env::set_var("PRX_TEST_CRED_DISCOVER", "tok-discover");
+    install_repo_listing_gh(&env, false);
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+
+    let found = client.discover_repos().await.unwrap();
+    let listed: Vec<(&str, bool)> = found
+        .repos
+        .iter()
+        .map(|r| (r.name.as_str(), r.private))
+        .collect();
+    assert_eq!(listed, [("acme/api", false), ("acme/vault", true)]);
+    let api_calls: Vec<(String, String)> = token_calls(&env.gh_dir)
+        .into_iter()
+        .filter(|(_, args)| args.starts_with("api user/repos"))
+        .collect();
+    assert!(!api_calls.is_empty());
+    assert!(
+        api_calls.iter().all(|(token, _)| token == "tok-discover"),
+        "{api_calls:?}"
+    );
+
+    install_repo_listing_gh(&env, true);
+    let err = client.discover_repos().await.unwrap_err().to_string();
+    assert!(
+        err.contains("502") && err.contains("could not list repositories"),
+        "{err}"
+    );
+    std::env::remove_var("PRX_TEST_CRED_DISCOVER");
+    handle.shutdown().await;
+}
+
+/// `GET /discover/agents` reports the built-in agent CLIs, where each
+/// configured agent command resolves on this daemon's machine, and the
+/// configured LLM API engines — without running any of them.
+#[tokio::test]
+async fn discover_agents_reports_builtins_and_configured_engines() {
+    let _env = env_guard();
+    let env = Env::new("ipc-discover-agents");
+    env.configure(&["org/one"], "", &[]);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+
+    let found = client.discover_agents().await.unwrap();
+    let names: Vec<&str> = found.agents.iter().map(|a| a.name.as_str()).collect();
+    for builtin in ["pi", "claude", "codex"] {
+        assert!(names.contains(&builtin), "{builtin} missing from {names:?}");
+    }
+    // The configured fake agent resolves to its absolute path.
+    assert_eq!(
+        found.configured["fake"].as_deref(),
+        Some(env.agent_path.as_path())
+    );
+    assert!(found.llm_apis.is_empty(), "{:?}", found.llm_apis);
+    // Nothing was executed to find that out: no agent run, no gh call.
+    assert_eq!(github_writes(&env.gh_dir), 0);
+    assert!(env.raw_history().is_empty());
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------ banners (tiers, D3)
+
+/// Replace this env's stand-in notifiers with recording ones: every banner
+/// the daemon raises appends its argv, one argument per line, to the
+/// returned log, closed by an `--end--` line.
+fn install_recording_notifiers(env: &Env) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let log = env.gh_dir.child("banners.log");
+    for name in ["osascript", "notify-send"] {
+        let path = env.gh_dir.child(name);
+        write_file(
+            &path,
+            &format!(
+                "#!/bin/sh\n{{ for a in \"$@\"; do printf '%s\\n' \"$a\"; done; echo '--end--'; }} >> '{}'\n",
+                log.display()
+            ),
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    log
+}
+
+/// The banners raised so far, each as the arguments that follow the
+/// title: `[body]`, or `[body, sound]` when the tier plays one.
+fn banners(log: &std::path::Path) -> Vec<Vec<String>> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .split(|line| *line == "--end--")
+        .filter(|argv| !argv.is_empty())
+        .map(|argv| {
+            let title = argv
+                .iter()
+                .rposition(|arg| *arg == "PRX")
+                .expect("every banner is titled PRX");
+            argv[title + 1..].iter().map(|s| s.to_string()).collect()
+        })
+        .collect()
+}
+
+fn blocking_review_manifest() -> String {
+    manifest_json(
+        "changes_requested",
+        &[&finding_json(
+            Some("src/a.rs"),
+            Some(3),
+            "blocking",
+            "fix this",
+        )],
+    )
+}
+
+/// With no menubar client around, the daemon raises its own banners, one
+/// per event, as that event's tier says: informational events (new PR,
+/// review started) without a sound, an urgent one (blocking review) with
+/// the tier's sound on macOS, and silent ones (merged) not at all. A PR
+/// title — untrusted text — arrives as a plain argument, quotes and all.
+#[tokio::test]
+async fn daemon_banners_follow_each_events_tier() {
+    let _env = env_guard();
+    let env = Env::new("ipc-banners");
+    env.configure(
+        &["org/one"],
+        COOLDOWN_ZERO,
+        &[(
+            "FAKE_AGENT_MANIFEST_JSON",
+            blocking_review_manifest().as_str(),
+        )],
+    );
+    let log = install_recording_notifiers(&env);
+    // JSON-escaped in the fixture; the title itself is: Fix "it" & (more)
+    let title = r#"Fix \"it\" & (more)"#;
+    write_list_fixture(
+        env.gh_dir.path(),
+        "org/one",
+        &[pr_json(1, title, "alice", "f/x", "aaaa", false, OLD)],
+    );
+    // No DaemonClient in this test: it would announce a menubar.
+    let handle = env.start(fast_opts()).await;
+
+    wait_for(
+        || async { banners(&log).len() >= 3 },
+        Duration::from_secs(15),
+        "the new-PR, review-started and review-complete banners",
+    )
+    .await;
+    let urgent_sound: &[&str] = if cfg!(target_os = "macos") {
+        &["Basso"]
+    } else {
+        &[]
+    };
+    let expected: Vec<Vec<String>> = [
+        (r#"new PR org/one#1: Fix "it" & (more)"#, &[][..]),
+        ("org/one#1: review started", &[][..]),
+        ("org/one#1 review: 1 blocking issue(s) found", urgent_sound),
+    ]
+    .iter()
+    .map(|(body, sound)| {
+        std::iter::once(*body)
+            .chain(sound.iter().copied())
+            .map(String::from)
+            .collect()
+    })
+    .collect();
+    assert_eq!(banners(&log), expected);
+
+    // Merged is a silent-tier event: recorded, never bannered.
+    write_file(&env.gh_dir.child("org_one#1.state"), "MERGED");
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    handle.shared.poll_requested.notify_one();
+    wait_for(
+        || async {
+            env.raw_history()
+                .iter()
+                .any(|e| matches!(e, HistoryEntry::PrMerged { .. }))
+        },
+        Duration::from_secs(10),
+        "the merge to be recorded",
+    )
+    .await;
+    // One more full poll, so a banner for the merge would have been raised.
+    let polled = handle.shared.last_poll_map().await["org/one"];
+    handle.shared.poll_requested.notify_one();
+    wait_for(
+        || async { handle.shared.last_poll_map().await["org/one"] > polled },
+        Duration::from_secs(10),
+        "the next poll",
+    )
+    .await;
+    assert_eq!(
+        banners(&log),
+        expected,
+        "a silent-tier event must not banner"
+    );
+    handle.shutdown().await;
+}
+
+/// D3: while a menubar client has announced itself, the daemon leaves the
+/// banners to it — the same events happen and are recorded, but the
+/// daemon's notifier is not run.
+#[tokio::test]
+async fn daemon_banners_are_left_to_a_live_menubar_client() {
+    let _env = env_guard();
+    let env = Env::new("ipc-banners-deferred");
+    env.configure(
+        &["org/one"],
+        COOLDOWN_ZERO,
+        &[(
+            "FAKE_AGENT_MANIFEST_JSON",
+            blocking_review_manifest().as_str(),
+        )],
+    );
+    let log = install_recording_notifiers(&env);
+    write_list_fixture(env.gh_dir.path(), "org/one", &[]);
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle).as_menubar();
+
+    // PRX.app's client announces itself as the menubar on every request.
+    client.get_status().await.unwrap();
+    write_list_fixture(
+        env.gh_dir.path(),
+        "org/one",
+        &[pr_json(1, "One", "alice", "f/x", "aaaa", false, OLD)],
+    );
+    client.review_now().await.unwrap();
+    wait_completed_and_idle(&env, &client, 1, "the review to complete").await;
+
+    assert_eq!(
+        env.state().prs["org/one#1"].state,
+        PrState::ReviewedChangesRequested
+    );
+    assert!(
+        env.raw_history()
+            .iter()
+            .any(|e| matches!(e, HistoryEntry::ReviewStarted { .. })),
+        "the events the banners are for did happen"
+    );
+    assert_eq!(banners(&log), Vec::<Vec<String>>::new());
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------ agent failures
+
+/// An agent that crashes, and one that hangs past its timeout, fail the
+/// review without taking the daemon with them: the PR is pending again
+/// (never `in_review`), the failure is in history, the review slot is
+/// free, and the next review of the same PR runs normally.
+#[tokio::test]
+async fn a_crashing_or_hanging_agent_fails_the_review_and_frees_the_queue() {
+    let _env = env_guard();
+    let env = Env::new("ipc-agent-fail");
+    env.configure(
+        &["org/one"],
+        "  agent_timeout_seconds: 1\n",
+        &[
+            ("FAKE_AGENT_MANIFEST_JSON", approved_manifest().as_str()),
+            ("FAKE_AGENT_EXIT", "1"),
+        ],
+    );
+    write_list_fixture(env.gh_dir.path(), "org/one", &[cooling_pr(1)]);
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+    tracked_pending(&env, &client, "org/one#1").await;
+
+    let failed = |env: &Env| {
+        env.history()
+            .iter()
+            .filter(|e| matches!(e, HistoryEntry::ReviewFailed { .. }))
+            .count()
+    };
+    let idle_after_failures = |n: usize| {
+        let (env, client) = (&env, client.clone());
+        move || {
+            let client = client.clone();
+            async move {
+                let s = client.get_status().await.unwrap();
+                failed(env) >= n && s.in_flight == 0 && s.queue_depth == 0
+            }
+        }
+    };
+
+    // Crash: exit 1 after writing the manifest (and again on the retry).
+    client.review(Some("org/one#1"), false, true).await.unwrap();
+    wait_for(
+        idle_after_failures(1),
+        Duration::from_secs(15),
+        "the crashed review to fail",
+    )
+    .await;
+    let rec = env.state().prs["org/one#1"].clone();
+    assert_eq!(rec.state, PrState::Pending);
+    assert_eq!(rec.last_verdict, None);
+    assert_eq!(rec.review_attempts, 1);
+
+    // Hang: the agent outlives its 1 s timeout and is killed.
+    std::env::remove_var("FAKE_AGENT_EXIT");
+    std::env::set_var("FAKE_AGENT_SLEEP", "20");
+    let hanging = Instant::now();
+    client.review(Some("org/one#1"), false, true).await.unwrap();
+    wait_for(
+        idle_after_failures(2),
+        Duration::from_secs(15),
+        "the hung review to time out",
+    )
+    .await;
+    assert!(
+        hanging.elapsed() < Duration::from_secs(15),
+        "the timeout, not the agent, must end the run"
+    );
+    assert_eq!(env.state().prs["org/one#1"].state, PrState::Pending);
+    assert_eq!(
+        github_writes(&env.gh_dir),
+        0,
+        "a failed review posts nothing"
+    );
+
+    // A healthy agent: the same PR is reviewed as if nothing had happened.
+    std::env::remove_var("FAKE_AGENT_SLEEP");
+    client.review(Some("org/one#1"), false, true).await.unwrap();
+    wait_completed_and_idle(&env, &client, 1, "the healthy review").await;
+    let rec = env.state().prs["org/one#1"].clone();
+    assert_eq!(rec.state, PrState::ReviewedApproved);
+    assert_eq!(rec.last_verdict, Some(Verdict::Approved));
+    assert_eq!(count_calls(&env.gh_dir, "pr review"), 1);
     handle.shutdown().await;
 }

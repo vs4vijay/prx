@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::notify::{NotifyEvent, Tier, TierTable};
+use crate::notify::{NotifyEvent, Tier, TierBehavior, TierTable};
 use crate::paths;
 use crate::usage::UsageField;
 
@@ -77,6 +77,10 @@ defaults:
     on_closed: silent
     on_failure: urgent
     on_skipped: silent
+    # sounds:                        # per-event sound in place of the tier's (a name, or none)
+    #   on_review_complete_approved: Glass   # built in: a ready PR plays Glass
+    #   on_review_complete_blocking: Basso   # unset: the tier's sound (urgent: Basso)
+    # menubar_bell: true             # PRX.app: bell for ready / blocked PRs not yet opened
   # comments:
   #   inline: true                     # false keeps findings in the review body only
   # brief:                            # (formerly executive_summary)
@@ -691,6 +695,114 @@ pub struct Notifications {
     pub on_failure: Tier,
     #[serde(default = "tier_silent")]
     pub on_skipped: Tier,
+    /// Per-event sound overrides (`notifications.sounds.<event>`): a sound
+    /// name, or `none` for no sound, in place of the tier's sound. Unset
+    /// events play their built-in sound ([`NotifyEvent::builtin_sound`]) or
+    /// else their tier's. Overridable per org and repo, event by event.
+    #[serde(default, skip_serializing_if = "EventSounds::is_empty")]
+    pub sounds: EventSounds,
+    /// PRX.app's menu bar bell (global, like `enabled`): count ready and
+    /// blocked PRs the user has not opened yet. Read by the app only.
+    #[serde(default = "default_true")]
+    pub menubar_bell: bool,
+}
+
+/// `notifications.sounds`: one optional sound per event, keyed like the
+/// event tiers. `None` means "not set here" at every level: in `defaults`
+/// the event's built-in or tier sound applies, in an override the level
+/// below applies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EventSounds {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_new_pr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_review_started: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_review_complete_approved: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_review_complete_blocking: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_new_commits: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_re_review_triggered: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_merged: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_closed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_failure: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_skipped: Option<String>,
+}
+
+impl EventSounds {
+    pub fn is_empty(&self) -> bool {
+        NotifyEvent::ALL.iter().all(|e| self.get(*e).is_none())
+    }
+
+    /// An override level sets no sound (absent, or emptied by clearing).
+    fn unset(sounds: &Option<EventSounds>) -> bool {
+        sounds.as_ref().is_none_or(EventSounds::is_empty)
+    }
+
+    /// The sound set for `event` at this level, if any.
+    pub fn get(&self, event: NotifyEvent) -> Option<&str> {
+        self.slot(event).as_deref()
+    }
+
+    fn slot(&self, event: NotifyEvent) -> &Option<String> {
+        match event {
+            NotifyEvent::NewPr => &self.on_new_pr,
+            NotifyEvent::ReviewStarted => &self.on_review_started,
+            NotifyEvent::ReviewCompleteApproved => &self.on_review_complete_approved,
+            NotifyEvent::ReviewCompleteBlocking => &self.on_review_complete_blocking,
+            NotifyEvent::NewCommits => &self.on_new_commits,
+            NotifyEvent::ReReviewTriggered => &self.on_re_review_triggered,
+            NotifyEvent::Merged => &self.on_merged,
+            NotifyEvent::Closed => &self.on_closed,
+            NotifyEvent::Failure => &self.on_failure,
+            NotifyEvent::Skipped => &self.on_skipped,
+        }
+    }
+
+    fn slot_mut(&mut self, event: NotifyEvent) -> &mut Option<String> {
+        match event {
+            NotifyEvent::NewPr => &mut self.on_new_pr,
+            NotifyEvent::ReviewStarted => &mut self.on_review_started,
+            NotifyEvent::ReviewCompleteApproved => &mut self.on_review_complete_approved,
+            NotifyEvent::ReviewCompleteBlocking => &mut self.on_review_complete_blocking,
+            NotifyEvent::NewCommits => &mut self.on_new_commits,
+            NotifyEvent::ReReviewTriggered => &mut self.on_re_review_triggered,
+            NotifyEvent::Merged => &mut self.on_merged,
+            NotifyEvent::Closed => &mut self.on_closed,
+            NotifyEvent::Failure => &mut self.on_failure,
+            NotifyEvent::Skipped => &mut self.on_skipped,
+        }
+    }
+
+    /// Field-by-field merge: `self` (the more specific layer) wins.
+    pub fn merged_over(&self, base: &EventSounds) -> EventSounds {
+        let mut out = base.clone();
+        for event in NotifyEvent::ALL {
+            if let Some(sound) = self.get(event) {
+                *out.slot_mut(event) = Some(sound.to_string());
+            }
+        }
+        out
+    }
+
+    /// Validate every set sound; `field` names the section in the error.
+    fn validate(&self, field: &str) -> Result<(), ConfigError> {
+        for event in NotifyEvent::ALL {
+            if let Some(sound) = self.get(event) {
+                crate::notify::validate_sound_name(sound).map_err(|e| {
+                    ConfigError::Validation(format!("{field}.{}: {e}", event.config_key()))
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_true() -> bool {
@@ -721,11 +833,29 @@ impl Default for Notifications {
             on_closed: Tier::Silent,
             on_failure: Tier::Urgent,
             on_skipped: Tier::Silent,
+            sounds: EventSounds::default(),
+            menubar_bell: true,
         }
     }
 }
 
 impl Notifications {
+    /// How `event` is delivered: its tier's banner and sound, with the
+    /// sound replaced by `notifications.sounds.<event>` when set (`none` is
+    /// no sound), else by the event's built-in sound. The tier alone still
+    /// decides whether there is a banner: a silent event stays silent.
+    pub fn behavior_for(&self, event: NotifyEvent, tiers: &TierTable) -> TierBehavior {
+        let mut behavior = tiers.behavior(self.tier_for(event)).clone();
+        match self.sounds.get(event).or(event.builtin_sound()) {
+            Some(sound) if sound.trim().eq_ignore_ascii_case(crate::notify::NO_SOUND) => {
+                behavior.sound = None;
+            }
+            Some(sound) => behavior.sound = Some(sound.trim().to_string()),
+            None => {}
+        }
+        behavior
+    }
+
     pub fn tier_for(&self, event: NotifyEvent) -> Tier {
         match event {
             NotifyEvent::NewPr => self.on_new_pr,
@@ -774,6 +904,12 @@ pub struct PartialNotifications {
     pub on_closed: Option<Tier>,
     pub on_failure: Option<Tier>,
     pub on_skipped: Option<Tier>,
+    /// Per-event sounds; each event overrides the level below on its own.
+    #[serde(default, skip_serializing_if = "EventSounds::unset")]
+    pub sounds: Option<EventSounds>,
+    /// Never valid here, like `enabled`: the menu bar bell is global.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub menubar_bell: Option<bool>,
 }
 
 impl PartialNotifications {
@@ -795,6 +931,11 @@ impl PartialNotifications {
             on_closed: self.on_closed.or(base.on_closed),
             on_failure: self.on_failure.or(base.on_failure),
             on_skipped: self.on_skipped.or(base.on_skipped),
+            sounds: match (&self.sounds, &base.sounds) {
+                (Some(own), Some(below)) => Some(own.merged_over(below)),
+                (own, below) => own.clone().or_else(|| below.clone()),
+            },
+            menubar_bell: self.menubar_bell.or(base.menubar_bell),
         }
     }
 }
@@ -1892,6 +2033,66 @@ const OVERRIDE_PROBES: &[OverrideProbe] = &[
             .as_ref()
             .is_some_and(|n| n.on_skipped.is_some())
     }),
+    ("notifications.sounds.on_new_pr", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_new_pr.is_some())
+    }),
+    ("notifications.sounds.on_review_started", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_review_started.is_some())
+    }),
+    ("notifications.sounds.on_review_complete_approved", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_review_complete_approved.is_some())
+    }),
+    ("notifications.sounds.on_review_complete_blocking", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_review_complete_blocking.is_some())
+    }),
+    ("notifications.sounds.on_new_commits", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_new_commits.is_some())
+    }),
+    ("notifications.sounds.on_re_review_triggered", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_re_review_triggered.is_some())
+    }),
+    ("notifications.sounds.on_merged", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_merged.is_some())
+    }),
+    ("notifications.sounds.on_closed", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_closed.is_some())
+    }),
+    ("notifications.sounds.on_failure", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_failure.is_some())
+    }),
+    ("notifications.sounds.on_skipped", |o| {
+        o.notifications
+            .as_ref()
+            .and_then(|n| n.sounds.as_ref())
+            .is_some_and(|s| s.on_skipped.is_some())
+    }),
     ("schedule", |o| o.schedule.is_some()),
     ("browser", |o| o.browser.is_some()),
     ("identity.login", |o| {
@@ -1929,10 +2130,10 @@ const OVERRIDE_PROBES: &[OverrideProbe] = &[
 ];
 
 /// Override leaves deliberately without a probe: `notifications.enabled` is
-/// global (design D6), so an org/repo value is a validation error, never a
-/// source.
+/// global (design D6), and so is `notifications.menubar_bell`, so an
+/// org/repo value is a validation error, never a source.
 #[cfg(test)]
-const NON_OVERRIDABLE_LEAVES: &[&str] = &["notifications.enabled"];
+const NON_OVERRIDABLE_LEAVES: &[&str] = &["notifications.enabled", "notifications.menubar_bell"];
 
 /// The field path a validation/parse error names, when it names one
 /// (design D5: the settings app renders the error next to that input).
@@ -1980,6 +2181,11 @@ pub fn error_field(error: &ConfigError) -> Option<String> {
 /// a sibling temp file (0600) is written, synced, and renamed over `path`,
 /// so readers — the reload watcher included — never see a partial file.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    write_atomic_with_mode(path, bytes, 0o600)
+}
+
+/// [`write_atomic`] with the permission bits the replaced file ends up with.
+fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), ConfigError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let write_err = |source| ConfigError::Write {
@@ -2006,7 +2212,7 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
         // `mode` only applies on creation; a leftover temp file keeps its
         // old bits unless they are reset explicitly.
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)
@@ -2052,22 +2258,21 @@ impl Config {
         })
     }
 
+    /// Serialize and write the config atomically (see [`write_atomic`]), so
+    /// an interrupted `config set` or `repos add` never leaves a truncated
+    /// file. An existing file keeps its permissions; a config that is a
+    /// symlink is written through to its target, the link itself is kept.
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        }
+        use std::os::unix::fs::PermissionsExt;
         let raw = serde_yaml::to_string(self).map_err(|e| ConfigError::Parse {
             path: path.to_path_buf(),
             message: e.to_string(),
         })?;
-        std::fs::write(path, raw).map_err(|source| ConfigError::Write {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        Ok(())
+        let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let mode = std::fs::metadata(&target)
+            .map(|m| m.permissions().mode() & 0o7777)
+            .unwrap_or(0o600);
+        write_atomic_with_mode(&target, raw.as_bytes(), mode)
     }
 
     /// Resolve an engine key against user config first, then built-ins.
@@ -2221,6 +2426,26 @@ impl Config {
                 ),
                 Some(o) => (o.agent_model.as_ref(), o.review_heading.as_ref()),
             };
+            // The same floors as `defaults` (checked above): an override of 0
+            // would poll about once a second, run nothing, or time every
+            // review out at once.
+            if let Some(o) = overrides {
+                if o.poll_interval_minutes == Some(0) {
+                    return Err(ConfigError::Validation(format!(
+                        "{level}.poll_interval_minutes must be > 0"
+                    )));
+                }
+                if o.max_concurrent_reviews == Some(0) {
+                    return Err(ConfigError::Validation(format!(
+                        "{level}.max_concurrent_reviews must be >= 1"
+                    )));
+                }
+                if o.agent_timeout_seconds == Some(0) {
+                    return Err(ConfigError::Validation(format!(
+                        "{level}.agent_timeout_seconds must be > 0"
+                    )));
+                }
+            }
             if let Some(model) = agent_model {
                 if model.is_empty() || model.split_whitespace().count() != 1 {
                     return Err(ConfigError::Validation(format!(
@@ -2296,6 +2521,22 @@ impl Config {
                     "{level}.notifications.enabled: the notification master switch is global; \
                      set it under defaults.notifications only"
                 )));
+            }
+            if overrides
+                .and_then(|o| o.notifications.as_ref())
+                .is_some_and(|n| n.menubar_bell.is_some())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "{level}.notifications.menubar_bell: the menu bar bell is global; \
+                     set it under defaults.notifications only"
+                )));
+            }
+            let sounds = match overrides {
+                None => Some(&self.defaults.notifications.sounds),
+                Some(o) => o.notifications.as_ref().and_then(|n| n.sounds.as_ref()),
+            };
+            if let Some(sounds) = sounds {
+                sounds.validate(&format!("{level}.notifications.sounds"))?;
             }
         }
         for (name, engine) in &self.engines {
@@ -2558,19 +2799,26 @@ fn unknown_engine(key: &str) -> ConfigError {
     ))
 }
 
-/// Validate an `org/repo` name (exactly one `/`, both halves non-empty,
-/// no whitespace).
+/// Validate an `org/repo` name: exactly one `/`, and both halves made only
+/// of what GitHub allows in a name (ASCII letters, digits, `.`, `-`, `_`).
+/// The name becomes a `gh -R` argument, part of REST paths
+/// (`repos/<name>/pulls/...`), of PR keys (`<name>#<n>`) and of file names,
+/// so `.` and `..` halves and an owner starting with `-` are refused too.
 pub fn validate_repo_name(name: &str) -> Result<(), ConfigError> {
     let invalid = || {
         ConfigError::Validation(format!(
-            "invalid repo name '{name}': expected 'org/repo' (one slash, no spaces)"
+            "invalid repo name '{name}': expected 'org/repo' (one slash; letters, digits, '.', '-' and '_' only)"
         ))
     };
-    if name.split_whitespace().count() != 1 {
-        return Err(invalid());
-    }
+    let segment_ok = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    };
     let (org, repo) = name.split_once('/').ok_or_else(invalid)?;
-    if org.is_empty() || repo.is_empty() || repo.contains('/') {
+    if !segment_ok(org) || !segment_ok(repo) || org.starts_with('-') {
         return Err(invalid());
     }
     Ok(())
@@ -2615,6 +2863,12 @@ fn merge_notifications(
             on_closed: p.on_closed.unwrap_or(base.on_closed),
             on_failure: p.on_failure.unwrap_or(base.on_failure),
             on_skipped: p.on_skipped.unwrap_or(base.on_skipped),
+            sounds: match &p.sounds {
+                Some(own) => own.merged_over(&base.sounds),
+                None => base.sounds.clone(),
+            },
+            // Global only, like `enabled`.
+            menubar_bell: base.menubar_bell,
         },
     }
 }
@@ -2651,16 +2905,18 @@ pub fn resolve_review_prompt(value: &str) -> &str {
 }
 
 /// A legacy (pre-F5) review_prompt file-path value: one line, no template
-/// placeholders, and a path shape (`.md`/`.txt` suffix or a `/`, `~`,
-/// `./`, `../` prefix). Such values are rejected, never read.
+/// placeholders, and a path shape (a `/`, `~`, `./`, `../` prefix, or a
+/// single word with a `.md`/`.txt` suffix). Such values are rejected, never
+/// read. A one-line prompt that merely ends by naming a file ("Follow
+/// CONTRIBUTING.md") is several words, so it is prompt text.
 fn looks_like_prompt_path(value: &str) -> bool {
     let v = value.trim();
     if v.contains('\n') || v.contains("{{") {
         return false;
     }
     let lower = v.to_ascii_lowercase();
-    lower.ends_with(".md")
-        || lower.ends_with(".txt")
+    let one_word = !v.contains(char::is_whitespace);
+    (one_word && (lower.ends_with(".md") || lower.ends_with(".txt")))
         || ["/", "~", "./", "../"].iter().any(|p| v.starts_with(p))
 }
 
@@ -2951,6 +3207,116 @@ repos:
             assert!(validate_repo_name(bad).is_err(), "{bad} should be invalid");
         }
         assert!(validate_repo_name("org/repo").is_ok());
+    }
+
+    /// Names GitHub cannot have are refused; everything a real repository
+    /// can be called still passes.
+    #[test]
+    fn repo_names_are_limited_to_what_github_allows() {
+        for bad in [
+            "org/repo#1",
+            "org/a;b",
+            "org/$(id)",
+            "org/a?b",
+            "org/a%2Fb",
+            "org/a\\b",
+            "org/a:b",
+            "org/a@b",
+            "org/r\u{e9}po",
+            "-x/y",
+            "org/..",
+            "org/.",
+            "../repo",
+            "./repo",
+            "org/repo/",
+            "org//repo",
+            "org/re\npo",
+            "",
+            "/",
+        ] {
+            let err = validate_repo_name(bad).expect_err(bad).to_string();
+            assert!(err.contains(&format!("invalid repo name '{bad}'")), "{err}");
+        }
+        for good in [
+            "org/repo",
+            "Org-Name/Repo.Name_2",
+            "o/r",
+            "acme/.github",
+            "acme/..a",
+            "acme/a..b",
+            "acme/repo.",
+            "acme/-dash",
+            "acme/_",
+            "acme/repo.git.js",
+            "user_shortcode/repo",
+            "a-b/c-d",
+            "0/0",
+        ] {
+            assert!(validate_repo_name(good).is_ok(), "{good} should be valid");
+        }
+    }
+
+    /// A config written before the check was tightened fails validation
+    /// with an error naming the entry, like any other invalid config.
+    #[test]
+    fn an_existing_config_with_a_now_invalid_repo_name_names_the_entry() {
+        let cfg: Config =
+            serde_yaml::from_str("repos:\n  - name: org/ok\n  - name: \"org/repo#1\"\n").unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("invalid repo name 'org/repo#1'"), "{err}");
+    }
+
+    /// `save` goes through a sibling temp file and a rename: the old file
+    /// is never rewritten in place (a hard link to it keeps the old bytes),
+    /// its permissions carry over, and a symlinked config stays a symlink.
+    #[test]
+    fn save_replaces_the_file_atomically_keeping_mode_and_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("prx-save-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let mut cfg = Config::default();
+        cfg.repos.push(RepoConfig {
+            name: "org/a".into(),
+            ..RepoConfig::default()
+        });
+
+        let path = dir.join("config.yml");
+        std::fs::write(&path, "repos: []\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let old = dir.join("old-link");
+        std::fs::hard_link(&path, &old).unwrap();
+        cfg.save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "repos: []\n");
+        assert_eq!(Config::load(&path).unwrap().repos.len(), 1);
+        assert_eq!(mode(&path), 0o640);
+        std::fs::remove_file(&old).unwrap();
+
+        // Through a symlink: the target is replaced, the link is kept.
+        let target = dir.join("real/config.yml");
+        std::fs::rename(&path, &target).unwrap();
+        std::os::unix::fs::symlink("real/config.yml", &path).unwrap();
+        cfg.repos[0].name = "org/b".into();
+        cfg.save(&path).unwrap();
+        assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(Config::load(&target).unwrap().repos[0].name, "org/b");
+        assert_eq!(mode(&target), 0o640);
+
+        // A new file (and its missing parent) is created owner-only.
+        let fresh = dir.join("new/dir/config.yml");
+        cfg.save(&fresh).unwrap();
+        assert_eq!(Config::load(&fresh).unwrap().repos[0].name, "org/b");
+        assert_eq!(mode(&fresh), 0o600);
+
+        // No temp file is left behind anywhere.
+        for d in [&dir, &dir.join("real"), &dir.join("new/dir")] {
+            for entry in std::fs::read_dir(d).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(!name.to_string_lossy().contains(".tmp-"), "{name:?}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3999,6 +4365,19 @@ repos:
                 on_closed: Some(Tier::Silent),
                 on_failure: Some(Tier::Silent),
                 on_skipped: Some(Tier::Silent),
+                sounds: Some(EventSounds {
+                    on_new_pr: Some("Glass".into()),
+                    on_review_started: Some("Glass".into()),
+                    on_review_complete_approved: Some("Glass".into()),
+                    on_review_complete_blocking: Some("Glass".into()),
+                    on_new_commits: Some("Glass".into()),
+                    on_re_review_triggered: Some("Glass".into()),
+                    on_merged: Some("Glass".into()),
+                    on_closed: Some("Glass".into()),
+                    on_failure: Some("Glass".into()),
+                    on_skipped: Some("Glass".into()),
+                }),
+                menubar_bell: Some(true),
             }),
             schedule: Some("@daily".into()),
             browser: Some(Browser::System),
@@ -4024,7 +4403,19 @@ repos:
         let mut leaves = std::collections::BTreeSet::new();
         for (key, v) in value.as_object().unwrap() {
             match v.as_object() {
-                Some(inner) => leaves.extend(inner.keys().map(|k| format!("{key}.{k}"))),
+                Some(inner) => {
+                    for (k, inner_v) in inner {
+                        // `notifications.sounds` is one more level deep.
+                        match inner_v.as_object() {
+                            Some(deeper) => {
+                                leaves.extend(deeper.keys().map(|d| format!("{key}.{k}.{d}")))
+                            }
+                            None => {
+                                leaves.insert(format!("{key}.{k}"));
+                            }
+                        }
+                    }
+                }
                 None => {
                     leaves.insert(key.clone());
                 }
@@ -4511,6 +4902,154 @@ repos:
         }
     }
 
+    /// The delivered behaviour per event: ready plays `Glass` out of the
+    /// box, blocked keeps the urgent tier's `Basso`, and every other event
+    /// keeps its tier's sound, so existing configs sound the same.
+    #[test]
+    fn event_sounds_default_to_glass_for_ready_and_the_tier_otherwise() {
+        let cfg = parse_yaml("repos: []\n").unwrap();
+        let n = &cfg.defaults.notifications;
+        assert!(n.sounds.is_empty());
+        assert!(n.menubar_bell);
+        let tiers = TierTable::builtin();
+        let sound = |e| n.behavior_for(e, &tiers).sound;
+        assert_eq!(
+            sound(NotifyEvent::ReviewCompleteApproved).as_deref(),
+            Some("Glass")
+        );
+        assert_eq!(
+            sound(NotifyEvent::ReviewCompleteBlocking).as_deref(),
+            Some("Basso")
+        );
+        assert_eq!(sound(NotifyEvent::Failure).as_deref(), Some("Basso"));
+        assert_eq!(sound(NotifyEvent::NewPr), None);
+        // A silent event stays silent whatever its sound says.
+        assert!(!n.behavior_for(NotifyEvent::Merged, &tiers).banner);
+        // A custom tier sound still reaches every event without its own.
+        let mut loud = tiers.clone();
+        loud.urgent.sound = Some("Funk".into());
+        assert_eq!(
+            n.behavior_for(NotifyEvent::ReviewCompleteBlocking, &loud)
+                .sound
+                .as_deref(),
+            Some("Funk")
+        );
+        // Nothing new is serialized for an untouched section.
+        let json = serde_json::to_value(n).unwrap();
+        assert!(json.get("sounds").is_none(), "{json}");
+        assert_eq!(json["menubar_bell"], true);
+    }
+
+    /// `notifications.sounds.<event>` replaces the tier's sound, `none`
+    /// removes it, and org / repo overrides merge event by event.
+    #[test]
+    fn event_sounds_override_per_level_event_by_event() {
+        let cfg = parse_yaml(
+            "defaults:\n  notifications:\n    sounds:\n      on_review_complete_approved: Hero\n      on_review_complete_blocking: Sosumi\n\
+             orgs:\n  - org: acme\n    notifications:\n      sounds:\n        on_review_complete_blocking: none\n\
+             repos:\n  - name: acme/web\n    notifications:\n      sounds:\n        on_failure: Ping\n  - name: other/x\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let tiers = TierTable::builtin();
+        let sound = |repo: &str, e| cfg.notifications_for(repo).behavior_for(e, &tiers).sound;
+        // Defaults.
+        assert_eq!(
+            sound("other/x", NotifyEvent::ReviewCompleteApproved).as_deref(),
+            Some("Hero")
+        );
+        assert_eq!(
+            sound("other/x", NotifyEvent::ReviewCompleteBlocking).as_deref(),
+            Some("Sosumi")
+        );
+        // Org: blocked is muted, approved still inherits the defaults.
+        assert_eq!(sound("acme/api", NotifyEvent::ReviewCompleteBlocking), None);
+        assert!(
+            cfg.notifications_for("acme/api")
+                .behavior_for(NotifyEvent::ReviewCompleteBlocking, &tiers)
+                .banner
+        );
+        assert_eq!(
+            sound("acme/api", NotifyEvent::ReviewCompleteApproved).as_deref(),
+            Some("Hero")
+        );
+        // Repo: its own event, plus the org's and the defaults' for the rest.
+        assert_eq!(
+            sound("acme/web", NotifyEvent::Failure).as_deref(),
+            Some("Ping")
+        );
+        assert_eq!(sound("acme/web", NotifyEvent::ReviewCompleteBlocking), None);
+        assert_eq!(
+            sound("acme/web", NotifyEvent::ReviewCompleteApproved).as_deref(),
+            Some("Hero")
+        );
+        // Sources name the level each event's sound comes from.
+        let web = cfg.repos.iter().find(|r| r.name == "acme/web").unwrap();
+        let sources = cfg.effective_sources(web);
+        assert_eq!(
+            sources["notifications.sounds.on_failure"],
+            ValueSource::Repo
+        );
+        assert_eq!(
+            sources["notifications.sounds.on_review_complete_blocking"],
+            ValueSource::Org
+        );
+        assert_eq!(
+            sources["notifications.sounds.on_review_complete_approved"],
+            ValueSource::Defaults
+        );
+    }
+
+    /// Sound names are checked like any other value: blank, path-like, and
+    /// unknown event keys are refused with the field named.
+    #[test]
+    fn event_sounds_are_validated() {
+        for (yaml, field) in [
+            (
+                "defaults:\n  notifications:\n    sounds:\n      on_failure: \"  \"\n",
+                "defaults.notifications.sounds.on_failure",
+            ),
+            (
+                "repos:\n  - name: o/r\n    notifications:\n      sounds:\n        on_merged: /System/Library/Sounds/Glass.aiff\n",
+                "repos[o/r].notifications.sounds.on_merged",
+            ),
+        ] {
+            let err = parse_yaml(yaml).unwrap().validate().unwrap_err();
+            assert_eq!(error_field(&err).as_deref(), Some(field), "{err}");
+        }
+        assert!(
+            parse_yaml("defaults:\n  notifications:\n    sounds:\n      on_aproved: Glass\n")
+                .is_err()
+        );
+        parse_yaml("defaults:\n  notifications:\n    sounds:\n      on_merged: NONE\n      on_closed: Purr\n")
+            .unwrap()
+            .validate()
+            .unwrap();
+    }
+
+    /// `menubar_bell` is global, like the master switch.
+    #[test]
+    fn menubar_bell_is_global_only() {
+        let cfg = parse_yaml("defaults:\n  notifications:\n    menubar_bell: false\n").unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.defaults.notifications.menubar_bell);
+        assert!(!cfg.notifications_for("o/r").menubar_bell);
+        for (yaml, field) in [
+            (
+                "orgs:\n  - org: acme\n    notifications:\n      menubar_bell: false\n",
+                "orgs[acme].notifications.menubar_bell",
+            ),
+            (
+                "repos:\n  - name: o/r\n    notifications:\n      menubar_bell: true\n",
+                "repos[o/r].notifications.menubar_bell",
+            ),
+        ] {
+            let err = parse_yaml(yaml).unwrap().validate().unwrap_err();
+            assert!(err.to_string().contains("global"), "{err}");
+            assert_eq!(error_field(&err).as_deref(), Some(field));
+        }
+    }
+
     /// Design D7: `menu` defaults when absent and round-trips when set.
     #[test]
     fn menu_section_defaults_and_parses() {
@@ -4598,6 +5137,526 @@ repos:
         assert_eq!(mode, 0o600);
         // No temp file is left behind.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------ load edge cases
+
+    /// A config that says nothing is the built-in defaults, not an error: an
+    /// emptied file, one that is all comments, and section keys left with
+    /// no value all load, validate and watch nothing.
+    #[test]
+    fn empty_and_valueless_files_load_as_the_defaults() {
+        for yaml in [
+            "",
+            "# everything commented out\n",
+            "defaults:\nrepos:\n",
+            "defaults:\norgs:\nengines:\nmenu:\n",
+        ] {
+            let cfg = parse_yaml(yaml).unwrap_or_else(|e| panic!("{yaml:?}: {e}"));
+            cfg.validate().unwrap();
+            assert_eq!(cfg, Config::default(), "{yaml:?}");
+        }
+    }
+
+    /// The starter config spells the built-in defaults out; the two must not
+    /// drift, or a fresh install would behave differently from a config that
+    /// leaves the same keys unset.
+    #[test]
+    fn starter_config_spells_out_exactly_the_built_in_defaults() {
+        let starter = parse_yaml(STARTER_CONFIG).unwrap();
+        assert_eq!(starter, Config::default());
+        assert_eq!(
+            starter.effective_defaults().unwrap(),
+            Config::default().effective_defaults().unwrap()
+        );
+    }
+
+    /// A file that is not a mapping, or repeats a section, fails to parse,
+    /// and the error names the file.
+    #[test]
+    fn malformed_files_are_parse_errors_naming_the_file() {
+        for yaml in [
+            "hello\n",
+            "- a\n- b\n",
+            "defaults:\n  engine: pi\ndefaults:\n  engine: claude\n",
+            "defaults: [not, a, map\n",
+        ] {
+            let err = parse_yaml(yaml).unwrap_err();
+            assert!(matches!(err, ConfigError::Parse { .. }), "{yaml:?}: {err}");
+            assert!(
+                err.to_string()
+                    .starts_with("failed to parse config file t.yml: "),
+                "{err}"
+            );
+        }
+    }
+
+    /// Type errors name the offending key, so the CLI message and the
+    /// settings app (through `error_field`) can point at it.
+    #[test]
+    fn type_errors_lead_with_the_field_path() {
+        for (yaml, field) in [
+            (
+                "defaults:\n  poll_interval_minutes: -5\n",
+                "defaults.poll_interval_minutes",
+            ),
+            (
+                "defaults:\n  poll_interval_minutes: soon\n",
+                "defaults.poll_interval_minutes",
+            ),
+            (
+                "defaults:\n  skip:\n    drafts: maybe\n",
+                "defaults.skip.drafts",
+            ),
+            ("repos:\n  - engine: pi\n", "repos[0]"),
+            ("engines:\n  x:\n    command: foo\n", "engines.x"),
+            (
+                "engines:\n  x:\n    type: robot\n    command: foo\n",
+                "engines.x.type",
+            ),
+        ] {
+            let err = parse_yaml(yaml).unwrap_err();
+            assert_eq!(error_field(&err).as_deref(), Some(field), "{err}");
+        }
+    }
+
+    /// Malformed values under the legacy keys are errors naming the level,
+    /// not silently dropped unknown keys; a null legacy key is just unset.
+    #[test]
+    fn malformed_legacy_keys_are_errors_naming_the_level() {
+        for (yaml, needle) in [
+            ("defaults:\n  agent: [a]\n", "defaults.agent: expected"),
+            (
+                "orgs:\n  - org: acme\n    agent: 7\n",
+                "orgs[acme].agent: expected",
+            ),
+            (
+                "repos:\n  - name: o/r\n    agent: {a: b}\n",
+                "repos[o/r].agent: expected",
+            ),
+            (
+                "defaults:\n  executive_summary: 5\n",
+                "defaults.executive_summary: ",
+            ),
+            (
+                "repos:\n  - name: o/r\n    executive_summary:\n      enabled: maybe\n",
+                "repos[o/r].executive_summary: ",
+            ),
+        ] {
+            let err = parse_yaml(yaml).unwrap_err().to_string();
+            assert!(err.contains(needle), "{yaml:?}: {err}");
+        }
+        let cfg = parse_yaml(
+            "defaults:\n  agent:\n  executive_summary:\nrepos:\n  - name: o/r\n    agent:\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.engine, "pi");
+        assert_eq!(cfg.defaults.brief, BriefSettings::default());
+        assert_eq!(cfg.repos[0].overrides.engine, None);
+        // The consumed legacy keys do not linger as unknown keys.
+        assert!(cfg.defaults.extra.is_empty(), "{:?}", cfg.defaults.extra);
+        assert!(cfg.repos[0].overrides.extra.is_empty());
+    }
+
+    /// Wire compatibility: what prx writes it reads back unchanged, at every
+    /// level and for both engine types, and legacy input is written in the
+    /// new form only.
+    #[test]
+    fn serialized_config_round_trips_and_drops_legacy_names() {
+        let cfg = parse_yaml(
+            r#"defaults:
+  agent: mine
+  agent_model: big
+  review_mode: monitor
+  schedule: "0 9 * * 1-5"
+  browser: ["firefox", "--new-tab", "{{URL}}"]
+  identity:
+    login: maya
+    credential: GH_TOKEN_WORK
+  executive_summary:
+    timeout_seconds: 45
+  notifications:
+    enabled: false
+    on_merged: urgent
+  future_default: 1
+agents:
+  mine:
+    command: my-agent
+    args: ["-"]
+    resume_args: ["--resume", "{{SESSION_ID}}"]
+    session_output:
+      json_field: session_id
+engines:
+  cheap:
+    type: llm_api
+    provider: openai_compatible
+    base_url: http://localhost:11434/v1
+    model: small
+    api_key_env: LOCAL_KEY
+    temperature: 0.2
+menu:
+  sort: key
+  group_by: repo
+orgs:
+  - org: acme
+    agent: codex
+    skip:
+      labels: ["hold"]
+    executive_summary:
+      enabled: false
+repos:
+  - name: acme/api
+    browser: Firefox
+    cooldown:
+      between_re_reviews_minutes: 5
+    notifications:
+      on_failure: silent
+    comments:
+      inline: false
+    future_repo: [1, 2]
+future_top:
+  nested: true
+"#,
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let written = serde_yaml::to_string(&cfg).unwrap();
+        for legacy in ["agents:", "agent:", "executive_summary"] {
+            assert!(!written.contains(legacy), "{legacy} in:\n{written}");
+        }
+        let back = parse_yaml(&written).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(
+            back.effective_repos().unwrap(),
+            cfg.effective_repos().unwrap()
+        );
+        // A second write is byte-identical: saving is stable.
+        assert_eq!(serde_yaml::to_string(&back).unwrap(), written);
+    }
+
+    // ------------------------------------------------ validation floors
+
+    /// The floors `defaults` enforces hold for org and repo overrides too:
+    /// a zero would poll about once a second, or time every review out.
+    #[test]
+    fn overrides_reject_the_zero_values_defaults_reject() {
+        for key in [
+            "poll_interval_minutes",
+            "max_concurrent_reviews",
+            "agent_timeout_seconds",
+        ] {
+            for (yaml, level) in [
+                (format!("defaults:\n  {key}: 0\n"), "defaults".to_string()),
+                (
+                    format!("orgs:\n  - org: acme\n    {key}: 0\n"),
+                    "orgs[acme]".to_string(),
+                ),
+                (
+                    format!("repos:\n  - name: o/r\n    {key}: 0\n"),
+                    "repos[o/r]".to_string(),
+                ),
+            ] {
+                let err = parse_yaml(&yaml).unwrap().validate().unwrap_err();
+                assert_eq!(
+                    error_field(&err),
+                    Some(format!("{level}.{key}")),
+                    "{yaml:?}: {err}"
+                );
+                assert!(err.to_string().contains("must be >"), "{err}");
+            }
+            // The smallest legal value passes at every level.
+            parse_yaml(&format!(
+                "defaults:\n  {key}: 1\norgs:\n  - org: acme\n    {key}: 1\nrepos:\n  - name: o/r\n    {key}: 1\n"
+            ))
+            .unwrap()
+            .validate()
+            .unwrap();
+        }
+    }
+
+    /// A one-line prompt that ends by naming a file is prompt text; only a
+    /// single path-shaped word is taken for a legacy prompt path.
+    #[test]
+    fn one_line_prompt_naming_a_file_is_prompt_text() {
+        for ok in [
+            "Follow the rules in CONTRIBUTING.md",
+            "Check every change against docs/review.txt",
+            "Be strict.",
+        ] {
+            let mut cfg = Config::default();
+            cfg.defaults.review_prompt = ok.into();
+            cfg.validate().unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+            cfg.repos.push(RepoConfig {
+                name: "o/r".into(),
+                ..RepoConfig::default()
+            });
+            assert_eq!(cfg.effective_repos().unwrap()[0].review_prompt, ok);
+        }
+        for path in ["strict.md", "prompts/strict.TXT", "~/p", "/etc/prx/p"] {
+            let mut cfg = Config::default();
+            cfg.defaults.review_prompt = path.into();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("review_prompt is now the prompt text"),
+                "{err}"
+            );
+        }
+    }
+
+    /// Core invariant: no secrets in config. Every key that could hold key
+    /// material inline on an `llm_api` engine is rejected by name, and the
+    /// two "name of an environment variable" fields refuse token-shaped
+    /// values.
+    #[test]
+    fn inline_secrets_are_rejected_wherever_a_credential_is_named() {
+        for key in INLINE_KEY_FIELDS {
+            let err = parse_yaml(&format!(
+                "engines:\n  llm:\n    type: llm_api\n    provider: anthropic\n    model: m\n    \
+                 api_key_env: K\n    {key}: hunter2\n"
+            ))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains(&format!("engines.llm.{key}: API keys must not be written")),
+                "{err}"
+            );
+            // The message must not echo the secret back into logs.
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+        for value in ["ghp_abc-123", "Bearer x", "1TOKEN", "a.b", ""] {
+            let err = parse_yaml(&format!(
+                "defaults:\n  identity:\n    credential: \"{value}\"\n"
+            ))
+            .unwrap()
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("defaults.identity.credential"), "{err}");
+        }
+        for name in ["GH_TOKEN_WORK", "_private", "token2"] {
+            parse_yaml(&format!("defaults:\n  identity:\n    credential: {name}\n"))
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+    }
+
+    // ------------------------------------------------ resolution details
+
+    /// The brief engine resolves like the review engine but with its own
+    /// default model: `agent_model` belongs to the review engine only.
+    #[test]
+    fn brief_engine_resolves_without_the_review_model() {
+        let cfg = parse_yaml(
+            "defaults:\n  engine: pi\n  agent_model: big\n  brief:\n    engine: claude\n\
+             repos:\n  - name: o/own\n  - name: o/same\n    brief:\n      engine: pi\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let eff = cfg.effective_repos().unwrap();
+
+        assert_eq!(eff[0].brief_engine(), "claude");
+        assert!(args_of(&eff[0]).ends_with(&["--model".to_string(), "big".to_string()]));
+        let brief = eff[0].brief_resolved_engine.clone().unwrap();
+        let brief = brief.as_agent().unwrap();
+        assert_eq!(brief.command, "claude");
+        assert!(!brief.args.iter().any(|a| a == "big"), "{:?}", brief.args);
+
+        // Naming the review engine itself reuses it, model included.
+        assert_eq!(eff[1].brief_engine(), "pi");
+        assert_eq!(
+            eff[1].brief_resolved_engine.as_ref(),
+            Some(&eff[1].resolved_engine)
+        );
+    }
+
+    /// Without `brief.engine` the brief engine is whatever reviews the PR,
+    /// following a repo-level engine override.
+    #[test]
+    fn unset_brief_engine_follows_the_review_engine() {
+        let cfg = parse_yaml("repos:\n  - name: o/r\n    engine: codex\n").unwrap();
+        let eff = cfg.effective_repos().unwrap();
+        assert_eq!(eff[0].brief.engine, None);
+        assert_eq!(eff[0].brief_engine(), "codex");
+        assert_eq!(
+            eff[0].brief_resolved_engine.as_ref(),
+            Some(&eff[0].resolved_engine)
+        );
+    }
+
+    /// An org entry applies to `<org>/…` names only: a longer org that
+    /// merely starts with the slug is a different org, and names without a
+    /// slash never match.
+    #[test]
+    fn org_entries_match_the_exact_org_half_only() {
+        let cfg = parse_yaml(
+            "orgs:\n  - org: acme\n    poll_interval_minutes: 3\n\
+             repos:\n  - name: acme/api\n  - name: acme-labs/api\n  - name: other/acme\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let polls: Vec<u64> = cfg
+            .effective_repos()
+            .unwrap()
+            .iter()
+            .map(|r| r.poll_interval_minutes)
+            .collect();
+        assert_eq!(polls, [3, 15, 15]);
+        assert!(cfg.matching_org("acme/anything").is_some());
+        for name in ["acme", "(defaults)", "/acme", "acme-labs/x", ""] {
+            assert!(cfg.matching_org(name).is_none(), "{name:?}");
+        }
+    }
+
+    /// `notifications_for` answers for any repo name: a watched repo's own
+    /// merge, an unwatched member of a configured org, and plain defaults —
+    /// also when the repo's entry cannot be resolved at all.
+    #[test]
+    fn notifications_for_covers_watched_unwatched_and_broken_repos() {
+        let cfg = parse_yaml(
+            "defaults:\n  notifications:\n    on_merged: informational\n\
+             orgs:\n  - org: acme\n    notifications:\n      on_closed: urgent\n\
+             repos:\n  - name: acme/api\n    notifications:\n      on_merged: urgent\n\
+             \x20 - name: solo/broken\n    engine: no-such-engine\n    notifications:\n      on_merged: urgent\n",
+        )
+        .unwrap();
+        let watched = cfg.notifications_for("acme/api");
+        assert_eq!(watched.on_merged, Tier::Urgent); // repo
+        assert_eq!(watched.on_closed, Tier::Urgent); // org
+        let member = cfg.notifications_for("acme/unwatched");
+        assert_eq!(member.on_merged, Tier::Informational); // defaults
+        assert_eq!(member.on_closed, Tier::Urgent); // org
+        let stranger = cfg.notifications_for("nobody/repo");
+        assert_eq!(stranger, cfg.defaults.notifications);
+        // The unresolvable entry falls back to the defaults, not a panic.
+        assert_eq!(
+            cfg.notifications_for("solo/broken"),
+            cfg.defaults.notifications
+        );
+    }
+
+    /// `engine_names` is what pickers offer: built-ins and configured
+    /// entries, sorted, with an overridden built-in listed once.
+    #[test]
+    fn engine_names_are_sorted_and_deduplicated() {
+        let cfg = parse_yaml(
+            "engines:\n  zed:\n    type: agent\n    command: z\n  pi:\n    type: agent\n    command: my-pi\n  alpha:\n    type: agent\n    command: a\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.engine_names(),
+            ["alpha", "claude", "codex", "pi", "zed"]
+        );
+        assert_eq!(Config::default().engine_names(), ["claude", "codex", "pi"]);
+    }
+
+    /// An engine a level names must exist; the error says which engine, and
+    /// resolving a repo that names a missing one fails the same way.
+    #[test]
+    fn unknown_engines_are_rejected_at_every_level() {
+        for yaml in [
+            "defaults:\n  engine: ghost\n",
+            "orgs:\n  - org: acme\n    engine: ghost\n",
+            "repos:\n  - name: o/r\n    engine: ghost\n",
+        ] {
+            let cfg = parse_yaml(yaml).unwrap();
+            let err = cfg.validate().unwrap_err();
+            assert_eq!(error_field(&err).as_deref(), Some("engine"), "{err}");
+            assert!(err.to_string().contains("unknown engine 'ghost'"), "{err}");
+        }
+        let cfg = parse_yaml("repos:\n  - name: o/r\n    engine: ghost\n").unwrap();
+        assert!(cfg.effective_repos().is_err());
+        assert!(cfg.resolved_engine("ghost", None).is_err());
+    }
+
+    // ------------------------------------------------ files on disk
+
+    /// Loading distinguishes "no file" (the `prx init` hint) from a path
+    /// that exists but cannot be read as a file.
+    #[test]
+    fn load_reports_missing_and_unreadable_paths_differently() {
+        let dir = starter_dir("load-kinds");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("absent.yml");
+        let err = Config::load(&missing).unwrap_err();
+        assert!(matches!(err, ConfigError::NotFound(ref p) if p == &missing));
+        assert!(err.to_string().contains(&missing.display().to_string()));
+
+        // A directory where the file should be is an I/O error, not "run init".
+        let err = Config::load(&dir).unwrap_err();
+        assert!(matches!(err, ConfigError::Io { .. }), "{err}");
+        assert!(!err.to_string().contains("prx init"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_creates_missing_parent_directories() {
+        let dir = starter_dir("save-nested");
+        let path = dir.join("a").join("b").join("config.yml");
+        let cfg = parse_yaml("repos:\n  - name: o/r\n").unwrap();
+        cfg.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The starter config is never written over something that is not a
+    /// config file either, and a parent that cannot hold it is an error
+    /// that leaves nothing behind.
+    #[test]
+    fn starter_config_respects_directories_and_reports_unwritable_parents() {
+        let dir = starter_dir("odd-paths");
+        std::fs::create_dir_all(dir.join("config.yml")).unwrap();
+        assert!(!ensure_starter_config(&dir.join("config.yml")).unwrap());
+        assert!(dir.join("config.yml").is_dir());
+
+        // The parent "directory" is a regular file.
+        std::fs::write(dir.join("blocker"), "x").unwrap();
+        let path = dir.join("blocker").join("config.yml");
+        let err = ensure_starter_config(&path).unwrap_err();
+        assert!(matches!(err, ConfigError::Write { .. }), "{err}");
+        assert_eq!(std::fs::read_to_string(dir.join("blocker")).unwrap(), "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `write_atomic` creates the directory it needs, tightens a stale temp
+    /// file left by a crashed write, and on failure leaves the target and
+    /// the directory as they were.
+    #[test]
+    fn write_atomic_handles_missing_dirs_stale_temp_files_and_failures() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = starter_dir("atomic-edges");
+        let path = dir.join("nested").join("config.yml");
+        write_atomic(&path, b"a: 1\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a: 1\n");
+
+        // A leftover world-readable temp file must not leak its mode.
+        let tmp = path.with_file_name(format!(".config.yml.tmp-{}", std::process::id()));
+        std::fs::write(&tmp, "stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic(&path, b"a: 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a: 2\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!tmp.exists());
+
+        // The target is a non-empty directory: the rename fails, the error
+        // names the target, and no temp file lingers.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(blocked.join("child")).unwrap();
+        let err = write_atomic(&blocked, b"x").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Write { ref path, .. } if path == &blocked),
+            "{err}"
+        );
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().all(|n| !n.contains(".tmp-")), "{names:?}");
+        assert!(blocked.join("child").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

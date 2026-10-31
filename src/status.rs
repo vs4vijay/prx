@@ -851,4 +851,394 @@ mod tests {
         let table = render_table(&[entry_with("\u{2705}", "t", "a")], None);
         assert!(table.ends_with("\nlast poll: never\n"), "{table:?}");
     }
+
+    const COOLDOWN_REPOS: &str =
+        "defaults:\n  cooldown:\n    before_first_review_minutes: 60\n    \
+                                  between_re_reviews_minutes: 30\nrepos:\n  - name: o/a\n";
+
+    fn at(ts: &str) -> DateTime<Utc> {
+        ts.parse().unwrap()
+    }
+
+    /// The one row `render_entries` produces for `rec` at `now`.
+    fn row_at(rec: PrRecord, now: &str) -> StatusEntry {
+        let mut file = StateFile::default();
+        file.prs.insert(rec.key(), rec);
+        let mut entries = render_entries(&file, &repos(COOLDOWN_REPOS), at(now));
+        assert_eq!(entries.len(), 1);
+        entries.remove(0)
+    }
+
+    /// Icon and VERDICT text for every lifecycle state and skip reason.
+    #[test]
+    fn every_state_and_skip_reason_has_its_icon_and_summary() {
+        const NOW: &str = "2026-09-05T12:00:00Z";
+        // Opened two hours before NOW: past the 60-minute first cooldown.
+        let old = |state| record("o/a", 1, "2026-09-05T10:00:00Z", state);
+        let skipped = |reason| {
+            let mut rec = old(PrState::Skipped);
+            rec.skip_reason = reason;
+            rec
+        };
+        let reviewed = |state, verdict, blocking, nits| {
+            let mut rec = old(state);
+            rec.last_verdict = verdict;
+            rec.blocking_count = blocking;
+            rec.nit_count = nits;
+            rec
+        };
+        let mut timed = skipped(Some(SkipReason::Snoozed));
+        timed.snooze_until = Some(at("2026-09-06T08:30:00Z"));
+        // A timed snooze wins the wording even if the push flag is also set.
+        let mut timed_and_push = timed.clone();
+        timed_and_push.snooze_until_push = true;
+        let mut until_push = skipped(Some(SkipReason::Snoozed));
+        until_push.snooze_until_push = true;
+
+        let cases: Vec<(&str, PrRecord, &str, &str)> = vec![
+            (
+                "pending, due",
+                old(PrState::Pending),
+                "\u{1f195}",
+                "ready for review",
+            ),
+            (
+                "pending, cooling down",
+                record("o/a", 1, "2026-09-05T11:45:00Z", PrState::Pending),
+                "\u{23f3}",
+                "cooling down: review in 45m",
+            ),
+            (
+                "in review",
+                old(PrState::InReview),
+                "\u{1f504}",
+                "review in progress",
+            ),
+            (
+                "approved",
+                reviewed(PrState::ReviewedApproved, Some(Verdict::Approved), 0, 2),
+                "\u{2705}",
+                "approved: 0 blocking, 2 nits",
+            ),
+            (
+                "comment only",
+                reviewed(PrState::ReviewedApproved, Some(Verdict::CommentOnly), 0, 1),
+                COMMENT_ONLY_ICON,
+                "commented: 0 blocking, 1 nits",
+            ),
+            (
+                "changes requested",
+                reviewed(
+                    PrState::ReviewedChangesRequested,
+                    Some(Verdict::ChangesRequested),
+                    3,
+                    1,
+                ),
+                "\u{26a0}\u{fe0f}",
+                "changes requested: 3 blocking, 1 nits",
+            ),
+            (
+                "blocked by hand, never reviewed",
+                reviewed(PrState::ReviewedChangesRequested, None, 0, 0),
+                "\u{26a0}\u{fe0f}",
+                "reviewed: 0 blocking, 0 nits",
+            ),
+            (
+                "draft",
+                skipped(Some(SkipReason::Draft)),
+                "\u{1f6ab}",
+                "skipped: draft",
+            ),
+            (
+                "config",
+                skipped(Some(SkipReason::Config)),
+                "\u{1f6ab}",
+                "skipped: config",
+            ),
+            (
+                "snoozed until a time",
+                timed,
+                "\u{1f6ab}",
+                "snoozed until 2026-09-06 08:30 UTC",
+            ),
+            (
+                "snoozed until a time and a push",
+                timed_and_push,
+                "\u{1f6ab}",
+                "snoozed until 2026-09-06 08:30 UTC",
+            ),
+            (
+                "snoozed until push",
+                until_push,
+                "\u{1f6ab}",
+                "snoozed until next push",
+            ),
+            (
+                "snoozed, no end recorded",
+                skipped(Some(SkipReason::Snoozed)),
+                "\u{1f6ab}",
+                "snoozed",
+            ),
+            (
+                "ignored",
+                skipped(Some(SkipReason::Ignored)),
+                "\u{1f6ab}",
+                "ignored",
+            ),
+            ("skipped, no reason", skipped(None), "\u{1f6ab}", "skipped"),
+            ("merged", old(PrState::Merged), "\u{2714}\u{fe0f}", "merged"),
+            (
+                "closed",
+                old(PrState::Closed),
+                "\u{1f5d1}\u{fe0f}",
+                "closed",
+            ),
+        ];
+        for (name, rec, icon, summary) in cases {
+            let (state, reason) = (rec.state, rec.skip_reason);
+            let entry = row_at(rec, NOW);
+            assert_eq!(entry.icon, icon, "{name}");
+            assert_eq!(entry.summary, summary, "{name}");
+            assert_eq!((entry.state, entry.skip_reason), (state, reason), "{name}");
+        }
+    }
+
+    /// A pending PR that was reviewed before is "re-review pending" (🔁) and
+    /// cools down on the re-review interval from its anchor; one with no
+    /// anchor at all is due immediately.
+    #[test]
+    fn re_review_pending_uses_the_re_review_cooldown() {
+        let mut again = record("o/a", 1, "2026-09-01T10:00:00Z", PrState::Pending);
+        again.last_verdict = Some(Verdict::ChangesRequested);
+        again.review_anchor_at = Some(at("2026-09-05T11:50:00Z")); // new commits seen
+        let entry = row_at(again.clone(), "2026-09-05T12:00:00Z");
+        assert_eq!(entry.icon, "\u{1f501}");
+        assert_eq!(entry.summary, "cooling down: review in 20m");
+        // The interval is over: same glyph, now ready.
+        let entry = row_at(again.clone(), "2026-09-05T12:20:00Z");
+        assert_eq!(entry.icon, "\u{1f501}");
+        assert_eq!(entry.summary, "ready for review");
+
+        let mut unanchored = record("o/a", 1, "2026-09-05T11:59:00Z", PrState::Pending);
+        unanchored.review_anchor_at = None;
+        let entry = row_at(unanchored, "2026-09-05T12:00:00Z");
+        assert_eq!(entry.icon, "\u{1f195}");
+        assert_eq!(entry.summary, "ready for review");
+    }
+
+    /// The manifest's summary replaces the generated verdict line, and the
+    /// diff-cap note leads a pending row (nothing will review it) but only
+    /// trails a reviewed one.
+    #[test]
+    fn stored_summary_and_diff_cap_notes_reach_the_summary() {
+        const NOW: &str = "2026-09-05T12:00:00Z";
+        let mut reviewed = record(
+            "o/a",
+            1,
+            "2026-09-05T10:00:00Z",
+            PrState::ReviewedChangesRequested,
+        );
+        reviewed.last_verdict = Some(Verdict::ChangesRequested);
+        reviewed.blocking_count = 2;
+        reviewed.last_summary = Some("Tenant scope is missing".into());
+        assert_eq!(
+            row_at(reviewed.clone(), NOW).summary,
+            "Tenant scope is missing"
+        );
+
+        reviewed.diff_too_large = true;
+        assert_eq!(
+            row_at(reviewed.clone(), NOW).summary,
+            "Tenant scope is missing (a later diff was too large to review)"
+        );
+        reviewed.last_summary = None;
+        assert_eq!(
+            row_at(reviewed, NOW).summary,
+            "changes requested: 2 blocking, 0 nits (a later diff was too large to review)"
+        );
+
+        // Pending and inside its cooldown: the cap still leads.
+        let mut pending = record("o/a", 1, "2026-09-05T11:45:00Z", PrState::Pending);
+        pending.diff_too_large = true;
+        assert_eq!(
+            row_at(pending, NOW).summary,
+            "diff too large \u{2014} review skipped"
+        );
+    }
+
+    /// LAST REVIEW: never, minutes, hours and minutes (no day unit), and a
+    /// review stamped after `now` (clock skew) reads "just now".
+    #[test]
+    fn last_review_age_is_relative_to_now() {
+        let now = at("2026-09-05T12:00:00Z");
+        assert_eq!(age_line(None, now), "never");
+        for (reviewed_at, text) in [
+            ("2026-09-05T12:00:00Z", "0m ago"),
+            ("2026-09-05T11:59:01Z", "0m ago"),
+            ("2026-09-05T11:59:00Z", "1m ago"),
+            ("2026-09-05T11:00:00Z", "1h 0m ago"),
+            ("2026-09-05T09:55:00Z", "2h 5m ago"),
+            ("2026-09-03T11:00:00Z", "49h 0m ago"),
+            ("2026-09-05T12:00:01Z", "just now"),
+            ("2027-01-01T00:00:00Z", "just now"),
+        ] {
+            assert_eq!(age_line(Some(at(reviewed_at)), now), text, "{reviewed_at}");
+        }
+
+        let mut rec = record("o/a", 1, "2026-09-01T10:00:00Z", PrState::ReviewedApproved);
+        rec.last_review_at = Some(at("2026-09-05T09:55:00Z"));
+        let entry = row_at(rec, "2026-09-05T12:00:00Z");
+        assert_eq!(entry.last_review_age, "2h 5m ago");
+        assert_eq!(entry.last_review_at, Some(at("2026-09-05T09:55:00Z")));
+    }
+
+    /// Rows are ordered by repo, then by PR number as a number (#9 before
+    /// #10), and only PRs of the repos asked for are listed: state for a
+    /// repo that is no longer watched stays out of the table.
+    #[test]
+    fn rows_are_sorted_numerically_and_limited_to_the_given_repos() {
+        let repos = repos("repos:\n  - name: o/b\n  - name: o/a\n");
+        let mut file = StateFile::default();
+        for (repo, number) in [
+            ("o/b", 2),
+            ("o/a", 10),
+            ("o/a", 9),
+            ("o/gone", 1),
+            ("o/a", 100),
+        ] {
+            let rec = record(repo, number, "2026-09-01T10:00:00Z", PrState::Pending);
+            file.prs.insert(rec.key(), rec);
+        }
+        let now = at("2026-09-05T00:00:00Z");
+        let keys: Vec<String> = render_entries(&file, &repos, now)
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, ["o/a#9", "o/a#10", "o/a#100", "o/b#2"]);
+
+        // The `prx status org/repo` filter is the same mechanism.
+        let only_b: Vec<EffectiveRepo> = repos.into_iter().filter(|r| r.name == "o/b").collect();
+        let keys: Vec<String> = render_entries(&file, &only_b, now)
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(keys, ["o/b#2"]);
+        assert!(render_entries(&file, &[], now).is_empty());
+        assert!(render_entries(&StateFile::default(), &only_b, now).is_empty());
+    }
+
+    /// Design B2/B3: the brief rides along with `stale` derived from the
+    /// PR's current head, and is withheld when briefs are off for the repo.
+    #[test]
+    fn brief_is_reported_with_staleness_and_hidden_when_disabled() {
+        let repos = repos(
+            "repos:\n  - name: o/a\n    engine: claude\n  - name: o/off\n    brief:\n      enabled: false\n",
+        );
+        let now = at("2026-09-05T00:00:00Z");
+        let brief = |head: &str| Brief {
+            text: "Adds tenant scoping".into(),
+            created_at: at("2026-09-02T00:00:00Z"),
+            updated_at: at("2026-09-03T00:00:00Z"),
+            head_sha: head.into(),
+            source: BriefSource::OnDemand,
+            engine: Some("claude".into()),
+        };
+        let mut file = StateFile::default();
+        let mut fresh = record("o/a", 1, "2026-09-01T10:00:00Z", PrState::Pending);
+        fresh.brief = Some(brief("sha"));
+        let mut stale = record("o/a", 2, "2026-09-01T10:00:00Z", PrState::Pending);
+        stale.brief = Some(brief("an-older-sha"));
+        let none = record("o/a", 3, "2026-09-01T10:00:00Z", PrState::Pending);
+        let mut hidden = record("o/off", 4, "2026-09-01T10:00:00Z", PrState::Pending);
+        hidden.brief = Some(brief("sha"));
+        for rec in [fresh, stale, none, hidden] {
+            file.prs.insert(rec.key(), rec);
+        }
+
+        let entries = render_entries(&file, &repos, now);
+        let fresh = entries[0].brief.as_ref().expect("brief is carried");
+        assert_eq!(fresh.text, "Adds tenant scoping");
+        assert_eq!(fresh.head_sha, "sha");
+        assert_eq!(fresh.source, BriefSource::OnDemand);
+        assert_eq!(fresh.engine.as_deref(), Some("claude"));
+        assert_eq!(fresh.updated_at, at("2026-09-03T00:00:00Z"));
+        assert!(!fresh.stale);
+        assert!(entries[1].brief.as_ref().unwrap().stale);
+        assert!(entries[2].brief.is_none());
+        assert!(entries[3].brief.is_none(), "briefs are off for o/off");
+        assert!(!entries[3].brief_available);
+
+        // The rest of what clients read off an entry.
+        assert_eq!(entries[1].html_url, "https://github.com/o/a/pull/2");
+        assert_eq!(entries[0].engine.as_deref(), Some("claude"));
+        assert!(!entries[0].brief_pending);
+        assert_eq!(entries[0].brief_error, None);
+        let json = serde_json::to_value(&entries[2]).unwrap();
+        assert!(json.get("brief").is_none(), "absent, not null: {json}");
+        assert_eq!(json["skip_reason"], serde_json::Value::Null);
+        assert_eq!(json["html_url"], "https://github.com/o/a/pull/3");
+    }
+
+    /// Long titles, authors, and summaries are cut to their column with an
+    /// ellipsis so the columns after them stay put. The PR key is the one
+    /// cell never cut: it is what the user pastes into `prx review`.
+    #[test]
+    fn long_cells_are_cut_to_their_column_but_the_key_is_kept_whole() {
+        let mut long = entry_with("\u{2705}", &"T".repeat(300), &"u".repeat(60));
+        long.summary = "S".repeat(200);
+        let table = render_table(&[long.clone()], None);
+        let row = table.lines().nth(1).unwrap();
+        assert!(
+            row.contains(&format!(" {}\u{2026} ", "T".repeat(38))),
+            "{row}"
+        );
+        assert!(!row.contains(&"T".repeat(39)), "{row}");
+        assert!(
+            row.contains(&format!(" {}\u{2026} ", "u".repeat(12))),
+            "{row}"
+        );
+        assert!(!row.contains(&"u".repeat(13)), "{row}");
+        assert!(
+            row.contains(&format!(" {}\u{2026} ", "S".repeat(34))),
+            "{row}"
+        );
+        assert!(!row.contains(&"S".repeat(35)), "{row}");
+        assert!(row.ends_with(" AGE"), "{row}");
+        assert_eq!(
+            column_starts(row, &["acme/api#1", "TTT", "uuu", "SSS", "AGE"]),
+            [4, 21, 62, 77, 114]
+        );
+
+        // Exactly at the limit: shown whole, no ellipsis.
+        let exact = entry_with("\u{2705}", &"T".repeat(38), &"u".repeat(12));
+        let table = render_table(&[exact], None);
+        assert!(!table.contains('\u{2026}'), "{table}");
+
+        long.key = "a-rather-long-organisation/a-rather-long-repository#12345".into();
+        let table = render_table(&[long.clone()], None);
+        assert!(table.contains(&format!(" {} ", long.key)), "{table}");
+    }
+
+    /// The footer carries the last poll time in UTC, and the table is one
+    /// header, one line per entry, a blank line, and the footer.
+    #[test]
+    fn table_has_one_line_per_entry_and_a_dated_footer() {
+        let entries = [
+            entry_with("\u{2705}", "first", "alice"),
+            entry_with("\u{1f195}", "second", "bob"),
+        ];
+        let table = render_table(&entries, Some(at("2026-09-05T07:08:09Z")));
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 5, "{table}");
+        assert!(lines[0].trim_start().starts_with("PR "), "{table}");
+        assert!(lines[1].contains("first") && lines[2].contains("second"));
+        assert_eq!(lines[3], "");
+        assert_eq!(lines[4], "last poll: 2026-09-05 07:08:09 UTC");
+        assert!(table.ends_with('\n'));
+        // An empty table has no header and no footer, polled or not.
+        assert_eq!(
+            render_table(&[], Some(at("2026-09-05T07:08:09Z"))),
+            "No PRs tracked yet.\n"
+        );
+    }
 }

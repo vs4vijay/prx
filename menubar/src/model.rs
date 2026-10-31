@@ -479,6 +479,10 @@ pub struct MenuModel {
     pub stopped: bool,
     /// A daemon-wide pause is active (also the icon's paused variant).
     pub paused: bool,
+    /// Ready / blocked PRs not opened yet (`notifications.menubar_bell`;
+    /// drives the icon's bell badge and the title's `✓N ✕N`). The app sets
+    /// it from its [`crate::bell::BellTracker`] after building the model.
+    pub bell: crate::bell::BellCounts,
     pub sections: Vec<MenuSection>,
 }
 
@@ -1007,6 +1011,7 @@ pub fn build_model(
         in_flight: status.in_flight,
         stopped: off,
         paused: pause_left.is_some(),
+        bell: crate::bell::BellCounts::default(),
         sections,
     }
 }
@@ -1167,6 +1172,7 @@ pub fn offline_model_for(daemon: &DaemonState) -> MenuModel {
         in_flight: 0,
         stopped: false,
         paused: false,
+        bell: crate::bell::BellCounts::default(),
         sections: vec![
             MenuSection { items: top },
             MenuSection { items: supervise },
@@ -1735,6 +1741,8 @@ fn history_symbol(entry: &HistoryEntry) -> Symbol {
         HistoryEntry::NewCommits { .. } => Symbol::ReReview,
         HistoryEntry::Brief { brief: Some(_), .. } => Symbol::Brief,
         HistoryEntry::Brief { brief: None, .. } => Symbol::Failed,
+        HistoryEntry::NewPr { .. } => Symbol::NeedsReview,
+        HistoryEntry::Unknown => Symbol::Info,
     }
 }
 
@@ -1773,6 +1781,8 @@ fn history_line(entry: &HistoryEntry, now: DateTime<Utc>) -> String {
         HistoryEntry::NewCommits { .. } => "New commits — re-review pending".to_string(),
         HistoryEntry::Brief { brief: Some(_), .. } => "Brief written".to_string(),
         HistoryEntry::Brief { brief: None, .. } => "Brief failed".to_string(),
+        HistoryEntry::NewPr { .. } => "New PR".to_string(),
+        HistoryEntry::Unknown => "Unknown event".to_string(),
     };
     format!(
         "{}#{} — {} \u{b7} {} ago",

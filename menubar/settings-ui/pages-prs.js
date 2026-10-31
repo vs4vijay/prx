@@ -160,9 +160,15 @@
   renderers.prs = function (rootNode, app) {
     // View state survives page switches and polls: filters, sort, row notes
     // and the open prompt form.
-    const view = app.view("prs", function () { return { filter: { repo: "", state: "", text: "" }, sort: null, notes: {}, prompt: null, pick: "", open: null }; });
+    const view = app.view("prs", function () { return {}; });
+    // The Dashboard's links create this view with only a `preset` when the
+    // page has not been opened yet, so every other part is filled in here.
+    const blank = { filter: { repo: "", state: "", text: "" }, sort: null, notes: {}, prompt: null, pick: "", open: null };
+    Object.keys(blank).forEach(function (k) { if (view[k] === undefined) view[k] = blank[k]; });
     if (view.preset) { view.filter = view.preset; view.preset = null; }
     let status = null;
+    // GET /config as this page fetched it, used until the app has its own.
+    let config = null;
     const search = el("input", { type: "search", placeholder: "Filter by PR, title, or author", "aria-label": "Filter pull requests", spellcheck: "false" });
     search.value = view.filter.text;
     search.addEventListener("input", function () { view.filter.text = search.value; draw(); });
@@ -287,7 +293,7 @@
       count.textContent = rows.length === all.length ? O.formatCount(all.length, "PR") : rows.length + " of " + all.length;
       tableBox.removeAttribute("aria-busy");
       if (!all.length) {
-        const watching = O.watchesRepos(app.loaded());
+        const watching = O.watchesRepos(app.loaded() || config);
         tableBox.replaceChildren(watching === false
           ? UI.empty("repo", "No repos watched yet", "Add a repo or an org on Repos & Orgs, and PRX lists its open PRs here after the next check.",
             [UI.button("Add a repo", function () { app.go("repos"); }, "primary")])
@@ -336,14 +342,23 @@
       tableBox.replaceChildren(el("table", { class: "data prs" }, [cols, el("thead", {}, [head]), body]));
     }
 
-    const live = O.poller(app, function () { return bridge.call("status.get", {}); }, function (error, value) {
+    const live = O.poller(app, function () {
+      // The empty state needs the watched repos: ask for the config too
+      // until the app has loaded it (as the Dashboard does), so the first
+      // render already tells "nothing watched" from "no PRs yet". A config
+      // that cannot be read only costs the specific wording.
+      const wanted = app.loaded() ? Promise.resolve(null) : bridge.getConfig().then(null, function () { return null; });
+      return Promise.all([bridge.call("status.get", {}), wanted]);
+    }, function (error, values) {
       if (error) {
         status = null;
         tableBox.removeAttribute("aria-busy");
         tableBox.replaceChildren(O.isOffline(error) ? O.offline(UI, live.refresh) : O.failure(UI, error, live.refresh));
         return;
       }
+      const value = values[0];
       status = value;
+      if (values[1]) config = values[1];
       briefs.update(value);
       // Don't rebuild under the user's hands (the prompt form, a select, an
       // open action menu).

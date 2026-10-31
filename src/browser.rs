@@ -317,4 +317,144 @@ mod tests {
         assert!(err.contains("fallback failed"), "{err}");
         assert_eq!(spy.calls().len(), 2);
     }
+
+    /// The fallback reports why the configured browser was passed over, and
+    /// when the system handler fails as well the error carries both causes.
+    #[test]
+    fn fallback_keeps_the_configured_browsers_failure_reason() {
+        let spy = Spy::failing(&["arc"]);
+        let template = Browser::Command(vec!["arc".into(), "{{URL}}".into()]);
+        assert_eq!(
+            open_url(&spy, &template, URL),
+            Ok(OpenOutcome::FellBackToSystem {
+                reason: "cannot run arc".into()
+            })
+        );
+
+        let spy = Spy::failing(&["arc", system_program()]);
+        assert_eq!(
+            open_url(&spy, &template, URL),
+            Err(format!(
+                "cannot run arc; system browser fallback failed too: cannot run {}",
+                system_program()
+            ))
+        );
+    }
+
+    /// A named application that cannot be launched (not installed) gets the
+    /// same second attempt through the system handler as a command template.
+    /// On macOS both attempts run `open`, so a spy failing that program
+    /// fails the fallback too; elsewhere the app is its own program.
+    #[test]
+    fn unlaunchable_app_is_retried_with_the_system_handler() {
+        let app = Browser::App("No Such Browser".into());
+        let configured = argv(&app, URL);
+        let spy = Spy::failing(&[configured[0].as_str()]);
+        let outcome = open_url(&spy, &app, URL);
+        assert_eq!(spy.calls(), [configured, system_argv(URL)]);
+        if cfg!(target_os = "macos") {
+            let err = outcome.unwrap_err();
+            assert!(err.contains("system browser fallback failed too"), "{err}");
+        } else {
+            assert!(matches!(outcome, Ok(OpenOutcome::FellBackToSystem { .. })));
+        }
+    }
+
+    /// A blank program is as unusable as an empty template: it is never
+    /// spawned. Template elements without the placeholder pass through
+    /// as written, and a URL is substituted once (text in the URL that looks
+    /// like the placeholder is not expanded again).
+    #[test]
+    fn blank_program_is_not_spawned_and_substitution_is_single_pass() {
+        let spy = Spy::default();
+        let blank = Browser::Command(vec!["  ".into(), "{{URL}}".into()]);
+        assert_eq!(
+            open_url(&spy, &blank, URL),
+            Ok(OpenOutcome::FellBackToSystem {
+                reason: "browser command is empty".into()
+            })
+        );
+        assert_eq!(spy.calls(), [system_argv(URL)]);
+
+        let no_placeholder = Browser::Command(vec!["arc".into(), "--new-window".into()]);
+        assert_eq!(argv(&no_placeholder, URL), ["arc", "--new-window"]);
+        let twice = Browser::Command(vec!["b".into(), "{{URL}}#{{URL}}".into()]);
+        assert_eq!(argv(&twice, "u"), ["b", "u#u"]);
+        let odd_url = "https://x/?q={{URL}}";
+        let out = argv(
+            &Browser::Command(vec!["b".into(), "{{URL}}".into()]),
+            odd_url,
+        );
+        assert_eq!(out, ["b", odd_url]);
+        // The program position is substituted like any other element.
+        let program = Browser::Command(vec!["{{URL}}".into()]);
+        assert_eq!(argv(&program, "x"), ["x"]);
+    }
+
+    /// The production opener, exercised with `sh` only (never a browser): it
+    /// maps the exit status to the result, names a program it cannot run,
+    /// and hands every argument over verbatim, with no shell in between.
+    #[test]
+    fn system_opener_runs_the_argv_directly_and_reports_failures() {
+        let sh = |script: &str, arg: &str| -> Vec<String> {
+            ["sh", "-c", script, "sh", arg]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        };
+        assert_eq!(SystemOpener.spawn(&sh("exit 0", "")), Ok(()));
+        let err = SystemOpener.spawn(&sh("exit 3", "")).unwrap_err();
+        assert!(err.starts_with("sh exited with"), "{err}");
+        assert!(err.contains('3'), "{err}");
+
+        // `$(...)`, backticks, quotes and `;` arrive as one literal argument.
+        let hostile = "https://x/$(exit 7);`exit 8` 'q' \"r\" && false";
+        let same = format!("[ \"$1\" = '{}' ]", hostile.replace('\'', "'\\''"));
+        assert_eq!(SystemOpener.spawn(&sh(&same, hostile)), Ok(()));
+
+        let missing = vec![
+            "prx-test-no-such-browser-binary".to_string(),
+            URL.to_string(),
+        ];
+        let err = SystemOpener.spawn(&missing).unwrap_err();
+        assert!(
+            err.starts_with("cannot run prx-test-no-such-browser-binary: "),
+            "{err}"
+        );
+        assert_eq!(
+            SystemOpener.spawn(&[]),
+            Err("browser command is empty".to_string())
+        );
+    }
+
+    /// `open_url` through the production opener with a configured command
+    /// that succeeds: it runs once and nothing else is attempted. (The
+    /// failing case is covered with the spy only: its fallback would open a
+    /// real browser.)
+    #[test]
+    fn open_url_with_the_production_opener_runs_a_working_command_once() {
+        let marker = std::env::temp_dir().join(format!(
+            "prx-browser-opened-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        // Appends one line per launch, with the URL it was handed.
+        let ok = Browser::Command(vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s\\n' \"$1\" >> \"$0\"".into(),
+            marker.display().to_string(),
+            "{{URL}}".into(),
+        ]);
+        assert_eq!(
+            open_url(&SystemOpener, &ok, URL),
+            Ok(OpenOutcome::Configured)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("{URL}\n")
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
 }

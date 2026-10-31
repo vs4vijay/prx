@@ -319,4 +319,180 @@ mod tests {
         assert_eq!(format_remaining(at("2026-10-07T13:12:00Z"), now), "1h 12m");
         assert_eq!(format_remaining(at("2026-10-10T15:00:00Z"), now), "3d 3h");
     }
+
+    /// The unit switches at 1 minute, 1 hour and 48 hours; a pause that has
+    /// already ended never shows a negative time.
+    #[test]
+    fn remaining_format_boundaries() {
+        let now = at(NOW);
+        for (until, expected) in [
+            ("2026-10-07T12:00:59Z", "<1m"),
+            ("2026-10-07T12:01:00Z", "1m"),
+            ("2026-10-07T12:59:59Z", "59m"),
+            ("2026-10-07T13:00:00Z", "1h 0m"),
+            ("2026-10-09T11:59:00Z", "47h 59m"),
+            ("2026-10-09T12:00:00Z", "2d 0h"),
+            (NOW, "<1m"),
+            ("2026-10-07T09:00:00Z", "<1m"),
+        ] {
+            assert_eq!(format_remaining(at(until), now), expected, "{until}");
+        }
+    }
+
+    #[test]
+    fn hours_bounds_and_fractions() {
+        let now = at(NOW);
+        // Fractions are honoured down to the millisecond.
+        assert_eq!(
+            resolve_pause_until(Some(0.25), None, now).unwrap(),
+            at("2026-10-07T12:15:00Z")
+        );
+        // The cap is inclusive; anything above it, or not a number, is refused.
+        assert_eq!(
+            resolve_pause_until(Some(87_600.0), None, now).unwrap(),
+            now + chrono::Duration::hours(87_600)
+        );
+        let err = resolve_pause_until(Some(87_600.5), None, now).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        for bad in [f64::INFINITY, f64::NEG_INFINITY, -0.0] {
+            let err = resolve_pause_until(Some(bad), None, now).unwrap_err();
+            assert!(
+                err.to_string().contains("--hours must be > 0"),
+                "{bad}: {err}"
+            );
+        }
+        // Too short to move the clock at all: refused, not a zero-length pause.
+        let err = resolve_pause_until(Some(1e-9), None, now).unwrap_err();
+        assert!(err.to_string().contains("not in the future"), "{err}");
+    }
+
+    /// `--until` must be strictly later than now, and the error says which
+    /// instant was refused.
+    #[test]
+    fn until_must_be_strictly_in_the_future() {
+        let now = at(NOW);
+        let err = resolve_pause_until(None, Some(now), now).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the pause end 2026-10-07 12:00 UTC is not in the future"
+        );
+        let next = now + chrono::Duration::milliseconds(1);
+        assert_eq!(resolve_pause_until(None, Some(next), now).unwrap(), next);
+    }
+
+    #[test]
+    fn parse_until_accepts_offsets_seconds_and_padding() {
+        let tz = FixedOffset::east_opt(2 * 3600).unwrap();
+        let now = at(NOW);
+        // An RFC 3339 offset is honoured whatever the local zone is.
+        assert_eq!(
+            parse_until_in("2026-10-07T18:00:00-05:00", now, &tz).unwrap(),
+            at("2026-10-07T23:00:00Z")
+        );
+        assert_eq!(
+            parse_until_in("2026-10-08 09:30:15", now, &tz).unwrap(),
+            at("2026-10-08T07:30:15Z")
+        );
+        assert_eq!(
+            parse_until_in("  18:00\n", now, &tz).unwrap(),
+            at("2026-10-07T16:00:00Z")
+        );
+        // A dated form is taken as written, even when it is in the past:
+        // `resolve_pause_until` is what refuses it.
+        let past = parse_until_in("2026-10-01 09:00", now, &tz).unwrap();
+        assert_eq!(past, at("2026-10-01T07:00:00Z"));
+        assert!(resolve_pause_until(None, Some(past), now).is_err());
+    }
+
+    /// A bare `HH:MM` is the next such local time: the current minute rolls
+    /// to tomorrow, and "today" is the local date, not the UTC one.
+    #[test]
+    fn bare_time_rolls_over_on_the_local_calendar() {
+        let tz = FixedOffset::east_opt(2 * 3600).unwrap();
+        let now = at(NOW); // 14:00 local
+        assert_eq!(
+            parse_until_in("14:00", now, &tz).unwrap(),
+            at("2026-10-08T12:00:00Z")
+        );
+        assert_eq!(
+            parse_until_in("14:01", now, &tz).unwrap(),
+            at("2026-10-07T12:01:00Z")
+        );
+
+        // 20:00 UTC is already the 8th, 06:00, ten hours east…
+        let east = FixedOffset::east_opt(10 * 3600).unwrap();
+        let evening = at("2026-10-07T20:00:00Z");
+        assert_eq!(
+            parse_until_in("07:00", evening, &east).unwrap(),
+            at("2026-10-07T21:00:00Z")
+        );
+        // …and 02:00 UTC is still the 6th, 18:00, eight hours west.
+        let west = FixedOffset::west_opt(8 * 3600).unwrap();
+        let night = at("2026-10-07T02:00:00Z");
+        assert_eq!(
+            parse_until_in("19:00", night, &west).unwrap(),
+            at("2026-10-07T03:00:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_until_rejects_malformed_input_and_echoes_it() {
+        let tz = FixedOffset::east_opt(0).unwrap();
+        let now = at(NOW);
+        for bad in [
+            "",
+            "24:00",
+            "12:60",
+            "noon",
+            "2026-13-01 09:00",
+            "2026-10-07",
+            "18",
+        ] {
+            let err = parse_until_in(bad, now, &tz).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("cannot parse --until '{bad}'")),
+                "{err}"
+            );
+        }
+    }
+
+    /// The pause ends at its instant, not after it: at `paused_until` the
+    /// gate is open again and the status header is gone.
+    #[test]
+    fn pause_end_instant_is_exclusive() {
+        let end = at("2026-10-07T13:00:00Z");
+        let st = state(Some("2026-10-07T13:00:00Z"));
+        let just_before = end - chrono::Duration::milliseconds(1);
+        assert_eq!(st.active_pause(just_before), Some(end));
+        assert_eq!(st.active_pause(end), None);
+        assert!(enqueue_allowed(
+            &st,
+            ReviewMode::ReviewComment,
+            EnqueueOrigin::ScheduledTick,
+            end
+        ));
+        assert_eq!(
+            status_lines(Some(end), ReviewMode::ReviewComment, just_before).len(),
+            1
+        );
+        assert!(status_lines(Some(end), ReviewMode::ReviewComment, end).is_empty());
+    }
+
+    /// The one origin a pause lets through is the explicit single-PR review.
+    #[test]
+    fn only_the_explicit_single_pr_origin_is_not_automatic() {
+        let manual: Vec<_> = EnqueueOrigin::ALL
+            .into_iter()
+            .filter(|o| !o.is_automatic())
+            .collect();
+        assert_eq!(manual, [EnqueueOrigin::SinglePr]);
+    }
+
+    #[test]
+    fn describe_names_the_end_in_utc_and_the_time_left() {
+        assert_eq!(
+            describe(at("2026-10-08T09:30:00Z"), at(NOW)),
+            "reviews paused until 2026-10-08 09:30 UTC (21h 30m left)"
+        );
+    }
 }

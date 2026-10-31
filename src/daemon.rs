@@ -50,7 +50,7 @@ const MENUBAR_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 // ------------------------------------------------- banner dedup (D3)
 
 /// The client-liveness cell (D3): when an authenticated IPC request last
-/// carried `X-Prx-Client`. `Shared` records into it (auth middleware); the
+/// carried `X-Prx-Client: menubar/…`. `Shared` records into it (auth middleware); the
 /// daemon's suppressing notifier reads it before delegating a banner — hence
 /// the `Arc`, shared by both owners.
 #[derive(Debug, Default)]
@@ -871,8 +871,8 @@ impl Shared {
         self.runtime.lock().await.next_poll.values().min().copied()
     }
 
-    /// Record a client announcement: the IPC auth middleware calls this when
-    /// an authenticated request carries `X-Prx-Client` (D3).
+    /// Record a menubar sighting: the IPC auth middleware calls this when
+    /// an authenticated request carries `X-Prx-Client: menubar/…` (D3).
     pub fn note_menubar_seen(&self) {
         self.menubar_liveness.note_seen();
     }
@@ -931,14 +931,13 @@ impl PidGuard {
                     return Ok(PidGuard { path, pid });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    match read_pid(&path) {
-                        // Our own leftover file (crash without drop): steal it.
-                        Some(pid) if pid == std::process::id() => {}
+                    match pid_file_owner(&path) {
                         // Another live process owns it: single instance (A16).
-                        Some(pid) if process_alive(pid) => {
+                        Some(pid) if pid != std::process::id() => {
                             return Err(PidError::AlreadyRunning(pid));
                         }
-                        // Stale or unreadable: reclaim.
+                        // Our own leftover file (crash without drop), or a
+                        // stale, reused, or unreadable one: reclaim.
                         _ => {}
                     }
                     let _ = std::fs::remove_file(&path);
@@ -965,17 +964,130 @@ impl Drop for PidGuard {
     }
 }
 
-/// Read the pid recorded in a pid file, if it parses.
+/// Read the pid recorded in a pid file, if it parses and can name one
+/// process (see [`signalable_pid`]); anything else reads as no pid at all,
+/// so a damaged file is reclaimed like any other stale one.
 pub fn read_pid(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    let pid = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    signalable_pid(pid).map(|_| pid)
+}
+
+/// How much later than its pid file a process may appear to have started
+/// and still count as the file's writer: process start times and file
+/// mtimes come from different clocks and granularities (whole-second boot
+/// time on Linux).
+const PID_FILE_START_SLACK: Duration = Duration::from_secs(2);
+
+/// The pid a pid file names, while that process is still the one that
+/// wrote it: alive, and started no later than the file was written. After
+/// a reboot or a crash the recorded pid can be handed to an unrelated
+/// process; that one started after the file, so the file reads as stale
+/// instead of as a running daemon that nothing can start over or that
+/// `prx daemon stop` would signal. When the start time cannot be read the
+/// live process is trusted, as before.
+pub fn pid_file_owner(path: &Path) -> Option<u32> {
+    let pid = read_pid(path)?;
+    if !process_alive(pid) {
+        return None;
+    }
+    let written = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    match (written, process_start_time(pid)) {
+        (Some(written), Some(started)) if started > written + PID_FILE_START_SLACK => None,
+        _ => Some(pid),
+    }
+}
+
+/// When the process `pid` started, from `sysctl(KERN_PROC_PID)`, which
+/// (unlike `proc_pidinfo`) also answers for other users' processes.
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let pid = signalable_pid(pid)?;
+    // libc has no `kinfo_proc` for Apple targets. The struct is 648 bytes,
+    // and its first field, `kp_proc.p_starttime`, is a `struct timeval`
+    // (i64 seconds, then i32 microseconds) on both arm64 and x86_64.
+    let mut info = [0u8; 648];
+    let mut len = info.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: `mib` names a 4-level sysctl and `info`/`len` describe a
+    // writable buffer of `len` bytes; nothing is written (`newp` is null).
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            info.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // No such process answers rc 0 with nothing written.
+    if rc != 0 || len < 12 {
+        return None;
+    }
+    let secs = i64::from_ne_bytes(info[0..8].try_into().ok()?);
+    let micros = i32::from_ne_bytes(info[8..12].try_into().ok()?);
+    let since_epoch = Duration::from_secs(u64::try_from(secs).ok()?)
+        + Duration::from_micros(u64::try_from(micros).ok()?);
+    std::time::UNIX_EPOCH.checked_add(since_epoch)
+}
+
+/// When the process `pid` started: `/proc/<pid>/stat` field 22 (clock ticks
+/// since boot) plus the boot time from `/proc/stat`.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields are counted after the parenthesised command name, which may
+    // itself hold spaces or parentheses; field 3 is the first one after it.
+    let ticks: u64 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    let boot: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf only reads a configuration value.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = u64::try_from(hz).ok().filter(|hz| *hz > 0)?;
+    let since_boot = Duration::from_millis(ticks.checked_mul(1000)? / hz);
+    std::time::UNIX_EPOCH.checked_add(Duration::from_secs(boot) + since_boot)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_time(_pid: u32) -> Option<std::time::SystemTime> {
+    None
+}
+
+/// `pid` as kill(2) takes it, when it names exactly one process. Zero and
+/// values past `i32::MAX` (negative once cast) address the caller's process
+/// group or every process the user owns instead, so they must never reach
+/// kill(2): a pid file holding one would otherwise read as a running daemon,
+/// and `prx daemon stop` would signal far more than a daemon.
+#[cfg(unix)]
+fn signalable_pid(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+#[cfg(not(unix))]
+fn signalable_pid(pid: u32) -> Option<u32> {
+    (pid > 0).then_some(pid)
 }
 
 /// True when a process with this pid exists. `kill(pid, 0)` sends no signal;
 /// EPERM means the process is alive but owned by another user.
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
+    let Some(pid) = signalable_pid(pid) else {
+        return false;
+    };
     // SAFETY: kill(2) with signal 0 performs only the permission check.
-    let rc = unsafe { libc::kill(pid as i32, 0) };
+    let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -1105,39 +1217,87 @@ pub async fn spawn_core(
 /// `prx daemon start` (detached): re-exec this binary in the background.
 /// The child survives the parent via `process_group(0)` and nulled stdio.
 pub fn start_detached() -> Result<()> {
-    if let Some(pid) = read_pid(&paths::daemon_pid_file()) {
-        if process_alive(pid) {
-            // A16: starting twice is idempotent.
-            println!("daemon already running (pid {pid})");
-            return Ok(());
-        }
+    if let Some(pid) = pid_file_owner(&paths::daemon_pid_file()) {
+        // A16: starting twice is idempotent.
+        println!("daemon already running (pid {pid})");
+        return Ok(());
     }
+    // A token file still here was left by a daemon that was killed. The new
+    // daemon writes a fresh token last, once its IPC API is bound, so a
+    // token that differs from this one is the readiness signal below.
+    let stale_token = std::fs::read(paths::daemon_token_file()).ok();
+
+    // The child's stderr goes to the file PRX.app uses for the daemons it
+    // spawns, so an error that ends the start (bad config, corrupt state) is
+    // kept and can be reported here rather than lost with a nulled stderr.
+    let stderr_log = paths::logs_dir().join("daemon-stderr.log");
+    let _ = std::fs::create_dir_all(paths::logs_dir());
+    let stderr_start = std::fs::metadata(&stderr_log).map_or(0, |m| m.len());
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+
     let exe = std::env::current_exe().context("cannot locate the prx binary")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "start", "--foreground"])
         .env("PRX_DAEMON_CHILD", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd.spawn().context("failed to spawn the daemon process")?;
+    let mut child = cmd.spawn().context("failed to spawn the daemon process")?;
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Started means ready: the pid file is claimed and the IPC API is
+    // published, so a command run right after this one reaches the daemon
+    // instead of falling back to in-process execution beside it (A4).
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
-        if read_pid(&paths::daemon_pid_file()) == Some(pid) {
+        let published = std::fs::read(paths::daemon_token_file())
+            .ok()
+            .filter(|token| !token.is_empty() && Some(token) != stale_token.as_ref());
+        if read_pid(&paths::daemon_pid_file()) == Some(pid) && published.is_some() {
             println!("daemon started (pid {pid})");
             return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            match startup_error(&stderr_log, stderr_start) {
+                Some(reason) => bail!("daemon did not start: {reason}"),
+                None => bail!(
+                    "daemon (pid {pid}) exited during startup ({status}) — \
+                     check `prx daemon logs`"
+                ),
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     bail!(
-        "daemon (pid {pid}) did not claim its pid file within 5s — \
-         check `prx daemon logs`"
+        "daemon (pid {pid}) did not become ready within {}s — \
+         check `prx daemon logs`",
+        STARTUP_TIMEOUT.as_secs()
     );
+}
+
+/// How long `prx daemon start` waits for the detached daemon to be ready.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The error a daemon child printed before it exited: the last non-empty
+/// line it added to `stderr_log` past byte `from`, without the CLI's
+/// `error: ` prefix.
+fn startup_error(stderr_log: &Path, from: u64) -> Option<String> {
+    let bytes = std::fs::read(stderr_log).ok()?;
+    let added = bytes.get(usize::try_from(from).ok()?..)?;
+    String::from_utf8_lossy(added)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(|line| line.strip_prefix("error: ").unwrap_or(line).to_string())
 }
 
 /// `prx daemon stop`: SIGTERM, wait for exit, SIGKILL only as last resort.
@@ -1149,6 +1309,12 @@ pub async fn run_stop() -> Result<()> {
     };
     if !process_alive(pid) {
         println!("stale pid file (pid {pid} is gone); removed");
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
+    }
+    if pid_file_owner(&pid_path) != Some(pid) {
+        // The pid was reused (after a reboot, say): never signal that process.
+        println!("stale pid file (pid {pid} now belongs to another process); removed");
         let _ = std::fs::remove_file(&pid_path);
         return Ok(());
     }
@@ -1177,8 +1343,11 @@ pub async fn run_stop() -> Result<()> {
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) {
+    let Some(pid) = signalable_pid(pid) else {
+        return;
+    };
     // SAFETY: plain kill(2) with a constant signal number.
-    let _ = unsafe { libc::kill(pid as i32, signal) };
+    let _ = unsafe { libc::kill(pid, signal) };
 }
 
 #[cfg(not(unix))]
@@ -1186,11 +1355,12 @@ fn send_signal(_pid: u32, _signal: i32) {}
 
 /// `prx daemon status`: pid file + process liveness (A16).
 pub fn run_status_cmd() {
-    let Some(pid) = read_pid(&paths::daemon_pid_file()) else {
+    let pid_path = paths::daemon_pid_file();
+    let Some(pid) = read_pid(&pid_path) else {
         println!("daemon not running");
         return;
     };
-    if !process_alive(pid) {
+    if pid_file_owner(&pid_path) != Some(pid) {
         println!("daemon not running (stale pid file: pid {pid})");
         return;
     }
@@ -1515,7 +1685,9 @@ async fn drain_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
         if let Some(job) = job {
             match shared.semaphore.clone().acquire_owned().await {
                 Ok(permit) => {
-                    tokio::spawn(execute_job(shared.clone(), job, permit));
+                    let key = job.key.clone();
+                    let run = execute_job(shared.clone(), job, permit);
+                    tokio::spawn(supervise_job(shared.clone(), key, run));
                 }
                 Err(_) => break, // semaphore closed: shutting down
             }
@@ -1528,12 +1700,28 @@ async fn drain_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
+/// Run a job as its own task and clean up if it does not reach
+/// [`finish_job`]. A panic inside the job unwinds only that task: the
+/// concurrency slot comes back with the dropped permit, but the key would
+/// stay in the in-flight set until restart, so the PR could never be queued
+/// again and a graceful stop would wait for it.
+async fn supervise_job<F>(shared: Arc<Shared>, key: String, run: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(e) = tokio::spawn(run).await {
+        tracing::error!("{key}: review job ended abnormally: {e}");
+        shared.runtime.lock().await.in_flight.remove(&key);
+        shared.work_available.notify_one();
+    }
+}
+
 /// Run one queued review. The state lock is held for the whole pipeline run:
 /// all state writes flow through this single owner (A4), which is what makes
 /// a restart unable to duplicate a review. A failed review never stops the
 /// queue — the pipeline already ran the on_failure effects; we log and move
 /// on (DEV-PLAN §9).
-async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedSemaphorePermit) {
+async fn execute_job(shared: Arc<Shared>, job: Job, permit: tokio::sync::OwnedSemaphorePermit) {
     // The config in force when the job starts governs the whole run.
     let live = shared.live();
     let Some(repo) = live.repo(&job.repo).cloned() else {
@@ -1541,13 +1729,13 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
             "{}: repo no longer configured; dropping queued review",
             job.key
         );
-        finish_job(&shared, &job).await;
+        finish_job(&shared, &job, permit).await;
         return;
     };
     // D3: the mode may have turned `off` between dequeue and here.
     if repo.review_mode == ReviewMode::Off {
         tracing::info!("{}: review mode is off; dropping queued review", job.key);
-        finish_job(&shared, &job).await;
+        finish_job(&shared, &job, permit).await;
         return;
     }
 
@@ -1565,7 +1753,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
         };
         if !due {
             tracing::debug!("{}: no longer due; dropping queued review", job.key);
-            finish_job(&shared, &job).await;
+            finish_job(&shared, &job, permit).await;
             return;
         }
     }
@@ -1612,7 +1800,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
             Ok(outcome) => tracing::warn!("{}: {:?}", job.key, outcome),
             Err(e) => tracing::warn!("{}: review failed: {e:#}", job.key),
         }
-        finish_job(&shared, &job).await;
+        finish_job(&shared, &job, permit).await;
         return;
     }
     // The review proper — through its state transition, history, and
@@ -1662,7 +1850,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
         Ok(other) => tracing::info!("{}: {:?}", job.key, other),
         Err(e) => tracing::warn!("{}: review failed: {e:#}", job.key),
     }
-    finish_job(&shared, &job).await;
+    finish_job(&shared, &job, permit).await;
 }
 
 /// Verdict-triggered auto-open (design D9; spec prx/browser-open): after a
@@ -1741,11 +1929,17 @@ async fn run_brief(
     }
 }
 
-async fn finish_job(shared: &Arc<Shared>, job: &Job) {
+/// End a job: leave the in-flight set, free the concurrency slot, and only
+/// then wake the drainer. The order matters: the drainer starts the next job
+/// only when it sees a free slot, and goes back to sleep otherwise — woken
+/// before the slot is free, it would leave queued jobs waiting for some
+/// later, unrelated wake-up.
+async fn finish_job(shared: &Arc<Shared>, job: &Job, permit: tokio::sync::OwnedSemaphorePermit) {
     {
         let mut rt = shared.runtime.lock().await;
         rt.in_flight.remove(&job.key);
     }
+    drop(permit);
     shared.work_available.notify_one();
 }
 
@@ -2055,6 +2249,50 @@ mod tests {
         drop(guard);
     }
 
+    /// Backdate a pid file, as if it was written before its pid was reused.
+    fn backdate(path: &Path, by: Duration) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - by)
+            .unwrap();
+    }
+
+    #[test]
+    fn process_start_time_reads_this_process() {
+        let started = process_start_time(std::process::id()).expect("start time");
+        let now = std::time::SystemTime::now();
+        assert!(
+            started <= now + PID_FILE_START_SLACK,
+            "{started:?} > {now:?}"
+        );
+        assert!(now.duration_since(started).unwrap() < Duration::from_secs(24 * 3600));
+        assert_eq!(process_start_time(dead_pid()), None);
+    }
+
+    /// After a reboot the pid in a leftover file can belong to an unrelated
+    /// process that started later. That file names no daemon: it must not
+    /// block a start (or be signalled by `daemon stop`), and is reclaimed.
+    #[test]
+    fn pid_file_whose_pid_was_reused_is_reclaimed() {
+        let d = dir("reused");
+        let path = d.join("daemon.pid");
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        std::fs::write(&path, format!("{pid}\n")).unwrap();
+        assert_eq!(pid_file_owner(&path), Some(pid), "a fresh file names it");
+
+        backdate(&path, Duration::from_secs(600));
+        assert_eq!(pid_file_owner(&path), None, "written before it started");
+        let guard = PidGuard::acquire(&d).unwrap();
+        assert_eq!(read_pid(&path), Some(std::process::id()));
+        drop(guard);
+
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
+
     #[test]
     fn unreadable_pid_file_is_reclaimed() {
         let d = dir("junk");
@@ -2078,6 +2316,341 @@ mod tests {
         assert_eq!(read_pid(&d.join("daemon.pid")), Some(sleeper.id()));
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
+    }
+
+    /// A pid file can only ever name one process. Zero and values that go
+    /// negative as a `pid_t` mean "my process group" / "every process" to
+    /// kill(2); read as a pid they would look like a running daemon (so
+    /// none could start) and `daemon stop` would signal all of those.
+    #[test]
+    fn pid_file_values_that_name_no_single_process_read_as_no_pid() {
+        let d = dir("badpid");
+        let path = d.join("daemon.pid");
+        for junk in ["0", "4294967295", "2147483648", "-1", "", "12 34"] {
+            std::fs::write(&path, format!("{junk}\n")).unwrap();
+            assert_eq!(read_pid(&path), None, "{junk:?}");
+        }
+        std::fs::write(&path, "2147483647\n").unwrap();
+        assert_eq!(read_pid(&path), Some(i32::MAX as u32));
+        std::fs::write(&path, "  77 \n").unwrap();
+        assert_eq!(read_pid(&path), Some(77));
+
+        // The liveness probe itself refuses them too, whatever the caller.
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+        assert!(!process_alive(i32::MAX as u32 + 1));
+    }
+
+    #[test]
+    fn pid_file_naming_no_single_process_is_reclaimed() {
+        for (tag, junk) in [("zero", "0"), ("minus-one", "4294967295")] {
+            let d = dir(tag);
+            std::fs::write(d.join("daemon.pid"), format!("{junk}\n")).unwrap();
+            let guard = PidGuard::acquire(&d).unwrap();
+            assert_eq!(read_pid(&d.join("daemon.pid")), Some(std::process::id()));
+            drop(guard);
+            assert!(!d.join("daemon.pid").exists());
+        }
+    }
+
+    /// `prx daemon start` reports why its daemon child died: the last line
+    /// the child printed in this start, not what earlier starts left in the
+    /// shared stderr log.
+    #[test]
+    fn startup_error_is_the_last_line_this_start_printed() {
+        let d = dir("stderr");
+        let log = d.join("daemon-stderr.log");
+        let earlier = "error: an older failure\n";
+        std::fs::write(&log, earlier).unwrap();
+        let from = earlier.len() as u64;
+        assert_eq!(startup_error(&log, from), None, "nothing printed yet");
+
+        std::fs::write(
+            &log,
+            format!("{earlier}warning: something minor\nerror: failed to load PR state\n\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            startup_error(&log, from).as_deref(),
+            Some("failed to load PR state")
+        );
+        assert_eq!(
+            startup_error(&log, 0).as_deref(),
+            Some("failed to load PR state")
+        );
+        // A log that shrank (rotated away) or is gone has nothing to report.
+        assert_eq!(startup_error(&log, 10_000), None);
+        assert_eq!(startup_error(&d.join("missing.log"), 0), None);
+    }
+
+    // ---------------------------------------- queue (D6)
+
+    /// A `Shared` over a scratch data dir watching `org/one`, with nothing
+    /// tracked and no usable gh or agent (the queue tests need neither).
+    fn queue_shared(tag: &str, max_concurrent: u32) -> Arc<Shared> {
+        let d = dir(tag);
+        let config = Config::parse(
+            &format!(
+                "defaults:\n  max_concurrent_reviews: {max_concurrent}\nrepos:\n  - name: org/one\n"
+            ),
+            &d.join("config.yml"),
+        )
+        .unwrap();
+        let deps = Deps {
+            gh: GhCli::with_binary("/nonexistent/gh"),
+            adapter: EngineAdapter::default(),
+            notifier: MenubarDeferringNotifier::wrapping(CommandNotifier),
+            config_path: None,
+            store: StateStore::new(d.join("state.json")),
+            history_path: d.join("history.jsonl"),
+            data_dir: d,
+            opener: Arc::new(SystemOpener),
+        };
+        Arc::new(Shared::new(deps, config, "token".into(), SchedulerOptions::default()).unwrap())
+    }
+
+    fn job(number: u64, due: DateTime<Utc>) -> Job {
+        Job {
+            key: format!("org/one#{number}"),
+            repo: "org/one".into(),
+            due,
+            force: false,
+            overrides: ReviewOverrides::default(),
+        }
+    }
+
+    /// Enqueue dedups by PR key: a second plain request for a queued PR
+    /// adds nothing, a forced one upgrades the queued job in place, and a
+    /// repo this daemon does not watch never enters the queue.
+    #[tokio::test]
+    async fn enqueue_dedups_by_key_and_drops_unwatched_repos() {
+        let shared = queue_shared("enqueue", 1);
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(60);
+
+        assert_eq!(shared.enqueue(vec![job(1, now)]).await, ["org/one#1"]);
+        assert!(shared.enqueue(vec![job(1, later)]).await.is_empty());
+        assert_eq!(shared.queue_stats().await, (1, 0));
+
+        let forced = Job {
+            force: true,
+            ..job(1, later)
+        };
+        assert_eq!(shared.enqueue(vec![forced.clone()]).await, ["org/one#1"]);
+        assert!(shared.enqueue(vec![forced]).await.is_empty());
+        assert_eq!(shared.queue_stats().await, (1, 0));
+
+        let unwatched = Job {
+            key: "org/other#1".into(),
+            repo: "org/other".into(),
+            ..job(1, now)
+        };
+        assert!(shared.enqueue(vec![unwatched]).await.is_empty());
+        assert_eq!(shared.queued_keys().await, ["org/one#1"]);
+    }
+
+    /// The queue reports oldest-due first, whatever the insertion order.
+    #[tokio::test]
+    async fn queued_keys_are_ordered_oldest_due_first() {
+        let shared = queue_shared("order", 1);
+        let now = Utc::now();
+        let at = |secs| now + chrono::Duration::seconds(secs);
+        shared
+            .enqueue(vec![job(3, at(30)), job(1, at(10)), job(2, at(20))])
+            .await;
+        assert_eq!(
+            shared.queued_keys().await,
+            ["org/one#1", "org/one#2", "org/one#3"]
+        );
+    }
+
+    /// The concurrency cap is the largest `max_concurrent_reviews` in the
+    /// config at start, and never below one.
+    #[tokio::test]
+    async fn concurrency_cap_is_sized_from_the_startup_config() {
+        assert_eq!(queue_shared("cap1", 1).max_concurrent, 1);
+        let three = queue_shared("cap3", 3);
+        assert_eq!(three.max_concurrent, 3);
+        assert_eq!(three.semaphore.available_permits(), 3);
+    }
+
+    /// A finished job gives its concurrency slot back before the drainer is
+    /// woken, and leaves the in-flight set.
+    #[tokio::test]
+    async fn finishing_a_job_frees_its_slot_before_waking_the_drainer() {
+        let shared = queue_shared("finish", 1);
+        let job = job(1, Utc::now());
+        let permit = shared.semaphore.clone().try_acquire_owned().unwrap();
+        shared
+            .runtime
+            .lock()
+            .await
+            .in_flight
+            .insert(job.key.clone());
+        assert_eq!(shared.semaphore.available_permits(), 0);
+
+        finish_job(&shared, &job, permit).await;
+
+        assert_eq!(shared.semaphore.available_permits(), 1);
+        assert!(!shared.is_in_flight(&job.key).await);
+        tokio::time::timeout(Duration::from_secs(1), shared.work_available.notified())
+            .await
+            .expect("the drainer must be woken");
+    }
+
+    /// A job that panics still leaves the in-flight set and frees its slot,
+    /// and the drainer is woken: the PR can be queued again without a
+    /// daemon restart.
+    #[tokio::test]
+    async fn a_panicking_job_leaves_the_in_flight_set() {
+        let shared = queue_shared("panic", 1);
+        let job = job(1, Utc::now());
+        let permit = shared.semaphore.clone().try_acquire_owned().unwrap();
+        shared
+            .runtime
+            .lock()
+            .await
+            .in_flight
+            .insert(job.key.clone());
+        assert!(shared.enqueue(vec![job.clone()]).await.is_empty());
+
+        let run = async move {
+            let _permit = permit;
+            panic!("review job panicked (expected by this test)");
+        };
+        supervise_job(shared.clone(), job.key.clone(), run).await;
+
+        assert_eq!(shared.semaphore.available_permits(), 1);
+        assert!(!shared.is_in_flight(&job.key).await);
+        tokio::time::timeout(Duration::from_secs(1), shared.work_available.notified())
+            .await
+            .expect("the drainer must be woken");
+        assert_eq!(shared.enqueue(vec![job.clone()]).await, [job.key]);
+    }
+
+    /// With a cap of one, the drainer works through a long queue without
+    /// ever stalling: each finished job hands its slot to the next. The
+    /// jobs are for untracked PRs, so each ends at once ("no longer due").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drainer_empties_a_long_queue_through_a_single_slot() {
+        let shared = queue_shared("drain", 1);
+        let now = Utc::now();
+        let jobs: Vec<Job> = (1..=400).map(|n| job(n, now)).collect();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let drainer = tokio::spawn(drain_loop(shared.clone(), shutdown_rx));
+        assert_eq!(shared.enqueue(jobs).await.len(), 400);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while shared.queue_stats().await != (0, 0) {
+            assert!(
+                Instant::now() < deadline,
+                "the queue stalled at {:?} (queued, in flight)",
+                shared.queue_stats().await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(shared.semaphore.available_permits(), 1);
+        shutdown_tx.send(true).unwrap();
+        drainer.await.unwrap();
+    }
+
+    // ---------------------------------------- poll cadence (A7, D11)
+
+    /// The one watched repo of a config with these `defaults:` lines.
+    fn repo_with(defaults: &str) -> EffectiveRepo {
+        let config = Config::parse(
+            &format!("defaults:\n{defaults}repos:\n  - name: org/one\n"),
+            Path::new("config.yml"),
+        )
+        .unwrap();
+        LiveConfig::from_config(config).unwrap().repos.remove(0)
+    }
+
+    /// A successful poll schedules the next one a configured interval
+    /// away, give or take 10 %; a failed poll retries after the plain
+    /// interval; and no interval is ever shorter than a second.
+    #[test]
+    fn next_poll_is_one_interval_away_with_at_most_ten_percent_jitter() {
+        let repo = repo_with("  poll_interval_minutes: 10\n");
+        let now = Utc::now();
+        let options = SchedulerOptions::default();
+        let gaps: Vec<i64> = (0..500)
+            .map(|_| (next_poll_after(&repo, now, options, true) - now).num_milliseconds())
+            .collect();
+        let (min, max) = (*gaps.iter().min().unwrap(), *gaps.iter().max().unwrap());
+        assert!(min >= 540_000 && max <= 660_000, "{min}..{max} ms");
+        assert!(
+            max - min > 10_000,
+            "the interval must be jittered: {min}..{max} ms"
+        );
+
+        // After a failed poll, and with jitter off: exactly the interval.
+        let plain = chrono::Duration::minutes(10);
+        assert_eq!(next_poll_after(&repo, now, options, false) - now, plain);
+        let steady = SchedulerOptions {
+            jitter: false,
+            ..options
+        };
+        assert_eq!(next_poll_after(&repo, now, steady, true) - now, plain);
+
+        let scaled_to_nothing = SchedulerOptions {
+            interval_scale: 0.000_001,
+            ..steady
+        };
+        assert_eq!(
+            next_poll_after(&repo, now, scaled_to_nothing, true) - now,
+            chrono::Duration::seconds(1)
+        );
+    }
+
+    /// D11: a repo without a schedule enqueues on every poll. A scheduled
+    /// repo never enqueues on sight: it is given its next tick and waits,
+    /// fires once the tick has come, and — its schedule removed — goes
+    /// back to the interval cadence with the tick forgotten.
+    #[test]
+    fn a_scheduled_repo_waits_for_its_tick_and_an_unscheduled_one_never_does() {
+        let mut ticks = BTreeMap::new();
+        let now = utc_at(2026, 6, 1, 12, 0);
+        let plain = repo_with("");
+        assert_eq!(
+            review_cadence(&mut ticks, &plain, now),
+            ReviewCadence::Interval
+        );
+        assert!(ticks.is_empty());
+
+        let hourly = repo_with("  schedule: \"0 * * * *\"\n");
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, now),
+            ReviewCadence::Waiting
+        );
+        let tick = ticks["org/one"];
+        // The top of the next local hour, whatever this machine's zone is.
+        assert!(
+            tick > now && tick <= now + chrono::Duration::hours(1),
+            "{tick}"
+        );
+        let just_before = tick - chrono::Duration::seconds(1);
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, just_before),
+            ReviewCadence::Waiting
+        );
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, tick),
+            ReviewCadence::Tick
+        );
+        // The caller consumes the tick; until then a later pass still fires.
+        let later = tick + chrono::Duration::minutes(5);
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, later),
+            ReviewCadence::Tick
+        );
+
+        assert_eq!(
+            review_cadence(&mut ticks, &plain, later),
+            ReviewCadence::Interval
+        );
+        assert!(ticks.is_empty(), "a removed schedule forgets its tick");
     }
 
     #[test]

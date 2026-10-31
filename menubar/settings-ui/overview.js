@@ -108,11 +108,13 @@
   }
 
   // 950 -> "950", 12345 -> "12.3k", 4200000 -> "4.2M".
+  // Each unit ends where its rounded figure would read "1000" (999 499 is
+  // "999k", 999 500 is "1M"), like usage.rs format_tokens.
   function formatTokens(n) {
     n = Number(n) || 0;
-    if (n < 1000) return String(Math.round(n));
-    if (n < 1e6) return trim(n / 1e3) + "k";
-    if (n < 1e9) return trim(n / 1e6) + "M";
+    if (n < 999.5) return String(Math.round(n));
+    if (n < 999.5e3) return trim(n / 1e3) + "k";
+    if (n < 999.5e6) return trim(n / 1e6) + "M";
     return trim(n / 1e9) + "B";
   }
   function trim(x) { return (x >= 100 ? Math.round(x) : Math.round(x * 10) / 10).toString(); }
@@ -127,7 +129,7 @@
 
   // A compact age: "now", "5m", "3h", "2d", "6w", "4mo", "2y".
   function shortAge(iso, now) {
-    if (!iso) return "";
+    if (!iso || isNaN(Date.parse(iso))) return "";
     const seconds = Math.max(0, (now - Date.parse(iso)) / 1000);
     if (seconds < 60) return "now";
     const steps = [[3600, 60, "m"], [86400, 3600, "h"], [86400 * 14, 86400, "d"], [86400 * 60, 86400 * 7, "w"], [86400 * 730, 86400 * 30, "mo"]];
@@ -200,6 +202,7 @@
     ["review_started", "Review started"],
     ["review_skipped", "Review skipped"],
     ["new_commits", "New commits"],
+    ["new_pr", "New PR"],
     ["brief", "Brief"],
     ["pr_merged", "Merged"],
     ["pr_closed", "Closed"],

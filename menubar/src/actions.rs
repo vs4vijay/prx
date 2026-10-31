@@ -300,7 +300,7 @@ impl ActionController {
                 let url = github_url(key)?;
                 // The repo's effective `browser` (daemon effective view;
                 // system handler when the daemon cannot say).
-                let client = DaemonClient::discover().await;
+                let client = DaemonClient::discover_as_menubar().await;
                 let browser =
                     crate::browser::resolve(client.as_ref(), crate::browser::repo_of(key)).await;
                 crate::browser::open(&browser, &url)?;
@@ -442,7 +442,7 @@ pub fn summarize_brief(response: &BriefResponse) -> String {
 /// Re-discover the daemon per action (fresh port/token files — heals across
 /// daemon restarts exactly like the poller).
 async fn daemon() -> Result<DaemonClient, String> {
-    DaemonClient::discover()
+    DaemonClient::discover_as_menubar()
         .await
         .ok_or_else(|| "daemon offline — action not sent".to_string())
 }

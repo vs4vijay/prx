@@ -2,7 +2,8 @@
 // the wire format). Each call gets a fresh id; the host echoes it back in
 // window.prxBridge.__resolve(reply), so replies may arrive in any order.
 // Errors reject with an Error carrying `kind` (bad_request | offline |
-// rejected | daemon) and `field` (the offending config path, or null).
+// rejected | unsupported | daemon) and `field` (the offending config path,
+// or null). `unsupported` is a daemon too old for the route.
 (function () {
   "use strict";
   const pending = new Map();

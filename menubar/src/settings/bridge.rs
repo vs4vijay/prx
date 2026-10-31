@@ -450,7 +450,7 @@ pub struct DaemonBackend;
 
 impl Backend for DaemonBackend {
     async fn execute(&self, call: Call) -> Result<Value, BridgeError> {
-        let client = DaemonClient::discover()
+        let client = DaemonClient::discover_as_menubar()
             .await
             .ok_or_else(BridgeError::offline)?;
         let encode = |value: Result<Value, serde_json::Error>| {

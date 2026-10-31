@@ -41,6 +41,7 @@
 
 mod actions;
 mod banners;
+mod bell;
 mod browser;
 mod clipboard;
 mod icon;
@@ -157,6 +158,8 @@ struct App {
     icon_tooltip: String,
     /// The last successful poll (pagination clicks rebuild from it).
     snapshot: Option<Snapshot>,
+    /// Ready / blocked PRs not opened yet (`notifications.menubar_bell`).
+    bell: bell::BellTracker,
     /// Pages shown per lifecycle group (design D7).
     pagination: PaginationState,
     poller: PollerHandle,
@@ -198,6 +201,7 @@ impl App {
             icon_title: None,
             icon_tooltip: String::new(),
             snapshot: None,
+            bell: bell::BellTracker::new(),
             pagination: PaginationState::default(),
             poller,
             actions,
@@ -276,6 +280,19 @@ impl App {
             PollOutcome::Up(snapshot) => Some((**snapshot).clone()),
             PollOutcome::Down(_) => None,
         };
+        if let Some(snapshot) = &self.snapshot {
+            self.bell.update(
+                &snapshot.history,
+                &snapshot.status.prs,
+                snapshot.menubar_bell,
+            );
+        }
+        // Opens from banners and window links, queued off the main thread.
+        for key in bell::take_pending() {
+            if self.bell.acknowledge(&key) {
+                eprintln!("prx-menubar: bell: {key} opened");
+            }
+        }
         self.rebuild_model();
         eprintln!("prx-menubar: {}", self.model.dump().trim_end());
         self.update_icon();
@@ -293,6 +310,9 @@ impl App {
             ),
             None => model::offline_model_for(&self.daemon),
         };
+        if self.snapshot.is_some() {
+            self.model.bell = self.bell.counts();
+        }
     }
 
     /// A supervision change: only the offline menu shows it, so rebuild
@@ -469,6 +489,19 @@ impl App {
             // Also modal, so also after the menu closes.
             self.sender.send(Msg::Confirm(id.to_string(), request));
         } else {
+            if let Some(key) = id
+                .strip_prefix(actions::OPEN_PREFIX)
+                .and_then(|rest| rest.strip_prefix('|'))
+            {
+                // Opening a PR from the menu acknowledges it in the bell. The
+                // icon and title update now; the menu itself is rebuilt by
+                // the poll the action triggers.
+                if self.bell.acknowledge(key) {
+                    eprintln!("prx-menubar: bell: {key} opened");
+                    self.model.bell = self.bell.counts();
+                    self.update_icon();
+                }
+            }
             let label = self
                 .model
                 .items()
@@ -806,6 +839,7 @@ fn main() -> ExitCode {
         poll_sender.send(Msg::Poll(outcome));
     });
     let poller = PollerHandle::new(tx.clone());
+    bell::set_waker(poller.clone());
     let action_sender = sender.clone();
     let actions = ActionController::new(
         tx,

@@ -50,16 +50,22 @@ impl Env {
         } else {
             Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
         };
-        let cooldown = if due_now {
-            "  cooldown:\n    before_first_review_minutes: 0\n    between_re_reviews_minutes: 0\n"
-        } else {
-            ""
-        };
+        // The shared helper always writes the default 60/30 cooldown block;
+        // due_now zeroes it in place (a second block would not parse).
+        let mut yaml = config_with_fake_agent(&["org/one"], &agent_path, "");
+        if due_now {
+            yaml = yaml
+                .replace(
+                    "before_first_review_minutes: 60",
+                    "before_first_review_minutes: 0",
+                )
+                .replace(
+                    "between_re_reviews_minutes: 30",
+                    "between_re_reviews_minutes: 0",
+                );
+        }
         let config = cfg_dir.path().join("config.yml");
-        write_file(
-            &config,
-            &config_with_fake_agent(&["org/one"], &agent_path, cooldown),
-        );
+        write_file(&config, &yaml);
         write_list_fixture(
             gh_dir.path(),
             "org/one",
@@ -267,19 +273,27 @@ fn daemon_start_surfaces_a_bad_config() {
         &env.config,
         "defaults:\n  agent: nope\nrepos:\n  - name: org/one\n",
     );
+    let started = Instant::now();
     let out = env.run(&["daemon", "start"], &[]);
     assert!(
         !out.status.success(),
         "start must fail on an invalid config"
     );
+    // The reason the daemon gave up is reported by `daemon start` itself,
+    // as soon as the child exits (not after a readiness timeout).
+    let err = stderr_of(&out);
+    assert!(err.contains("daemon did not start"), "{err}");
+    assert!(err.contains("unknown engine 'nope'"), "{err}");
     assert!(
-        stderr_of(&out).contains("did not claim its pid file"),
-        "{}",
-        stderr_of(&out)
+        started.elapsed() < Duration::from_secs(5),
+        "a daemon that exits at once must be reported at once"
     );
     env.mark_stopped();
     let out = env.run(&["daemon", "status"], &[]);
     assert!(stdout_of(&out).contains("daemon not running"));
+    // The same text is kept beside the daemon's logs.
+    let kept = std::fs::read_to_string(env.data_dir.child("logs/daemon-stderr.log")).unwrap();
+    assert!(kept.contains("unknown engine 'nope'"), "{kept}");
 }
 
 /// The first-run contract PRX.app relies on (v0.1.1): on a machine with no
@@ -575,12 +589,17 @@ fn daemon_sigkill_during_review_leaves_state_consistent_and_reviewable() {
         "a killed review must leave the record reviewable"
     );
     assert_eq!(rec.last_verdict, None);
-    // Only the run's review_started marker (design D6) may be there.
+    // Only the run's review_started marker (design D6) and the poll's
+    // new_pr entry may be there.
     assert!(
         prx::history::query(&env.data_dir.child("history.jsonl"), None, 0)
             .unwrap()
             .iter()
-            .all(|e| matches!(e, prx::history::HistoryEntry::ReviewStarted { .. })),
+            .all(|e| matches!(
+                e,
+                prx::history::HistoryEntry::ReviewStarted { .. }
+                    | prx::history::HistoryEntry::NewPr { .. }
+            )),
         "no review_completed may be recorded for the killed run"
     );
 
@@ -997,5 +1016,493 @@ fn cli_brief_prints_and_regenerates_through_the_daemon_and_in_process() {
         stderr_of(&out).contains("needs the daemon"),
         "{}",
         stderr_of(&out)
+    );
+}
+
+// ------------------------------------------- readiness, stale files, stop
+
+/// The daemon's pid, from its pid file.
+fn daemon_pid(env: &Env) -> u32 {
+    prx::daemon::read_pid(&env.data_dir.child("daemon.pid")).expect("pid file must name the daemon")
+}
+
+/// Start the daemon and require success; the env is marked running.
+fn start_daemon(env: &mut Env, extra_env: &[(&str, &str)]) {
+    let out = env.run(&["daemon", "start"], extra_env);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("daemon started (pid"),
+        "{}",
+        stdout_of(&out)
+    );
+    env.mark_running();
+}
+
+fn stop_daemon(env: &mut Env) {
+    let out = env.run(&["daemon", "stop"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("daemon stopped"),
+        "{}",
+        stdout_of(&out)
+    );
+    env.mark_stopped();
+}
+
+/// `prx daemon start` returns once the daemon is ready, not merely
+/// spawned: the IPC discovery files are there, and the very next command
+/// goes through the daemon instead of running in-process beside it
+/// (invariant 6).
+#[test]
+fn daemon_start_returns_only_once_the_ipc_api_is_ready() {
+    let mut env = Env::new("lc-ready", false);
+    start_daemon(&mut env, &[]);
+    // No waiting here: the files must exist the moment start returns.
+    assert!(env.data_dir.child("daemon.port").exists());
+    assert!(env.data_dir.child("daemon.token").exists());
+
+    // `review-now` says "on the daemon" only when it went through IPC.
+    let out = env.run(&["review-now"], &[]);
+    assert!(
+        out.status.success(),
+        "the command right after start must reach the daemon: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("on the daemon"),
+        "{}",
+        stdout_of(&out)
+    );
+    stop_daemon(&mut env);
+}
+
+/// The single-instance guard itself (A16), not just the `daemon start`
+/// shortcut: a second daemon process pointed at the same data dir refuses
+/// to run, and the first keeps its pid file, port, and token.
+#[test]
+fn a_second_daemon_process_refuses_to_run_beside_the_first() {
+    let mut env = Env::new("lc-second", false);
+    start_daemon(&mut env, &[]);
+    let pid = daemon_pid(&env);
+    let port = std::fs::read_to_string(env.data_dir.child("daemon.port")).unwrap();
+    let token = std::fs::read_to_string(env.data_dir.child("daemon.token")).unwrap();
+
+    let out = env.run(&["daemon", "start", "--foreground"], &[]);
+    assert!(!out.status.success(), "a second daemon must not run");
+    assert!(
+        stderr_of(&out).contains(&format!("daemon already running (pid {pid})")),
+        "{}",
+        stderr_of(&out)
+    );
+
+    assert_eq!(daemon_pid(&env), pid);
+    assert_eq!(
+        std::fs::read_to_string(env.data_dir.child("daemon.port")).unwrap(),
+        port
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.data_dir.child("daemon.token")).unwrap(),
+        token
+    );
+    // The first daemon still serves.
+    let out = env.run(&["review-now"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("on the daemon"),
+        "{}",
+        stdout_of(&out)
+    );
+    stop_daemon(&mut env);
+}
+
+/// After a reboot the pid in a leftover pid file can belong to an unrelated
+/// process. `daemon status` and `daemon stop` must read the file as stale
+/// and never signal that process, and `daemon start` must start a daemon.
+#[test]
+fn pid_file_whose_pid_was_reused_names_no_daemon() {
+    let mut env = Env::new("lc-reused", false);
+    let mut stranger = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = stranger.id();
+    let pid_file = env.data_dir.child("daemon.pid");
+    // Written ten minutes before `stranger` started, as a leftover would be.
+    let write_old_pid_file = || {
+        std::fs::write(&pid_file, format!("{pid}\n")).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&pid_file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(600))
+            .unwrap();
+    };
+    write_old_pid_file();
+
+    let out = env.run(&["daemon", "status"], &[]);
+    assert!(
+        stdout_of(&out).contains(&format!("stale pid file: pid {pid}")),
+        "{}",
+        stdout_of(&out)
+    );
+    let out = env.run(&["daemon", "stop"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("now belongs to another process"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert!(!pid_file.exists());
+    assert!(
+        stranger.try_wait().unwrap().is_none(),
+        "the unrelated process must not be signalled"
+    );
+
+    write_old_pid_file();
+    start_daemon(&mut env, &[]);
+    assert_ne!(daemon_pid(&env), pid);
+    stop_daemon(&mut env);
+
+    stranger.kill().unwrap();
+    stranger.wait().unwrap();
+}
+
+/// A daemon that was SIGKILLed leaves its pid, port, and token files
+/// behind. They must read as "no daemon": status says so, commands fall
+/// back to in-process execution, `daemon stop` clears the stale pid file,
+/// and the next start works and mints a new token.
+#[test]
+fn files_left_by_a_killed_daemon_read_as_no_daemon() {
+    let mut env = Env::new("lc-stale", false);
+    start_daemon(&mut env, &[]);
+    let pid = daemon_pid(&env);
+    let old_token = std::fs::read_to_string(env.data_dir.child("daemon.token")).unwrap();
+    send_sigkill(pid);
+    wait_for(
+        || !process_alive_(pid),
+        Duration::from_secs(10),
+        "the daemon process to die",
+    );
+    env.mark_stopped();
+    for file in ["daemon.pid", "daemon.port", "daemon.token"] {
+        assert!(env.data_dir.child(file).exists(), "{file} is left behind");
+    }
+
+    let out = env.run(&["daemon", "status"], &[]);
+    assert!(
+        stdout_of(&out).contains(&format!("stale pid file: pid {pid}")),
+        "{}",
+        stdout_of(&out)
+    );
+    // In-process fallback: the CLI polls gh itself, which the thin client
+    // of a live daemon never does.
+    let polls_before = gh_call_count(&env);
+    let out = env.run(&["status", "--json"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        gh_call_count(&env) > polls_before,
+        "status must run in-process when the daemon is gone"
+    );
+    let out = env.run(&["daemon", "stop"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("stale pid file"),
+        "{}",
+        stdout_of(&out)
+    );
+    assert!(!env.data_dir.child("daemon.pid").exists());
+
+    start_daemon(&mut env, &[]);
+    assert_ne!(daemon_pid(&env), pid);
+    assert_ne!(
+        std::fs::read_to_string(env.data_dir.child("daemon.token")).unwrap(),
+        old_token
+    );
+    stop_daemon(&mut env);
+}
+
+/// A pid file that does not name a process — here `0`, which kill(2)
+/// reads as "my own process group" — is a stale file, not a running
+/// daemon: status says not running, and a daemon can be started.
+#[test]
+fn a_pid_file_that_names_no_process_does_not_block_the_daemon() {
+    let mut env = Env::new("lc-pid-zero", false);
+    write_file(&env.data_dir.child("daemon.pid"), "0\n");
+
+    let out = env.run(&["daemon", "status"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out).trim(), "daemon not running");
+
+    let out = env.run(&["daemon", "start"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("daemon started (pid"),
+        "{}",
+        stdout_of(&out)
+    );
+    // Only now is there a daemon of ours to stop.
+    env.mark_running();
+    assert_ne!(daemon_pid(&env), 0);
+    stop_daemon(&mut env);
+}
+
+/// Graceful stop while a review is running: `daemon stop` returns within
+/// its grace period, the PR is left pending (never `in_review`), nothing
+/// was posted, the discovery files are gone — and the next daemon reviews
+/// the PR, once.
+#[test]
+fn stopping_during_a_review_leaves_the_pr_pending_and_a_restart_reviews_it_once() {
+    let mut env = Env::new("lc-stop-mid-review", true);
+    let prompt_out = env.data_dir.child("agent-prompt.txt");
+    start_daemon(
+        &mut env,
+        &[
+            ("FAKE_AGENT_SLEEP", "30"),
+            ("FAKE_AGENT_PROMPT_OUT", prompt_out.to_str().unwrap()),
+            ("FAKE_AGENT_MANIFEST_JSON", agent_manifest_env()[0].1),
+        ],
+    );
+    wait_for_file(&prompt_out, Duration::from_secs(15), true, "agent to start");
+
+    let stopping = Instant::now();
+    stop_daemon(&mut env);
+    assert!(
+        stopping.elapsed() < Duration::from_secs(12),
+        "stop must not wait for the 30 s review"
+    );
+    for file in ["daemon.pid", "daemon.port", "daemon.token"] {
+        assert!(!env.data_dir.child(file).exists(), "{file} must be removed");
+    }
+    let rec = &env.state().prs["org/one#1"];
+    assert_eq!(rec.state, prx::state::PrState::Pending);
+    assert_eq!(rec.last_verdict, None);
+    assert_eq!(review_posts(&env), 0, "an abandoned review posts nothing");
+
+    // The next daemon (fast agent) picks the PR up again.
+    start_daemon(&mut env, agent_manifest_env());
+    wait_for(
+        || env.state().prs["org/one#1"].state == prx::state::PrState::ReviewedApproved,
+        Duration::from_secs(15),
+        "the restarted daemon to review the PR",
+    );
+    stop_daemon(&mut env);
+    let completed = prx::history::query(&env.data_dir.child("history.jsonl"), None, 0)
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(e, prx::history::HistoryEntry::ReviewCompleted { .. }))
+        .count();
+    assert_eq!(completed, 1);
+    assert_eq!(review_posts(&env), 1);
+}
+
+/// `gh pr review` invocations recorded by the fake gh.
+fn review_posts(env: &Env) -> usize {
+    std::fs::read_to_string(env.gh_dir.child("calls.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with("pr review"))
+        .count()
+}
+
+// ------------------------------------------------ secrets (invariant 7)
+
+/// Every regular file under `dir`, recursively, with its content.
+fn files_under(dir: &Path) -> Vec<(PathBuf, String)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+            found.push((path, text));
+        }
+    }
+    found
+}
+
+/// Core invariant 7: a credential is referenced by the name of its
+/// environment variable only, and the IPC token lives in `daemon.token`
+/// only. After a daemon — logging at debug level — has polled, reviewed,
+/// posted with the credential, and served authenticated requests, neither
+/// value appears in the logs, state, history, manifests, or config.
+#[test]
+fn logs_and_data_files_never_contain_the_token_or_a_credential() {
+    let mut env = Env::new("lc-secrets", true);
+    let secret = "ghp_prxTestSecretValue0123456789";
+    let config = std::fs::read_to_string(&env.config).unwrap().replacen(
+        "defaults:\n",
+        "defaults:\n  identity:\n    credential: PRX_TEST_SECRET_PAT\n",
+        1,
+    );
+    write_file(&env.config, &config);
+
+    start_daemon(
+        &mut env,
+        &[
+            ("PRX_TEST_SECRET_PAT", secret),
+            ("RUST_LOG", "debug"),
+            ("FAKE_AGENT_MANIFEST_JSON", agent_manifest_env()[0].1),
+        ],
+    );
+    let token = std::fs::read_to_string(env.data_dir.child("daemon.token")).unwrap();
+    assert_eq!(token.len(), 64);
+    wait_for(
+        || {
+            env.state()
+                .prs
+                .get("org/one#1")
+                .is_some_and(|r| r.last_review_at.is_some())
+        },
+        Duration::from_secs(15),
+        "the automated review",
+    );
+    // Authenticated requests, including GitHub writes with the credential.
+    for args in [
+        &["status", "--json"][..],
+        &["approve", "org/one#1"],
+        &["snooze", "org/one#1", "--hours", "1"],
+        &["history", "--limit", "5"],
+        &["review-now"],
+    ] {
+        let out = env.run(args, &[("RUST_LOG", "debug")]);
+        assert!(out.status.success(), "{args:?}: {}", stderr_of(&out));
+        for (stream, text) in [("stdout", stdout_of(&out)), ("stderr", stderr_of(&out))] {
+            assert!(
+                !text.contains(&token),
+                "{args:?} printed the token on {stream}"
+            );
+            assert!(
+                !text.contains(secret),
+                "{args:?} printed the credential on {stream}"
+            );
+        }
+    }
+    // The credential really was in play: the fake gh saw it as GH_TOKEN.
+    let tokens_seen = std::fs::read_to_string(env.gh_dir.child("calls.log.tokens")).unwrap();
+    assert!(tokens_seen.contains(secret), "{tokens_seen}");
+    stop_daemon(&mut env);
+
+    let files = files_under(env.data_dir.path());
+    let log = files
+        .iter()
+        .find(|(path, _)| path.to_string_lossy().contains("prx.log."))
+        .expect("the daemon wrote a log");
+    assert!(log.1.contains("reviewing org/one#1"), "{}", log.1);
+    assert!(
+        files
+            .iter()
+            .any(|(path, _)| path.ends_with("history.jsonl")),
+        "history was written"
+    );
+    let config_now = (
+        env.config.clone(),
+        std::fs::read_to_string(&env.config).unwrap(),
+    );
+    for (path, text) in files.iter().chain([&config_now]) {
+        assert!(
+            !text.contains(secret),
+            "{} holds the credential",
+            path.display()
+        );
+        assert!(
+            !text.contains(&token),
+            "{} holds the IPC token",
+            path.display()
+        );
+    }
+}
+
+// ------------------------------------------------ banners from the daemon
+
+/// Put recording `osascript` / `notify-send` fakes first on the daemon's
+/// PATH; every banner appends one line holding its arguments to the log.
+fn install_recording_notifiers(env: &Env) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let log = env.gh_dir.child("banners.log");
+    for name in ["osascript", "notify-send"] {
+        let path = env.gh_dir.child(name);
+        write_file(
+            &path,
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    log
+}
+
+fn banner_lines(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A daemon nobody is watching raises its own desktop banners through the
+/// platform's notification command: here for the new PR and for the review
+/// it then runs.
+#[test]
+fn a_daemon_without_clients_raises_its_own_banners() {
+    let mut env = Env::new("lc-banners", true);
+    let log = install_recording_notifiers(&env);
+    start_daemon(&mut env, agent_manifest_env());
+
+    wait_for(
+        || banner_lines(&log).len() >= 3,
+        Duration::from_secs(15),
+        "the new-PR, review-started and review-complete banners",
+    );
+    let lines = banner_lines(&log);
+    for (line, body) in lines.iter().zip([
+        "new PR org/one#1: Add feature",
+        "org/one#1: review started",
+        "org/one#1 review passed: no blocking issues",
+    ]) {
+        assert!(line.contains(body), "expected {body:?}, got {line:?}");
+    }
+    // The ready banner plays its own sound (the last argument on macOS).
+    if cfg!(target_os = "macos") {
+        assert!(lines[2].ends_with(" Glass"), "{:?}", lines[2]);
+    }
+    stop_daemon(&mut env);
+}
+
+/// With no menu bar app anywhere, using the CLI must not mute the daemon:
+/// the banner for a review that follows a `prx` command still has to come
+/// from the daemon, because nothing else will raise it.
+#[test]
+fn cli_commands_do_not_mute_the_daemons_banners() {
+    let mut env = Env::new("lc-banners-cli", true);
+    let log = install_recording_notifiers(&env);
+    // Nothing to review yet: the daemon starts on an empty repo.
+    let pr = std::fs::read_to_string(env.gh_dir.child("list_org_one.json")).unwrap();
+    write_file(&env.gh_dir.child("list_org_one.json"), "[]");
+    start_daemon(&mut env, agent_manifest_env());
+
+    // A CLI command, then the PR shows up and is reviewed.
+    let out = env.run(&["status"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    write_file(&env.gh_dir.child("list_org_one.json"), &pr);
+    let out = env.run(&["review-now"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    wait_for(
+        || {
+            env.state()
+                .prs
+                .get("org/one#1")
+                .is_some_and(|r| r.last_review_at.is_some())
+        },
+        Duration::from_secs(15),
+        "the review",
+    );
+    stop_daemon(&mut env);
+
+    let lines = banner_lines(&log);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("org/one#1 review passed: no blocking issues")),
+        "the daemon must raise the review banner itself: {lines:?}"
     );
 }
