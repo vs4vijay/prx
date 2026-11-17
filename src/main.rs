@@ -34,8 +34,15 @@ async fn main() {
         }
     };
     if let Err(e) = run(cli.command).await {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+        let code = if e.is::<daemon::RestartRequested>() {
+            daemon::RESTART_EXIT_CODE
+        } else {
+            eprintln!("error: {e:#}");
+            1
+        };
+        // Flush the daemon's file log before exiting.
+        drop(_log_guard);
+        std::process::exit(code);
     }
 }
 
@@ -44,9 +51,17 @@ async fn run(command: Command) -> Result<()> {
         Command::Init => cmd_init(),
         Command::Doctor => cmd_doctor().await,
         Command::Repos { cmd } => match cmd {
-            ReposCmd::Add { repo } => cmd_repos_add(&repo),
+            ReposCmd::Add { repo } => {
+                cmd_repos_add(&repo)?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
             ReposCmd::List => cmd_repos_list(),
-            ReposCmd::Remove { repo } => cmd_repos_remove(&repo),
+            ReposCmd::Remove { repo } => {
+                cmd_repos_remove(&repo)?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
         },
         Command::Status(args) => cmd_status(args).await,
         Command::Review {
@@ -56,6 +71,7 @@ async fn run(command: Command) -> Result<()> {
             engine,
             no_post,
             prompt,
+            yes,
         } => {
             let overrides = review::ReviewOverrides {
                 engine,
@@ -63,9 +79,24 @@ async fn run(command: Command) -> Result<()> {
                 extra_prompt: prompt,
             }
             .normalized();
-            cmd_review(target.as_deref(), all, dry_run, &overrides).await
+            cmd_review(target.as_deref(), all, dry_run, &overrides, yes).await
         }
         Command::Brief { target, regenerate } => review::run_brief_cmd(&target, regenerate).await,
+        Command::Chat {
+            target,
+            new,
+            engine,
+            dir,
+            dry_run,
+        } => prx::chat::run_chat_cmd(
+            &target,
+            prx::chat::ChatOptions {
+                new,
+                engine,
+                dir,
+                dry_run,
+            },
+        ),
         Command::Approve { target } => cmd_approve(&target).await,
         Command::Snooze {
             target,
@@ -96,8 +127,16 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Config { cmd } => match cmd {
             None | Some(ConfigCmd::Show) => cmd_config_show(),
-            Some(ConfigCmd::Edit) => cmd_config_edit(),
-            Some(ConfigCmd::Set { key, value }) => cmd_config_set(&key, &value),
+            Some(ConfigCmd::Edit) => {
+                cmd_config_edit()?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
+            Some(ConfigCmd::Set { key, value }) => {
+                cmd_config_set(&key, &value)?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
         },
         Command::Daemon { cmd } => match cmd {
             DaemonCmd::Start { foreground } => {
@@ -134,6 +173,7 @@ async fn cmd_review(
     all: bool,
     dry_run: bool,
     overrides: &review::ReviewOverrides,
+    yes: bool,
 ) -> Result<()> {
     // Mirror run_review_cmd's argument validation so the daemon path cannot
     // turn a bare `prx review` into an accidental `--all`.
@@ -149,7 +189,28 @@ async fn cmd_review(
             // reviews only currently-due PRs. D10: the target goes through
             // unparsed — the daemon resolves every reference form.
             let resp = match target {
-                Some(target) if !all => client.review_with(target, true, overrides).await?,
+                Some(target) if !all => {
+                    // The pre-flight (an older daemon has none and never
+                    // runs a skipped or oversized review): ask, or refuse
+                    // without a terminal, before tokens are spent.
+                    let preflight = match yes {
+                        true => None,
+                        false => client.preflight(target).await?,
+                    };
+                    let confirm = match preflight {
+                        None => yes,
+                        Some(preflight) => match review::decide_on_terminal(&preflight)? {
+                            review::Decision::Proceed { confirm } => confirm,
+                            review::Decision::Declined => {
+                                println!("{} was not reviewed", preflight.key);
+                                return Ok(());
+                            }
+                        },
+                    };
+                    client
+                        .review_confirmed(target, true, overrides, confirm)
+                        .await?
+                }
                 _ => client.review(target, all, target.is_some()).await?,
             };
             if resp.enqueued.is_empty() {
@@ -187,7 +248,7 @@ async fn cmd_review(
             );
         }
     }
-    review::run_review_cmd(target, all, dry_run, overrides).await
+    review::run_review_cmd(target, all, dry_run, overrides, yes).await
 }
 
 async fn cmd_approve(target: &str) -> Result<()> {
@@ -258,7 +319,14 @@ async fn cmd_review_now() -> Result<()> {
         return Ok(());
     }
     // Same semantics as `prx review --all`: poll everything, review what's due.
-    review::run_review_cmd(None, true, false, &review::ReviewOverrides::default()).await
+    review::run_review_cmd(
+        None,
+        true,
+        false,
+        &review::ReviewOverrides::default(),
+        false,
+    )
+    .await
 }
 
 /// D5: the pause end in effect at `now` per state.json (in-process paths).
@@ -340,6 +408,15 @@ async fn cmd_status(args: StatusArgs) -> Result<()> {
                 "warning: the config file has errors; the daemon is using its last good config: {}",
                 err.message
             );
+        }
+        // Polls that keep failing leave the table stale: say why, also on
+        // stderr.
+        for line in prx::health::status_warnings(
+            &payload.poll_health,
+            payload.restart_recommended,
+            Utc::now(),
+        ) {
+            eprintln!("{line}");
         }
         let mut prs = payload.prs;
         if let Some(repo) = &args.repo {
@@ -1412,6 +1489,53 @@ fn cmd_repos_remove(repo: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- config
 
+/// After a command edited the config file: have a running daemon apply it
+/// now (`POST /config/reload`) instead of waiting for its file watcher, and
+/// say what the daemon did. Stderr only: stdout stays the command's own
+/// output. No daemon, no message (the next start reads the file).
+async fn nudge_daemon_reload() {
+    let Some(client) = ipc::DaemonClient::discover().await else {
+        return;
+    };
+    match client.reload_config().await {
+        Ok(response) => eprintln!("{}", reload_note(&response)),
+        // An older daemon has no reload route; its watcher still applies
+        // the file within a few seconds.
+        Err(e) => eprintln!(
+            "note: the running daemon did not confirm the change ({e:#}); it applies file \
+             changes within a few seconds"
+        ),
+    }
+}
+
+/// One stderr line (two with a restart notice) for a reload answer.
+fn reload_note(response: &ipc::ConfigReloadResponse) -> String {
+    use ipc::ConfigReloadOutcome;
+    let revision = response
+        .config_state
+        .config_revision
+        .map(|r| format!(" (config revision {r})"))
+        .unwrap_or_default();
+    let mut note = match response.outcome {
+        ConfigReloadOutcome::Applied => format!("the running daemon applied the change{revision}"),
+        // Its watcher got there first, or the edit changed nothing.
+        ConfigReloadOutcome::Unchanged => format!("the running daemon runs this config{revision}"),
+        ConfigReloadOutcome::Rejected => format!(
+            "warning: the running daemon rejected the config file and keeps its last good \
+             config: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        ),
+    };
+    if !response.config_state.restart_required.is_empty() {
+        note.push_str(&format!(
+            "\nnote: {} applies after a daemon restart (`prx daemon stop`, then `prx daemon \
+             start`; or quit PRX and open it again)",
+            response.config_state.restart_required.join(", ")
+        ));
+    }
+    note
+}
+
 fn cmd_config_show() -> Result<()> {
     let config = load_config_for_edit()?.1;
     config.validate().context("configuration is invalid")?;
@@ -1477,6 +1601,48 @@ mod tests {
             output_tokens: output,
             ..Default::default()
         }
+    }
+
+    fn reload(
+        outcome: ipc::ConfigReloadOutcome,
+        error: Option<&str>,
+        restart: &[&str],
+    ) -> ipc::ConfigReloadResponse {
+        ipc::ConfigReloadResponse {
+            outcome,
+            error: error.map(str::to_string),
+            added: vec![],
+            removed: vec![],
+            config_state: ipc::ConfigRevision {
+                config_revision: Some(3),
+                config_loaded_at: None,
+                restart_required: restart.iter().map(|s| s.to_string()).collect(),
+            },
+        }
+    }
+
+    /// The CLI's reload line says what the daemon did, quotes a rejection,
+    /// and adds the restart notice only when a key needs one.
+    #[test]
+    fn reload_note_reports_the_daemon_outcome() {
+        use ipc::ConfigReloadOutcome::*;
+        assert_eq!(
+            reload_note(&reload(Applied, None, &[])),
+            "the running daemon applied the change (config revision 3)"
+        );
+        assert_eq!(
+            reload_note(&reload(Unchanged, None, &[])),
+            "the running daemon runs this config (config revision 3)"
+        );
+        let rejected = reload_note(&reload(Rejected, Some("bad yaml"), &[]));
+        assert!(rejected.starts_with("warning: the running daemon rejected"));
+        assert!(rejected.ends_with("bad yaml"));
+        let restart = reload_note(&reload(Applied, None, &["max_concurrent_reviews"]));
+        assert!(restart
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("note: max_concurrent_reviews applies after a daemon restart"));
     }
 
     fn completed(verdict: Verdict) -> HistoryEntry {

@@ -11,10 +11,14 @@ prx status [org/repo] [--json]    current state of watched PRs (through the daem
 prx review <target>               review one PR (bypasses cooldowns; daemon-first)
         [--engine NAME] [--no-post] [--prompt TEXT]
                                   per-run options: another engine, no GitHub writes, extra instructions
+        [-y | --yes]              review a skipped or oversized PR without asking first
 prx review --all                  review all currently-due PRs (respects cooldowns)
 prx review <target> --dry-run     full pipeline, ZERO GitHub writes and zero state changes
 prx brief <target> [--regenerate] print the PR's brief and its dates; --regenerate writes a new
                                   one first (never posts to GitHub; daemon-first)
+prx chat <target> [--new] [--engine NAME] [--dir DIR] [--dry-run]
+                                  Review Chat: an interactive agent session about the PR in this
+                                  terminal (reopens the PR's session; never posts to GitHub)
 prx approve <org/repo>#<n>        post YOUR GitHub approval (the only approve path)
 prx snooze <target> --hours N | --until-push
 prx ignore <target> / prx unignore <target>
@@ -69,6 +73,30 @@ URLs are accepted: a URL on another host, an issue URL (`…/issues/N`), or any 
 page is rejected with the reason and the accepted forms. The same forms work in PRX.app's
 *Review PR…* panel and the window's *Review PR* box.
 
+### Confirmation before a risky review
+
+Before a single-PR review, `prx review <target>` runs a pre-flight (through the daemon's
+[`POST /review/preflight`](ipc-api.md#review-pre-flight), or in-process when the daemon is down).
+When the PR is skipped as a draft or by a skip rule, or its diff is over `diff_max_files` /
+`diff_max_lines`, it lists why and asks:
+
+```
+acme/api#42 needs your confirmation before review:
+  - Skipped — author dependabot[bot] excluded
+  - Large PR — 2,140 lines changed (limit 1,500)
+Review anyway? [y/N]
+```
+
+- On a terminal, `y` (or `yes`) reviews it; anything else prints `… was not reviewed` and exits 0.
+- `--yes` / `-y` skips the question and the pre-flight.
+- Without a terminal (a script, a pipe, cron) and without `--yes`, the review is refused with exit
+  status 1 and a message that lists the warnings and names `--yes`.
+
+A confirmed review of a skipped PR runs once and the PR stays skipped, so automatic reviews still
+leave it alone. A confirmed review runs past the diff cap. Snoozed and ignored PRs are not
+confirmable: unsnooze or unignore them first. `--all` never asks; it reviews only due PRs and the
+cap still holds oversized ones back.
+
 A repo whose [review mode](../guides/review-modes.md) is `off` is never reviewed, with or without
 the daemon: `prx review <target>` (also with `--dry-run`) prints that the mode is off and makes no
 `gh` call, and `prx review --all` leaves that repo out.
@@ -92,12 +120,27 @@ options; if a review of it is already running, the request is not queued and the
 `prx brief <target>` prints the PR's [brief](../guides/briefs.md), then `created <time> · updated <time>` (local
 time), plus `(stale)` when the PR's head has moved past the commit the brief describes. `<target>`
 takes the same forms as `prx review` (short forms need the daemon). A PR without a brief exits
-non-zero with a hint.
+non-zero with a hint. On a terminal the brief is wrapped at 80 columns; piped output is the text as
+stored.
 
 `--regenerate` writes a new brief first: through the daemon it sends `POST /brief` and waits until
 the brief lands; without the daemon it runs in-process. It works for any tracked PR, reviewed or
 not, in any repo mode except `off`, and never writes to GitHub. Regenerating keeps `created_at`. If
 generation fails, the previous brief is kept and the command reports the error.
+
+## `prx chat`
+
+`prx chat <target>` runs an agent interactively in the foreground, about one PR (see
+[Review Chat](../guides/review-chat.md)). It reopens the PR's last chat, else the session its last
+review left behind, and otherwise starts a new session seeded with the PR's metadata, brief, and
+latest review. `<target>` takes the same forms as `prx review`; short forms resolve against the
+tracked PRs, and a full reference also works for a PR prx does not track.
+
+`--new` starts a new session even if one exists. `--engine NAME` and `--dir DIR` start a new
+session with that agent engine or in that directory. `--dry-run` prints the decision and the
+command and changes nothing. The command reads the config and `state.json`, needs no daemon, and
+writes only `chats.json`. It fails with an `llm_api` engine (no interactive session), with an
+engine that has no chat templates, and when the agent's command is not found.
 
 ## `prx usage`
 

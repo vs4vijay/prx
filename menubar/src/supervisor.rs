@@ -1,33 +1,47 @@
 //! Daemon supervision in the app (design A3, the Ollama model).
 //!
-//! On start the app attaches to a daemon that already answers discovery
-//! (started by the CLI, launchd, or another session) and never spawns a
-//! second one. Otherwise it spawns the bundled `prx daemon start
-//! --foreground` (PRX.app's `Contents/Helpers/prx`) with the login-shell
-//! `PATH` ([`crate::shellenv`]) and records the owned pid.
+//! While PRX.app runs, a daemon runs. On start the app attaches to a daemon
+//! that already runs (started by the CLI, launchd, or an earlier app) and
+//! never spawns a second one. Otherwise it spawns the bundled `prx daemon
+//! start --foreground` (PRX.app's `Contents/Helpers/prx`) with the
+//! login-shell `PATH` ([`crate::shellenv`]) and records the owned pid.
 //!
 //! - Before a spawn the app creates the default config when none exists
 //!   ([`ensure_first_run_config`]), so a first launch needs no `prx init`.
-//! - An owned daemon exiting non-zero (a crash, `kill -9`) is restarted with
-//!   exponential backoff (1 s, 2 s, 4 s, … capped at 60 s). After
-//!   [`MAX_FAILURES`] failures inside [`FAILURE_WINDOW`] the supervisor gives
-//!   up and reports the daemon stopped (menu: "Start daemon", "Show log").
-//! - An owned daemon exiting 0 is a deliberate stop (`prx daemon stop`): no
-//!   restart.
+//! - A spawned daemon is *Starting* until it is ready (its pid file and a
+//!   fresh IPC token, or discovery answering with its pid), then *Running*.
+//!   The app nudges a poll then, so the menu turns online at once.
+//! - Every [`WATCH_INTERVAL`] the app probes the daemon, owned or adopted.
+//! - A daemon that goes away, owned (any exit) or adopted (gone on
+//!   [`VANISH_PROBES`] probes in a row), is restarted with exponential
+//!   backoff (1 s, 2 s, 4 s, … capped at 60 s). After [`MAX_FAILURES`]
+//!   failures inside [`FAILURE_WINDOW`] the supervisor gives up and reports
+//!   the daemon stopped (menu: "Start daemon", "Show log").
+//! - Except a deliberate stop: `prx daemon stop` leaves a stop marker
+//!   ([`prx::paths::daemon_stop_marker`]), and then the app shows *Daemon
+//!   stopped* and waits for "Start daemon". A daemon that someone starts
+//!   meanwhile is adopted.
 //! - A non-zero exit while ANOTHER daemon is alive (the pid-file guard's
 //!   loser, A16) is not a crash: the app attaches to the winner.
+//! - A daemon whose `/status` says `restart_recommended` (its polls have
+//!   failed in a way a fresh process can fix, see [`prx::health`]) is
+//!   replaced: SIGTERM, then a spawn. [`HealthPolicy`] allows that once per
+//!   [`HEALTH_RESTART_GAP`], doubling up to [`HEALTH_RESTART_MAX_GAP`] while
+//!   the daemon stays unhealthy. This is what recovers a daemon orphaned by
+//!   an earlier app in a stale system session.
 //! - Quit SIGTERMs only the owned daemon and waits for its graceful exit;
 //!   "Quit PRX (keep reviewing)" and an external daemon are left running.
 //!
-//! The restart policy is pure ([`RestartPolicy`]) so its backoff and cap are
-//! unit-tested; the thread around it only spawns, waits, and reports.
+//! The restart policies are pure ([`RestartPolicy`], [`HealthPolicy`]) so
+//! their backoff and caps are unit-tested; the thread around them only
+//! probes, spawns, signals, and reports.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Failures that make the supervisor give up when they all fall inside
 /// [`FAILURE_WINDOW`].
@@ -41,6 +55,19 @@ pub const MAX_DELAY: Duration = Duration::from_secs(60);
 /// How long Quit waits for the owned daemon's graceful shutdown (the same
 /// window `prx daemon stop` grants before escalating).
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
+/// How often the daemon is probed while one runs (or should).
+pub const WATCH_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a starting daemon is checked for readiness.
+pub const READY_INTERVAL: Duration = Duration::from_millis(250);
+/// Probes in a row that must find no daemon before an adopted one counts
+/// as gone (a daemon that is just starting claims its pid file first).
+pub const VANISH_PROBES: u32 = 2;
+/// The shortest gap between two health replacements.
+pub const HEALTH_RESTART_GAP: Duration = Duration::from_secs(30 * 60);
+/// The longest gap between two health replacements.
+pub const HEALTH_RESTART_MAX_GAP: Duration = Duration::from_secs(4 * 60 * 60);
+/// Bound on one discovery probe (a hung daemon must not stall supervision).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// What the menu shows about the daemon's supervision.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,14 +75,14 @@ pub enum DaemonState {
     /// Not owned by the app: attached to an external daemon, or none seen
     /// yet.
     Unmanaged,
-    /// The app spawned its daemon and is waiting for it to answer.
+    /// The app spawned its daemon and is waiting for it to be ready.
     Starting,
     /// The app's own daemon is running.
     Running { pid: u32 },
-    /// The owned daemon crashed; a restart is scheduled.
+    /// The daemon went away; a restart is scheduled.
     Restarting { delay_secs: u64, failures: usize },
-    /// The owned daemon is down and will not be restarted automatically:
-    /// a deliberate stop (`gave_up: false`) or the failure cap.
+    /// No daemon, and none is started automatically: a deliberate stop
+    /// (`gave_up: false`) or the failure cap.
     Stopped { gave_up: bool },
 }
 
@@ -102,11 +129,77 @@ impl RestartPolicy {
     }
 }
 
+/// How often an unhealthy daemon may be replaced: once per gap, the gap
+/// doubling from [`HEALTH_RESTART_GAP`] to [`HEALTH_RESTART_MAX_GAP`] while
+/// the daemon never becomes healthy in between, so a lasting outage (a
+/// network that is really down) costs a few restarts a day, not a loop.
+#[derive(Debug, Clone)]
+pub struct HealthPolicy {
+    gap: Duration,
+    next_allowed: Option<Instant>,
+}
+
+impl Default for HealthPolicy {
+    fn default() -> Self {
+        HealthPolicy {
+            gap: HEALTH_RESTART_GAP,
+            next_allowed: None,
+        }
+    }
+}
+
+impl HealthPolicy {
+    /// May the daemon be replaced at `now`? A yes uses up this gap.
+    pub fn allow(&mut self, now: Instant) -> bool {
+        if self.next_allowed.is_some_and(|at| now < at) {
+            return false;
+        }
+        self.next_allowed = Some(now + self.gap);
+        self.gap = self.gap.saturating_mul(2).min(HEALTH_RESTART_MAX_GAP);
+        true
+    }
+
+    /// The daemon synced again (or the user restarted it): fresh budget.
+    pub fn reset(&mut self) {
+        *self = HealthPolicy::default();
+    }
+}
+
+/// What one probe of a daemon that answers learned from `/status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answer {
+    pub pid: u32,
+    /// The daemon recommends a restart (`restart_recommended`).
+    pub restart_recommended: bool,
+    /// Every polled repo has synced and none is failing.
+    pub healthy: bool,
+}
+
+impl Answer {
+    fn of(status: &prx::ipc::StatusResponse) -> Answer {
+        let thresholds = prx::health::HealthThresholds::default();
+        Answer {
+            pid: status.pid,
+            restart_recommended: status.restart_recommended,
+            healthy: !status.poll_health.is_empty()
+                && status
+                    .poll_health
+                    .values()
+                    .all(|h| h.last_success.is_some() && !h.is_failing(&thresholds)),
+        }
+    }
+}
+
+/// Asks the running daemon's `/status` (None: nothing answers).
+type AskFn = dyn Fn() -> Option<Answer> + Send;
+
 enum Cmd {
     /// Manual "Start daemon".
     Start,
+    /// Manual "Restart daemon": replace whatever runs with a fresh daemon.
+    Restart,
     /// The owned child exited.
-    Exited { pid: u32, success: bool },
+    Exited { pid: u32 },
     /// Quit: stop the owned daemon when `stop`, then acknowledge.
     Shutdown { stop: bool, done: Sender<()> },
 }
@@ -124,16 +217,30 @@ impl Supervisor {
         prx: Option<PathBuf>,
         on_state: impl Fn(DaemonState) + Send + 'static,
     ) -> Supervisor {
+        Supervisor::spawn_with(prx, Box::new(ask_daemon), on_state)
+    }
+
+    /// [`Supervisor::spawn`] with the `/status` probe supplied (tests).
+    fn spawn_with(
+        prx: Option<PathBuf>,
+        ask: Box<AskFn>,
+        on_state: impl Fn(DaemonState) + Send + 'static,
+    ) -> Supervisor {
         let (tx, rx) = mpsc::channel();
-        let owned = Arc::new(Mutex::new(None));
         let worker = Worker {
             prx,
             tx: tx.clone(),
-            owned,
+            owned: Arc::new(Mutex::new(None)),
             policy: RestartPolicy::default(),
+            health: HealthPolicy::default(),
             state: DaemonState::Unmanaged,
             on_state: Box::new(on_state),
+            ask,
             restart_at: None,
+            next_watch: Instant::now() + WATCH_INTERVAL,
+            ready_wait: None,
+            replacing: None,
+            missing: 0,
         };
         std::thread::Builder::new()
             .name("prx-menubar-supervisor".into())
@@ -145,6 +252,12 @@ impl Supervisor {
     /// Menu "Start daemon": a fresh restart budget and an attach-or-spawn.
     pub fn start_daemon(&self) {
         let _ = self.tx.send(Cmd::Start);
+    }
+
+    /// Menu "Restart daemon" (the poll-health line): stop the running
+    /// daemon, owned or not, and start a fresh one.
+    pub fn restart_daemon(&self) {
+        let _ = self.tx.send(Cmd::Restart);
     }
 
     /// Quit: with `stop_owned`, SIGTERM the owned daemon and wait for it
@@ -170,20 +283,32 @@ struct Worker {
     tx: Sender<Cmd>,
     owned: Arc<Mutex<Option<u32>>>,
     policy: RestartPolicy,
+    health: HealthPolicy,
     state: DaemonState,
     on_state: Box<dyn Fn(DaemonState) + Send>,
+    ask: Box<AskFn>,
     restart_at: Option<Instant>,
+    next_watch: Instant,
+    /// The owned daemon being waited on for readiness, and when it was
+    /// spawned.
+    ready_wait: Option<(u32, SystemTime)>,
+    /// A daemon this supervisor stopped to replace it: its exit or
+    /// disappearance spawns a fresh one without counting as a failure.
+    replacing: Option<u32>,
+    /// Probes in a row that found no daemon (adopted daemons only).
+    missing: u32,
 }
 
 impl Worker {
     fn run(mut self, rx: Receiver<Cmd>) {
         self.attach_or_spawn();
         loop {
-            let timeout = self
-                .restart_at
-                .map(|at| at.saturating_duration_since(Instant::now()))
-                .unwrap_or(Duration::from_secs(3600));
-            match rx.recv_timeout(timeout) {
+            let now = Instant::now();
+            let wake = match self.restart_at {
+                Some(at) => at.min(self.next_watch),
+                None => self.next_watch,
+            };
+            match rx.recv_timeout(wake.saturating_duration_since(now)) {
                 Ok(Cmd::Start) => {
                     self.policy.reset();
                     self.restart_at = None;
@@ -191,7 +316,8 @@ impl Worker {
                         self.attach_or_spawn();
                     }
                 }
-                Ok(Cmd::Exited { pid, success }) => self.exited(pid, success),
+                Ok(Cmd::Restart) => self.restart_now(),
+                Ok(Cmd::Exited { pid }) => self.exited(pid),
                 Ok(Cmd::Shutdown { stop, done }) => {
                     if stop {
                         self.stop_owned(&rx);
@@ -202,9 +328,13 @@ impl Worker {
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if self.restart_at.is_some_and(|at| Instant::now() >= at) {
+                    let now = Instant::now();
+                    if self.restart_at.is_some_and(|at| now >= at) {
                         self.restart_at = None;
                         self.attach_or_spawn();
+                    }
+                    if now >= self.next_watch {
+                        self.watch();
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -230,14 +360,29 @@ impl Worker {
         }
     }
 
+    fn schedule_watch(&mut self) {
+        let every = if self.ready_wait.is_some() {
+            READY_INTERVAL
+        } else {
+            WATCH_INTERVAL
+        };
+        self.next_watch = Instant::now() + every;
+    }
+
     /// A3 attach-first: a daemon that answers (or a live pid-file owner)
     /// is used as is; otherwise spawn the bundled one.
     fn attach_or_spawn(&mut self) {
+        self.missing = 0;
         if other_daemon_alive(None) {
             eprintln!("prx-menubar: a daemon is already running; attaching (not spawning)");
             self.set_state(DaemonState::Unmanaged);
+            self.schedule_watch();
             return;
         }
+        self.spawn_own();
+    }
+
+    fn spawn_own(&mut self) {
         let Some(prx) = self.prx.clone() else {
             eprintln!("prx-menubar: no bundled prx binary found; cannot start a daemon");
             self.set_state(DaemonState::Stopped { gave_up: false });
@@ -245,6 +390,10 @@ impl Worker {
         };
         self.set_state(DaemonState::Starting);
         ensure_first_run_config();
+        // The app starts this daemon on purpose: an old stop marker must
+        // not turn a failed start into a "deliberate" stop.
+        let _ = std::fs::remove_file(prx::paths::daemon_stop_marker());
+        let spawned_at = SystemTime::now();
         match spawn_daemon(&prx) {
             Ok(child) => {
                 let pid = child.id();
@@ -255,11 +404,12 @@ impl Worker {
                     .name("prx-menubar-daemon-wait".into())
                     .spawn(move || {
                         let mut child = child;
-                        let success = child.wait().map(|s| s.success()).unwrap_or(false);
-                        let _ = tx.send(Cmd::Exited { pid, success });
+                        let _ = child.wait();
+                        let _ = tx.send(Cmd::Exited { pid });
                     })
                     .expect("failed to spawn the daemon waiter thread");
-                self.set_state(DaemonState::Running { pid });
+                self.ready_wait = Some((pid, spawned_at));
+                self.schedule_watch();
             }
             Err(error) => {
                 eprintln!("prx-menubar: cannot spawn the daemon: {error}");
@@ -268,19 +418,122 @@ impl Worker {
         }
     }
 
-    fn exited(&mut self, pid: u32, success: bool) {
+    /// One probe: readiness of a starting daemon, the disappearance of an
+    /// adopted one, a daemon appearing while none is expected, and the
+    /// health of whatever answers.
+    fn watch(&mut self) {
+        let owned = self.owned_pid();
+        if let Some((pid, spawned_at)) = self.ready_wait {
+            if owned != Some(pid) {
+                self.ready_wait = None;
+            } else if daemon_ready(pid, spawned_at, || (self.ask)()) {
+                eprintln!("prx-menubar: daemon pid {pid} is ready");
+                self.ready_wait = None;
+                self.set_state(DaemonState::Running { pid });
+            }
+            self.schedule_watch();
+            return;
+        }
+        let pid_owner = prx::daemon::pid_file_owner(&prx::paths::daemon_pid_file());
+        let answer = (self.ask)();
+        if pid_owner.is_some() || answer.is_some() {
+            self.missing = 0;
+            if owned.is_none() {
+                if self.restart_at.take().is_some()
+                    || matches!(self.state, DaemonState::Stopped { .. })
+                {
+                    eprintln!("prx-menubar: a daemon started elsewhere; attaching");
+                }
+                self.set_state(DaemonState::Unmanaged);
+            }
+            if let Some(answer) = answer {
+                self.check_health(answer);
+            }
+        } else if owned.is_none() && self.state == DaemonState::Unmanaged {
+            // The adopted daemon (or the one being replaced) is gone.
+            self.missing += 1;
+            if self.missing >= VANISH_PROBES {
+                self.missing = 0;
+                self.vanished();
+            }
+        }
+        self.schedule_watch();
+    }
+
+    /// An adopted daemon is gone: replace it unless the user stopped it.
+    fn vanished(&mut self) {
+        if self.replacing.take().is_some() {
+            eprintln!("prx-menubar: the replaced daemon is gone; starting a fresh one");
+            self.attach_or_spawn();
+        } else if stop_requested() {
+            eprintln!("prx-menubar: the daemon was stopped with `prx daemon stop`; not restarting");
+            self.set_state(DaemonState::Stopped { gave_up: false });
+        } else {
+            eprintln!("prx-menubar: the daemon this app attached to is gone; starting one");
+            self.failed();
+        }
+    }
+
+    /// Replace a daemon that recommends it, within [`HealthPolicy`].
+    fn check_health(&mut self, answer: Answer) {
+        if answer.healthy {
+            self.health.reset();
+            return;
+        }
+        if !answer.restart_recommended || self.replacing.is_some() {
+            return;
+        }
+        if !self.health.allow(Instant::now()) {
+            return;
+        }
+        eprintln!(
+            "prx-menubar: daemon pid {} keeps failing to sync and recommends a restart; replacing it",
+            answer.pid
+        );
+        self.replace(answer.pid);
+    }
+
+    /// SIGTERM `pid` (the owned daemon, or the pid-file owner) so a fresh
+    /// daemon replaces it once it is gone.
+    fn replace(&mut self, pid: u32) {
+        let owned = self.owned_pid() == Some(pid);
+        let owner = prx::daemon::pid_file_owner(&prx::paths::daemon_pid_file()) == Some(pid);
+        if !owned && !owner {
+            eprintln!("prx-menubar: pid {pid} is not the daemon of this data dir; not signalling");
+            return;
+        }
+        self.replacing = Some(pid);
+        self.set_state(DaemonState::Unmanaged);
+        signal(pid, libc::SIGTERM);
+    }
+
+    /// Manual "Restart daemon".
+    fn restart_now(&mut self) {
+        self.policy.reset();
+        self.health.reset();
+        self.restart_at = None;
+        let running = self
+            .owned_pid()
+            .or_else(|| prx::daemon::pid_file_owner(&prx::paths::daemon_pid_file()));
+        match running {
+            Some(pid) => {
+                eprintln!("prx-menubar: restart requested; stopping daemon pid {pid}");
+                self.replace(pid);
+            }
+            None => self.attach_or_spawn(),
+        }
+    }
+
+    fn exited(&mut self, pid: u32) {
         if self.owned_pid() != Some(pid) {
             return;
         }
         self.set_owned(None);
-        if success {
-            eprintln!("prx-menubar: daemon pid {pid} exited cleanly; not restarting");
-            // The pid-file guard's loser also exits cleanly: attach then.
-            if other_daemon_alive(Some(pid)) {
-                self.set_state(DaemonState::Unmanaged);
-            } else {
-                self.set_state(DaemonState::Stopped { gave_up: false });
-            }
+        self.ready_wait = None;
+        if self.replacing == Some(pid) {
+            self.replacing = None;
+            eprintln!("prx-menubar: replaced daemon pid {pid} exited; starting a fresh one");
+            self.attach_or_spawn();
             return;
         }
         if other_daemon_alive(Some(pid)) {
@@ -288,6 +541,14 @@ impl Worker {
                 "prx-menubar: daemon pid {pid} exited; another daemon is running — attaching"
             );
             self.set_state(DaemonState::Unmanaged);
+            self.schedule_watch();
+            return;
+        }
+        if stop_requested() {
+            eprintln!(
+                "prx-menubar: daemon pid {pid} was stopped with `prx daemon stop`; not restarting"
+            );
+            self.set_state(DaemonState::Stopped { gave_up: false });
             return;
         }
         eprintln!("prx-menubar: daemon pid {pid} exited unexpectedly");
@@ -325,7 +586,7 @@ impl Worker {
         let deadline = Instant::now() + STOP_GRACE;
         while let Some(left) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(left) {
-                Ok(Cmd::Exited { pid: exited, .. }) if exited == pid => {
+                Ok(Cmd::Exited { pid: exited }) if exited == pid => {
                     eprintln!("prx-menubar: owned daemon pid {pid} stopped");
                     self.set_owned(None);
                     return;
@@ -338,6 +599,22 @@ impl Worker {
             "prx-menubar: daemon pid {pid} still shutting down after {STOP_GRACE:?}; leaving it"
         );
     }
+}
+
+/// A spawned daemon is ready once it answers discovery with its pid, or —
+/// what `prx daemon start` waits for — its pid file names it and its IPC
+/// token was written after the spawn.
+fn daemon_ready(pid: u32, spawned_at: SystemTime, ask: impl Fn() -> Option<Answer>) -> bool {
+    let claimed = prx::daemon::read_pid(&prx::paths::daemon_pid_file()) == Some(pid);
+    let token_fresh = std::fs::metadata(prx::paths::daemon_token_file())
+        .and_then(|m| m.modified())
+        .is_ok_and(|at| at >= spawned_at - Duration::from_secs(1));
+    (claimed && token_fresh) || ask().is_some_and(|answer| answer.pid == pid)
+}
+
+/// `prx daemon stop` stopped the last daemon on purpose.
+fn stop_requested() -> bool {
+    prx::paths::daemon_stop_marker().exists()
 }
 
 /// The bundled CLI/daemon: PRX.app's `Contents/Helpers/prx` when running
@@ -390,6 +667,9 @@ fn spawn_daemon(prx: &Path) -> std::io::Result<std::process::Child> {
         .args(["daemon", "start", "--foreground"])
         .env("PATH", crate::shellenv::login_path())
         .env("PRX_DAEMON_CHILD", "1")
+        // This app restarts the daemon when it exits non-zero, so the
+        // daemon may exit for a fresh start (see `prx::health`).
+        .env(prx::daemon::SUPERVISED_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr);
@@ -426,8 +706,29 @@ fn other_daemon_alive(except: Option<u32>) -> bool {
         return false;
     };
     runtime
-        .block_on(prx::ipc::DaemonClient::discover_as_menubar())
+        .block_on(async {
+            tokio::time::timeout(PROBE_TIMEOUT, prx::ipc::DaemonClient::discover()).await
+        })
+        .ok()
+        .flatten()
         .is_some()
+}
+
+/// The production `/status` probe (bounded by [`PROBE_TIMEOUT`]).
+fn ask_daemon() -> Option<Answer> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .ok()?;
+    runtime.block_on(async {
+        tokio::time::timeout(PROBE_TIMEOUT, async {
+            let client = prx::ipc::DaemonClient::discover().await?;
+            client.get_status().await.ok().map(|s| Answer::of(&s))
+        })
+        .await
+        .ok()
+        .flatten()
+    })
 }
 
 #[cfg(test)]
@@ -444,6 +745,203 @@ fn signal(pid: u32, sig: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a fake daemon does to look ready, as the real one does once
+    /// its IPC API is bound: claim the pid file, then publish a token.
+    const FAKE_READY: &str = "echo $$ > \"$PRX_DATA_DIR/daemon.pid\"\n\
+                              echo token > \"$PRX_DATA_DIR/daemon.token\"\n";
+
+    #[test]
+    fn health_replacements_back_off_from_thirty_minutes_to_four_hours() {
+        let mut policy = HealthPolicy::default();
+        let t0 = Instant::now();
+        assert!(policy.allow(t0));
+        assert!(!policy.allow(t0 + Duration::from_secs(29 * 60)));
+        assert!(policy.allow(t0 + HEALTH_RESTART_GAP));
+        // The next gap is an hour, then two, then four, and stays there.
+        let t1 = t0 + HEALTH_RESTART_GAP;
+        assert!(!policy.allow(t1 + Duration::from_secs(59 * 60)));
+        assert!(policy.allow(t1 + Duration::from_secs(60 * 60)));
+        let mut at = t1 + Duration::from_secs(60 * 60);
+        for gap_hours in [2, 4, 4, 4] {
+            let gap = Duration::from_secs(gap_hours * 3600);
+            assert!(!policy.allow(at + gap - Duration::from_secs(1)));
+            at += gap;
+            assert!(policy.allow(at));
+        }
+        // Healthy again: the next failure may be handled at once.
+        policy.reset();
+        assert!(policy.allow(at + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn answers_are_healthy_only_when_every_repo_synced() {
+        use prx::health::RepoPollHealth;
+        let mut status: prx::ipc::StatusResponse = serde_json::from_value(serde_json::json!({
+            "version": "0", "pid": 7, "uptime_seconds": 1, "in_flight": 0,
+            "queue_depth": 0, "last_poll": {}, "last_state_poll": null, "prs": []
+        }))
+        .unwrap();
+        assert!(!Answer::of(&status).healthy, "nothing polled yet");
+        let mut ok = RepoPollHealth::default();
+        ok.record_success(chrono::Utc::now());
+        status.poll_health.insert("org/a".into(), ok);
+        assert!(Answer::of(&status).healthy);
+        let mut bad = RepoPollHealth::default();
+        for _ in 0..3 {
+            bad.record_failure(chrono::Utc::now(), "tls: bad certificate");
+        }
+        status.poll_health.insert("org/b".into(), bad);
+        status.restart_recommended = true;
+        let answer = Answer::of(&status);
+        assert!(!answer.healthy && answer.restart_recommended);
+        assert_eq!(answer.pid, 7);
+    }
+
+    /// A fake daemon this test starts itself (as if the CLI or an earlier
+    /// app had): it claims the pid file, exits 0 on SIGTERM, and is reaped
+    /// by a thread so a dead one never lingers as a zombie.
+    fn external_daemon(dir: &Path) -> u32 {
+        let fake = dir.join("external-prx");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\n{FAKE_READY}trap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = Command::new(&fake).spawn().unwrap();
+        let pid = child.id();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while prx::daemon::pid_file_owner(&prx::paths::daemon_pid_file()) != Some(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the external daemon claims the pid file"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pid
+    }
+
+    fn fake_prx(dir: &Path) -> PathBuf {
+        let fake = dir.join("prx");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\n{FAKE_READY}trap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n"),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    fn wait_state(rx: &Receiver<DaemonState>, want: impl Fn(&DaemonState) -> bool) -> DaemonState {
+        loop {
+            let state = rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("state change");
+            if want(&state) {
+                return state;
+            }
+        }
+    }
+
+    /// The first-launch bug: an app that attached to a daemon (one still
+    /// shutting down, or started elsewhere) never looked again, so when it
+    /// exited the menu sat at "Daemon offline" until the user clicked Start.
+    /// Now the app notices and starts its own.
+    #[test]
+    fn an_adopted_daemon_that_goes_away_is_replaced() {
+        let dir = sandbox("adopted");
+        in_sandbox(&dir.clone(), move || {
+            let external = external_daemon(&dir);
+            let (tx, rx) = mpsc::channel();
+            let supervisor = Supervisor::spawn(Some(fake_prx(&dir)), move |s| {
+                let _ = tx.send(s);
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            signal(external, libc::SIGKILL);
+            let restarting = wait_state(&rx, |s| !matches!(s, DaemonState::Unmanaged));
+            assert!(
+                matches!(restarting, DaemonState::Restarting { failures: 1, .. }),
+                "{restarting:?}"
+            );
+            let DaemonState::Running { pid } =
+                wait_state(&rx, |s| matches!(s, DaemonState::Running { .. }))
+            else {
+                unreachable!()
+            };
+            assert_ne!(pid, external);
+            supervisor.shutdown(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// `prx daemon stop` is respected: no restart, "Daemon stopped".
+    #[test]
+    fn a_deliberately_stopped_daemon_is_not_restarted() {
+        let dir = sandbox("deliberate");
+        in_sandbox(&dir.clone(), move || {
+            let external = external_daemon(&dir);
+            let (tx, rx) = mpsc::channel();
+            let supervisor = Supervisor::spawn(Some(fake_prx(&dir)), move |s| {
+                let _ = tx.send(s);
+            });
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::write(prx::paths::daemon_stop_marker(), format!("{external}\n")).unwrap();
+            signal(external, libc::SIGTERM);
+            assert_eq!(
+                wait_state(&rx, |_| true),
+                DaemonState::Stopped { gave_up: false }
+            );
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(6)).ok(),
+                None,
+                "nothing is started"
+            );
+            // "Start daemon" starts one, and clears the marker.
+            supervisor.start_daemon();
+            wait_state(&rx, |s| matches!(s, DaemonState::Running { .. }));
+            assert!(!prx::paths::daemon_stop_marker().exists());
+            supervisor.shutdown(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The incident: an orphaned daemon that cannot reach GitHub reports
+    /// `restart_recommended`; the app stops it and starts a fresh one, and
+    /// (the health gap keeps it from doing so again soon).
+    #[test]
+    fn a_daemon_that_recommends_a_restart_is_replaced() {
+        let dir = sandbox("unhealthy");
+        in_sandbox(&dir.clone(), move || {
+            let external = external_daemon(&dir);
+            let ask = move || {
+                process_alive(external).then_some(Answer {
+                    pid: external,
+                    restart_recommended: true,
+                    healthy: false,
+                })
+            };
+            let (tx, rx) = mpsc::channel();
+            let supervisor =
+                Supervisor::spawn_with(Some(fake_prx(&dir)), Box::new(ask), move |s| {
+                    let _ = tx.send(s);
+                });
+            let DaemonState::Running { pid } =
+                wait_state(&rx, |s| matches!(s, DaemonState::Running { .. }))
+            else {
+                unreachable!()
+            };
+            assert_ne!(pid, external);
+            assert!(!process_alive(external), "the unhealthy daemon was stopped");
+            supervisor.shutdown(true);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 
     #[test]
     fn backoff_doubles_from_one_second() {
@@ -552,7 +1050,8 @@ mod tests {
             "#!/bin/sh\n\
              [ -f \"$PRX_CONFIG\" ] || { echo 'config file not found' >&2; exit 1; }\n\
              grep -q '^repos:' \"$PRX_CONFIG\" || { echo 'failed to parse config' >&2; exit 1; }\n\
-             trap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n",
+             {FAKE_READY}trap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n"
+                .replace("{FAKE_READY}", FAKE_READY),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -666,7 +1165,7 @@ mod tests {
         let fake = dir.join("prx");
         std::fs::write(
             &fake,
-            "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n",
+            format!("#!/bin/sh\n{FAKE_READY}trap 'exit 0' TERM\nwhile :; do sleep 0.05; done\n"),
         )
         .unwrap();
         use std::os::unix::fs::PermissionsExt;

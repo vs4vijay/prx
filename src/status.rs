@@ -28,6 +28,13 @@ pub struct StatusEntry {
     pub icon: String,
     pub state: PrState,
     pub skip_reason: Option<SkipReason>,
+    /// Why prx is not reviewing this PR, in a few words
+    /// ([`PrRecord::skip_text`]): `draft`, `author dependabot[bot]
+    /// excluded`, `snoozed until …`, `ignored`, or the size against the cap
+    /// (`2,140 lines changed (limit 1,500)`). Absent when nothing holds the
+    /// PR back, and from older daemons' payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_detail: Option<String>,
     pub title: String,
     pub author: String,
     pub head_branch: String,
@@ -331,6 +338,7 @@ pub fn render_entries(
                 icon: icon_for(rec, cooldown, now).to_string(),
                 state: rec.state,
                 skip_reason: rec.skip_reason,
+                skip_detail: rec.skip_text(),
                 title: rec.title.clone(),
                 author: rec.author.clone(),
                 head_branch: rec.head_branch.clone(),
@@ -398,8 +406,8 @@ fn summary_line(rec: &PrRecord, cooldown: &Cooldown, now: DateTime<Utc>) -> Stri
             // A14: the cap is the overriding fact — nothing will review this
             // PR until its diff shrinks, so lead with it (the table column is
             // narrow and would truncate a trailing note).
-            if rec.diff_too_large {
-                return "diff too large \u{2014} review skipped".to_string();
+            if let Some(why) = rec.skip_text() {
+                return format!("Skipped \u{2014} {why}");
             }
             match machine::cooldown_remaining(rec, cooldown, now) {
                 Some(remaining) => {
@@ -428,17 +436,18 @@ fn summary_line(rec: &PrRecord, cooldown: &Cooldown, now: DateTime<Utc>) -> Stri
                 base
             }
         }
-        PrState::Skipped => match rec.skip_reason {
-            Some(SkipReason::Draft) => "skipped: draft".to_string(),
-            Some(SkipReason::Config) => "skipped: config".to_string(),
-            Some(SkipReason::Snoozed) => match (rec.snooze_until, rec.snooze_until_push) {
-                (Some(until), _) => format!("snoozed until {}", until.format("%Y-%m-%d %H:%M UTC")),
-                (None, true) => "snoozed until next push".to_string(),
-                (None, false) => "snoozed".to_string(),
-            },
-            Some(SkipReason::Ignored) => "ignored".to_string(),
-            None => "skipped".to_string(),
-        },
+        // Snoozed and ignored read as what they are; the rule-based skips
+        // say which rule (`Skipped — draft`, `Skipped — label wip
+        // excluded`).
+        PrState::Skipped => {
+            let why = rec.skip_text().unwrap_or_else(|| "skipped".to_string());
+            match rec.skip_reason {
+                Some(SkipReason::Draft) | Some(SkipReason::Config) => {
+                    format!("Skipped \u{2014} {why}")
+                }
+                _ => why,
+            }
+        }
         PrState::Merged => "merged".to_string(),
         PrState::Closed => "closed".to_string(),
     }
@@ -573,8 +582,11 @@ mod tests {
             blocking_count: 0,
             nit_count: 0,
             review_session: None,
+            review_session_info: None,
+            last_manifest: None,
             review_attempts: 0,
             diff_too_large: false,
+            skip_detail: None,
             human_approved_at: None,
             exec_summary: None,
             brief: None,
@@ -947,13 +959,22 @@ mod tests {
                 "draft",
                 skipped(Some(SkipReason::Draft)),
                 "\u{1f6ab}",
-                "skipped: draft",
+                "Skipped \u{2014} draft",
             ),
             (
-                "config",
+                "config, no detail recorded",
                 skipped(Some(SkipReason::Config)),
                 "\u{1f6ab}",
-                "skipped: config",
+                "Skipped \u{2014} skip rule",
+            ),
+            (
+                "config with the matched rule",
+                PrRecord {
+                    skip_detail: Some("author dependabot[bot] excluded".into()),
+                    ..skipped(Some(SkipReason::Config))
+                },
+                "\u{1f6ab}",
+                "Skipped \u{2014} author dependabot[bot] excluded",
             ),
             (
                 "snoozed until a time",
@@ -1061,8 +1082,18 @@ mod tests {
         let mut pending = record("o/a", 1, "2026-09-05T11:45:00Z", PrState::Pending);
         pending.diff_too_large = true;
         assert_eq!(
-            row_at(pending, NOW).summary,
-            "diff too large \u{2014} review skipped"
+            row_at(pending.clone(), NOW).summary,
+            "Skipped \u{2014} diff too large"
+        );
+        pending.skip_detail = Some("2,140 lines changed (limit 1,500)".into());
+        let row = row_at(pending, NOW);
+        assert_eq!(
+            row.summary,
+            "Skipped \u{2014} 2,140 lines changed (limit 1,500)"
+        );
+        assert_eq!(
+            row.skip_detail.as_deref(),
+            Some("2,140 lines changed (limit 1,500)")
         );
     }
 

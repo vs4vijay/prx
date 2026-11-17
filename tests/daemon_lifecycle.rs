@@ -238,6 +238,32 @@ fn daemon_start_status_stop_roundtrip() {
     assert!(stdout_of(&out).contains("daemon not running"));
 }
 
+/// `prx daemon stop` leaves `daemon.stop-requested` behind, which tells
+/// PRX.app the stop was deliberate (no automatic restart); the next daemon
+/// start clears it.
+#[test]
+fn daemon_stop_leaves_a_stop_marker_that_the_next_start_clears() {
+    let mut env = Env::new("lc-stop-marker", false);
+    let marker = env.data_dir.child("daemon.stop-requested");
+    let out = env.run(&["daemon", "start"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    env.mark_running();
+    assert!(!marker.exists());
+
+    let out = env.run(&["daemon", "stop"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    env.mark_stopped();
+    assert!(marker.exists(), "a deliberate stop is marked");
+
+    let out = env.run(&["daemon", "start"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    env.mark_running();
+    assert!(!marker.exists(), "a started daemon clears the marker");
+    let out = env.run(&["daemon", "stop"], &[]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    env.mark_stopped();
+}
+
 #[test]
 fn daemon_start_is_idempotent_and_single_instance() {
     let mut env = Env::new("lc-single", false);
@@ -1505,4 +1531,114 @@ fn cli_commands_do_not_mute_the_daemons_banners() {
             .any(|l| l.contains("org/one#1 review passed: no blocking issues")),
         "the daemon must raise the review banner itself: {lines:?}"
     );
+}
+
+/// An IPC client for the detached daemon of `env` (port and token from its
+/// data dir; no process env involved, so tests stay parallel-safe).
+fn ipc_client(env: &Env) -> prx::ipc::DaemonClient {
+    let read = |name: &str| {
+        std::fs::read_to_string(env.data_dir.child(name))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .trim()
+            .to_string()
+    };
+    prx::ipc::DaemonClient::with_base(
+        format!("http://127.0.0.1:{}", read("daemon.port")),
+        read("daemon.token"),
+    )
+}
+
+/// A config change reaches a running daemon at once, whichever way it is
+/// made, and bumps the config revision clients watch: `PUT /config` is
+/// applied before it answers; a hand edit is picked up by the watcher
+/// within about a second (a newly watched repo is polled right away, not on
+/// the next timer); `prx config set` nudges the daemon and reports the
+/// outcome, including a setting that needs a restart; a broken hand edit
+/// is rejected by `POST /config/reload` and keeps the revision.
+#[test]
+fn config_changes_reach_the_running_daemon_promptly() {
+    let mut env = Env::new("lc-reload", false);
+    write_list_fixture(
+        env.gh_dir.path(),
+        "org/two",
+        &[pr_json(5, "Two", "bob", "f/two", "bbbb", false, OLD)],
+    );
+    start_daemon(&mut env, &[]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let client = ipc_client(&env);
+    let status = || runtime.block_on(client.get_status()).expect("GET /status");
+    let first = status()
+        .config_state
+        .config_revision
+        .expect("the daemon reports a config revision");
+
+    // 1. IPC write: applied before the answer.
+    let mut config = runtime.block_on(client.get_config()).unwrap().raw;
+    config.defaults.review_mode = prx::config::ReviewMode::Monitor;
+    let written = runtime.block_on(client.put_config(&config)).unwrap();
+    assert_eq!(written.config_state.config_revision, Some(first + 1));
+    let now = status();
+    assert_eq!(now.review_mode, prx::config::ReviewMode::Monitor);
+    assert_eq!(now.config_state.config_revision, Some(first + 1));
+    assert_eq!(
+        runtime
+            .block_on(client.get_config())
+            .unwrap()
+            .config_state
+            .config_revision,
+        Some(first + 1)
+    );
+
+    // 2. Hand edit: a new repo, polled within seconds (the default poll
+    // interval is minutes; the reload wakes the scheduler).
+    let mut edited = prx::config::Config::load(&env.config).unwrap();
+    edited.repos.push(prx::config::RepoConfig {
+        name: "org/two".into(),
+        ..Default::default()
+    });
+    edited.save(&env.config).unwrap();
+    wait_for(
+        || {
+            let now = status();
+            now.config_state.config_revision == Some(first + 2)
+                && now.prs.iter().any(|p| p.key == "org/two#5")
+        },
+        Duration::from_secs(10),
+        "the hand edit to apply and org/two to be polled",
+    );
+
+    // 3. `prx config set` with a daemon: confirmed on stderr, and a
+    // restart-only key is called out.
+    let out = env.run(
+        &["config", "set", "defaults.max_concurrent_reviews", "3"],
+        &[],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let err = stderr_of(&out);
+    assert!(err.contains("the running daemon"), "{err}");
+    assert!(
+        err.contains("max_concurrent_reviews applies after a daemon restart"),
+        "{err}"
+    );
+    let now = status();
+    assert_eq!(now.config_state.config_revision, Some(first + 3));
+    assert_eq!(
+        now.config_state.restart_required,
+        ["max_concurrent_reviews"]
+    );
+
+    // 4. A broken hand edit: rejected, last-good config and revision kept.
+    write_file(&env.config, "defaults: [broken\n");
+    let reload = runtime.block_on(client.reload_config()).unwrap();
+    assert_eq!(reload.outcome, prx::ipc::ConfigReloadOutcome::Rejected);
+    assert!(reload.error.is_some());
+    assert_eq!(reload.config_state.config_revision, Some(first + 3));
+    let now = status();
+    assert!(now.config_error.is_some());
+    assert_eq!(now.review_mode, prx::config::ReviewMode::Monitor);
+
+    stop_daemon(&mut env);
 }

@@ -507,7 +507,8 @@ fn status_json_is_the_bare_entry_array() {
     assert_eq!(draft["state"], "skipped");
     assert_eq!(draft["skip_reason"], "draft");
     assert_eq!(draft["is_draft"], true);
-    assert_eq!(draft["summary"], "skipped: draft");
+    assert_eq!(draft["summary"], "Skipped \u{2014} draft");
+    assert_eq!(draft["skip_detail"], "draft");
 
     // The same payload type the thin client reads from the daemon.
     let typed: Vec<prx::status::StatusEntry> = serde_json::from_str(&stdout).unwrap();

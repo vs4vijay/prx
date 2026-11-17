@@ -197,3 +197,20 @@ test("in the window the schema is one frozen global", () => {
   assert.equal(schema.FIELDS.length, S.FIELDS.length);
   assert.deepEqual(plain(schema.navGroups().map((g) => g.pages.length)), [4, 10]);
 });
+
+test("the PR details page: hidden from the sidebar, opened at a validated PR key", () => {
+  assert.equal(S.pageGroup("pr"), "overview");
+  assert.equal(S.pageFromHash("#page=pr&pr=acme%2Fapi%2342"), "pr");
+  assert.ok(!S.navGroups().some((g) => g.pages.some((p) => p.id === "pr")));
+  assert.equal(S.navPage("pr"), "prs");
+  assert.equal(S.navPage("usage"), "usage");
+  assert.equal(S.navPage("nope"), null);
+  assert.equal(S.prFromHash("#page=pr&pr=acme%2Fapi%2342"), "acme/api#42");
+  assert.equal(S.prFromHash("#pr=a.b_c-d%2Fx.y%231&page=pr"), "a.b_c-d/x.y#1");
+  for (const bad of ["#page=pr", "#page=pr&pr=", "#page=pr&pr=acme%2Fapi", "#page=pr&pr=acme%2Fapi%23x", "#page=pr&pr=%E0%A4%A",
+    "#page=pr&pr=" + encodeURIComponent("a/b#1\");alert(1)//"), "#page=pr&pr=" + encodeURIComponent("a/b/c#1"), "#page=pr&xpr=a%2Fb%231", null]) {
+    assert.equal(S.prFromHash(bad), null, String(bad));
+  }
+  assert.equal(S.prKeyValid("acme/api#42"), true);
+  assert.equal(S.prKeyValid(42), false);
+});

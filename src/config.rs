@@ -198,9 +198,77 @@ pub struct AgentConfig {
     /// unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_output: Option<BTreeMap<UsageField, String>>,
+    /// Review Chat (design C3): how to start and reopen an interactive
+    /// session. Unset on an agent whose command is a built-in agent's
+    /// binary, the built-in's templates apply (see [`ChatConfig::for_agent`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<ChatConfig>,
     /// Unknown keys are captured so config rewrites never drop user data.
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// An agent's interactive-session templates (Review Chat, design C3). Each
+/// is an argv appended to the agent's `command`; an empty one means the
+/// agent cannot do that.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatConfig {
+    /// Start a new interactive session. Must contain `{{PROMPT}}` (the chat
+    /// prompt, one argument); may contain `{{SESSION_ID}}`, a UUID prx
+    /// generates and records so the session can be resumed by id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub new_args: Vec<String>,
+    /// Reopen a session by id. Must contain `{{SESSION_ID}}`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resume_args: Vec<String>,
+    /// Reopen the latest session in the chat's directory, for a new chat
+    /// whose id prx could not set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub continue_args: Vec<String>,
+}
+
+impl ChatConfig {
+    /// The chat templates of `agent`: its own `chat`, else those of the
+    /// built-in agent whose binary its command names (basename `claude`,
+    /// `codex`, or `pi`), so an absolute-path override keeps them.
+    pub fn for_agent(agent: &AgentConfig) -> Option<ChatConfig> {
+        if let Some(chat) = &agent.chat {
+            return Some(chat.clone());
+        }
+        let base = Path::new(agent.command.trim())
+            .file_name()
+            .and_then(|n| n.to_str())?
+            .to_string();
+        builtin_agents().remove(&base).and_then(|a| a.chat)
+    }
+
+    /// Validate the templates; `field` (`engines.<name>`) names them.
+    fn validate(&self, field: &str) -> Result<(), ConfigError> {
+        let has = |args: &[String], placeholder: &str| args.iter().any(|a| a.contains(placeholder));
+        if !self.new_args.is_empty() && !has(&self.new_args, "{{PROMPT}}") {
+            return Err(ConfigError::Validation(format!(
+                "{field}.chat.new_args must contain the {{{{PROMPT}}}} placeholder"
+            )));
+        }
+        if !self.resume_args.is_empty() && !has(&self.resume_args, SESSION_ID_PLACEHOLDER) {
+            return Err(ConfigError::Validation(format!(
+                "{field}.chat.resume_args must contain the {SESSION_ID_PLACEHOLDER} placeholder"
+            )));
+        }
+        if has(&self.continue_args, "{{PROMPT}}")
+            || has(&self.continue_args, SESSION_ID_PLACEHOLDER)
+        {
+            return Err(ConfigError::Validation(format!(
+                "{field}.chat.continue_args takes no placeholder"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether any template is set.
+    pub fn is_empty(&self) -> bool {
+        self.new_args.is_empty() && self.resume_args.is_empty() && self.continue_args.is_empty()
+    }
 }
 
 /// Where an agent run reports its session reference (design D3): exactly
@@ -301,6 +369,9 @@ impl EngineConfig {
                         "{field}.resume_args must contain the {SESSION_ID_PLACEHOLDER} placeholder"
                     )));
                 }
+                if let Some(chat) = &agent.chat {
+                    chat.validate(field)?;
+                }
                 for (usage_field, path) in agent.usage_output.iter().flatten() {
                     if !crate::usage::valid_json_path(path) {
                         return Err(ConfigError::Validation(format!(
@@ -316,7 +387,7 @@ impl EngineConfig {
                 Ok(())
             }
             EngineConfig::LlmApi(llm) => {
-                for key in ["resume_args", "session_output"] {
+                for key in ["resume_args", "session_output", "chat"] {
                     if llm.extra.contains_key(key) {
                         return Err(ConfigError::Validation(format!(
                             "{field}.{key} is not supported on llm_api engines: sessions are \
@@ -471,6 +542,9 @@ impl AgentInvocation {
 /// `agent_model`.
 pub const MODEL_PLACEHOLDER: &str = "{{MODEL}}";
 
+/// Placeholder in an agent's argv templates replaced with the prompt.
+pub const PROMPT_PLACEHOLDER: &str = "{{PROMPT}}";
+
 /// Placeholder in an agent's `resume_args` replaced with the retained
 /// session reference (design D3).
 pub const SESSION_ID_PLACEHOLDER: &str = "{{SESSION_ID}}";
@@ -487,6 +561,18 @@ pub fn builtin_agents() -> AgentsMap {
             session_output: None,
             resume_args: Vec::new(),
             usage_output: None,
+            // Review Chat (design C3): `--session-id` creates the session
+            // when missing, so the same flag starts and reopens it.
+            chat: Some(ChatConfig {
+                new_args: vec![
+                    "--session-id".into(),
+                    SESSION_ID_PLACEHOLDER.into(),
+                    "--".into(),
+                    PROMPT_PLACEHOLDER.into(),
+                ],
+                resume_args: vec!["--session-id".into(), SESSION_ID_PLACEHOLDER.into()],
+                continue_args: vec!["--continue".into()],
+            }),
             extra: BTreeMap::new(),
         },
     );
@@ -510,6 +596,18 @@ pub fn builtin_agents() -> AgentsMap {
             }),
             resume_args: vec!["--resume".into(), SESSION_ID_PLACEHOLDER.into()],
             usage_output: None,
+            // Review Chat (design C3): an interactive session with an id
+            // prx chooses; `--resume` reopens it (no skip-permissions: the
+            // human is there to approve tool use).
+            chat: Some(ChatConfig {
+                new_args: vec![
+                    "--session-id".into(),
+                    SESSION_ID_PLACEHOLDER.into(),
+                    PROMPT_PLACEHOLDER.into(),
+                ],
+                resume_args: vec!["--resume".into(), SESSION_ID_PLACEHOLDER.into()],
+                continue_args: vec!["--continue".into()],
+            }),
             extra: BTreeMap::new(),
         },
     );
@@ -529,6 +627,13 @@ pub fn builtin_agents() -> AgentsMap {
             }),
             resume_args: vec!["resume".into(), SESSION_ID_PLACEHOLDER.into()],
             usage_output: None,
+            // Review Chat (design C3): codex cannot take an id up front, so
+            // a new chat is found again as the latest one in its directory.
+            chat: Some(ChatConfig {
+                new_args: vec![PROMPT_PLACEHOLDER.into()],
+                resume_args: vec!["resume".into(), SESSION_ID_PLACEHOLDER.into()],
+                continue_args: vec!["resume".into(), "--last".into()],
+            }),
             extra: BTreeMap::new(),
         },
     );
@@ -2185,7 +2290,11 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
 }
 
 /// [`write_atomic`] with the permission bits the replaced file ends up with.
-fn write_atomic_with_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<(), ConfigError> {
+pub(crate) fn write_atomic_with_mode(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> Result<(), ConfigError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let write_err = |source| ConfigError::Write {

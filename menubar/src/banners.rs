@@ -39,7 +39,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 
@@ -350,13 +349,15 @@ fn load_config_from(path: &Path) -> Config {
 }
 
 /// The notification config as the poller sees it: loaded once, then
-/// re-loaded whenever the config file's (mtime, length) changes, so a
+/// re-loaded whenever the config file's content changes, so a
 /// `defaults.notifications.enabled` / tier edit saved from the settings
 /// window (or by hand) applies on the next poll without restarting the
-/// shell. Stat-only when unchanged.
+/// shell. Change detection hashes the content (not mtime and length: an
+/// edit of the same length within the same second, `Glass` → `Basso`,
+/// would slip past those); the file is small and read once per poll.
 pub struct ConfigSource {
     path: PathBuf,
-    stamp: Option<(Option<SystemTime>, u64)>,
+    stamp: Option<u64>,
     config: Config,
 }
 
@@ -394,9 +395,18 @@ impl Default for ConfigSource {
     }
 }
 
-fn file_stamp(path: &Path) -> Option<(Option<SystemTime>, u64)> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some((meta.modified().ok(), meta.len()))
+fn file_stamp(path: &Path) -> Option<u64> {
+    content_fingerprint(path)
+}
+
+/// A hash of `path`'s content, `None` when it cannot be read. Change
+/// detection only (not security); shared with the poller's config watch.
+pub fn content_fingerprint(path: &Path) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 /// Raise the banners. GUARD: poller thread only (module docs) — this spawns
@@ -953,6 +963,36 @@ mod tests {
         )
         .unwrap();
         assert!(!source.current().defaults.notifications.enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edit that keeps the file's length, written within the same second
+    /// (same mtime on a coarse clock), is still picked up: the source
+    /// compares content, not mtime and length.
+    #[test]
+    fn config_source_sees_a_same_length_edit() {
+        let dir = std::env::temp_dir().join(format!(
+            "prx-menubar-config-same-length-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yml");
+        let sound = |name: &str| {
+            format!("defaults:\n  notifications:\n    sounds:\n      on_new_pr: {name}\n")
+        };
+        std::fs::write(&path, sound("Glass")).unwrap();
+        let mut source = ConfigSource::at(path.clone());
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, sound("Basso")).unwrap();
+        // Pin the mtime back so only the content differs.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(before)
+            .unwrap();
+        let sounds = source.current().defaults.notifications.sounds.clone();
+        assert!(format!("{sounds:?}").contains("Basso"), "{sounds:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

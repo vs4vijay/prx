@@ -92,6 +92,16 @@
     return pr.state === "skipped" && pr.skip_reason ? label + " (" + (SKIP_LABELS[pr.skip_reason] || pr.skip_reason) + ")" : label;
   }
 
+  // Why PRX is not reviewing a PR, in a few words (status `skip_detail`):
+  // the detail itself for a skipped PR ("author dependabot[bot] excluded"),
+  // "Review skipped — …" for one the diff cap held back. "" when nothing
+  // holds it back, and for an older daemon that sends no detail.
+  function skipNote(pr) {
+    const detail = pr && typeof pr.skip_detail === "string" ? pr.skip_detail.trim() : "";
+    if (!detail) return "";
+    return pr.state === "skipped" ? detail : "Review skipped \u2014 " + detail;
+  }
+
   function verdictLabel(verdict) { return verdict ? VERDICT_LABELS[verdict] || verdict : ""; }
   function modeLabel(mode) { return MODE_LABELS[mode] || mode || MODE_LABELS["review comment"]; }
 
@@ -242,7 +252,7 @@
   // The "daemon offline" state every Overview page shows instead of data.
   function offline(UI, retry) {
     return UI.empty("offline", "Daemon offline",
-      "The PRX daemon isn't running, so there is nothing live to show. Start it from the PRX menu bar (Start daemon) or with `prx daemon start`; this page picks it up within a few seconds.",
+      "The PRX daemon isn't running, so there is nothing live to show. PRX starts it on its own, and this page picks it up within a few seconds. If it stays offline, choose Start daemon in the PRX menu bar, or run `prx daemon start`.",
       retry ? [UI.button("Try again", retry, "primary")] : []);
   }
 
@@ -377,15 +387,80 @@
     return { refresh: refresh };
   }
 
+  // A repo's polls count as failing after this many in a row (src/health.rs
+  // `failing_after`); the Dashboard banner and the PR details page agree.
+  const FAILING_AFTER = 3;
+
+  // ---- manual review pre-flight (POST /review/preflight) ------------------
+  // Shared by the Pull requests page and the PR details page: every manual
+  // review there runs the pre-flight and asks before sending `confirm: true`.
+
+  // Whether a pre-flight answer needs the human's confirmation: warnings,
+  // and nothing that blocks the review anyway. `null` (an older daemon)
+  // needs none.
+  function needsConfirmation(preflight) {
+    return !!(preflight && !preflight.blocked && (preflight.warnings || []).length);
+  }
+
+  function groupDigits(n) { return String(Number(n) || 0).replace(/\B(?=(\d{3})+(?!\d))/g, ","); }
+
+  // The confirm box's lines: each warning, then the size when known and
+  // not already said by a too-large warning.
+  function confirmLines(preflight) {
+    const warnings = (preflight && preflight.warnings) || [];
+    const lines = warnings.map(function (w) { return String(w.message || ""); });
+    const size = preflight && preflight.size;
+    if (size && !warnings.some(function (w) { return w.kind === "too_large"; })) {
+      lines.push("Size \u2014 " + groupDigits(size.lines) + " " + (size.lines === 1 ? "line" : "lines") + " in " +
+        groupDigits(size.files_changed) + " " + (size.files_changed === 1 ? "file" : "files"));
+    }
+    return lines;
+  }
+
+  // The confirm box's closing sentence.
+  function confirmCost(preflight) {
+    const skipped = ((preflight && preflight.warnings) || []).some(function (w) { return w.kind === "skipped"; });
+    return "Reviewing it runs the engine and can use many tokens." + (skipped ? " The PR stays skipped for automatic reviews." : "");
+  }
+
+  // The pre-flight, then `send(req)` — or `ask(answer)` when it warns. A
+  // shell or daemon without the pre-flight (bad_request) sends as before.
+  function reviewPreflight(bridge, req, ask, send, fail) {
+    bridge.call("review.preflight", { target: req.target }).then(function (answer) {
+      if (needsConfirmation(answer)) ask(answer);
+      else send(req);
+    }, function (error) {
+      if (error && error.kind === "bad_request") send(req);
+      else fail(error);
+    });
+  }
+
+  // The confirm box (role alertdialog): the warnings, what a review costs,
+  // Cancel and "Review anyway".
+  function confirmBox(UI, answer, onCancel, onConfirm) {
+    const el = UI.el;
+    const title = "Review " + (answer.key || "this PR") + " anyway?";
+    const yes = UI.button("Review anyway", onConfirm, "primary");
+    setTimeout(function () { if (yes.isConnected) yes.focus(); }, 0);
+    return el("div", { class: "confirm-box", role: "alertdialog", "aria-label": title }, [
+      el("p", { class: "confirm-title", text: title }),
+      el("ul", { class: "confirm-lines" }, confirmLines(answer).map(function (line) { return el("li", { text: line }); })),
+      el("p", { class: "confirm-cost", text: confirmCost(answer) }),
+      el("div", { class: "inline" }, [el("span", { class: "spacer" }), UI.button("Cancel", onCancel), yes]),
+    ]);
+  }
+
   const api = {
     GROUPS: GROUPS, STATES: STATES, VERDICT_STATES: VERDICT_STATES, stateOf: stateOf, stateView: stateView, pill: pill,
     usageBreakdown: usageBreakdown, watchesRepos: watchesRepos, isTerminal: isTerminal, readyForApproval: readyForApproval, groupOf: groupOf, groupLabel: groupLabel,
-    needsAttention: needsAttention, stateLabel: stateLabel, verdictLabel: verdictLabel, modeLabel: modeLabel,
+    needsAttention: needsAttention, stateLabel: stateLabel, skipNote: skipNote, verdictLabel: verdictLabel, modeLabel: modeLabel,
     splitKey: splitKey, compareKeys: compareKeys, formatTokens: formatTokens, formatCost: formatCost,
     formatCount: formatCount, shortAge: shortAge, ago: ago, tokenTotal: tokenTotal, hasUsage: hasUsage,
     usageLine: usageLine, entryKey: entryKey, EVENTS: EVENTS, eventLabel: eventLabel, findings: findings, eventSummary: eventSummary, isOffline: isOffline, offline: offline, failure: failure, poller: poller,
     pauseLeft: pauseLeft, pauseState: pauseState, pausePanel: pausePanel,
     PAUSE_CHOICES: PAUSE_CHOICES, pauseErrorText: pauseErrorText, pauseControls: pauseControls,
+    needsConfirmation: needsConfirmation, confirmLines: confirmLines, confirmCost: confirmCost,
+    reviewPreflight: reviewPreflight, confirmBox: confirmBox, FAILING_AFTER: FAILING_AFTER,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.prxOverview = Object.freeze(api);

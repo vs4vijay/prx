@@ -315,7 +315,7 @@ test("offline at start: the offline page, then the form once the daemon is back"
   let up = false;
   const w = await X.open("review", { "config.get": () => { if (!up) X.offline(); return X.config(); } });
   assert.equal(w.page.querySelector(".empty-title").textContent, "The PRX daemon isn't running");
-  assert.match(w.page.querySelector(".empty-text").textContent, /Start it from the PRX menu bar \(Start daemon\) or with prx daemon start/);
+  assert.match(w.page.querySelector(".empty-text").textContent, /PRX starts it on its own.*choose Start daemon in the PRX menu bar, or run prx daemon start/);
   assert.equal(w.byId("daemon").textContent, "Daemon not running");
   assert.equal(w.page.querySelectorAll("input, textarea").length, 0);
   assert.deepEqual(bar(w), [true, true, false]);
@@ -487,4 +487,80 @@ test("installed browsers are listed once per window, with the app paths the conf
   assert.equal(w.calls("browsers.list").length, 1);
   // Agent discovery, by contrast, is repeated after a save.
   assert.equal(w.calls("discover.agents").length, 2);
+});
+
+test("a config change made elsewhere re-loads a clean form at once, and skips the revision it already shows", async () => {
+  let interval = 10;
+  let revision = 4;
+  const w = await X.open("general", { "config.get": () => X.config((c) => { c.raw.defaults.poll_interval_minutes = interval; c.config_revision = revision; }) });
+  assert.equal(poll(w).value, "10");
+  // The host reports the revision this window already loaded: no read.
+  w.window.prxApp.configChanged(4);
+  await w.settle();
+  assert.equal(w.calls("config.get").length, 1);
+  // `prx config set` (or a hand edit) made revision 5.
+  interval = 25;
+  revision = 5;
+  w.window.prxApp.configChanged(5);
+  await w.settle();
+  assert.equal(w.calls("config.get").length, 2);
+  assert.equal(poll(w).value, "25");
+  assert.equal(w.window.prxApp.app.isDirty(), false);
+  assert.equal(w.byId("save-note").hidden, true);
+});
+
+test("a config change made elsewhere never replaces unsaved edits; it is noted until Revert", async () => {
+  let interval = 10;
+  const w = await X.open("general", { "config.get": () => X.config((c) => { c.raw.defaults.poll_interval_minutes = interval; c.config_revision = interval; }) });
+  X.type(w, poll(w), "5");
+  interval = 30;
+  w.window.prxApp.configChanged(30);
+  await w.settle();
+  assert.equal(w.calls("config.get").length, 1, "the edited form is not re-read");
+  assert.equal(poll(w).value, "5");
+  assert.equal(w.byId("save-note").hidden, false);
+  assert.equal(w.byId("save-note").textContent, "The config changed outside this window. Revert loads it and drops your edits; Save replaces it.");
+  w.fire(w.byId("revert"), "click");
+  await w.settle();
+  assert.equal(poll(w).value, "30");
+  assert.equal(w.byId("save-note").hidden, true);
+});
+
+test("a config change refreshes the Overview page in view", async () => {
+  const w = await X.open("dashboard");
+  const before = w.calls("status.get").length;
+  w.window.prxApp.configChanged(9);
+  await w.settle();
+  assert.equal(w.calls("status.get").length, before + 1);
+});
+
+test("a setting that needs a daemon restart says so after the save and in the save bar", async () => {
+  let restart = [];
+  const daemon = X.storing((c) => { if (restart.length) c.restart_required = restart; }, {
+    "config.put": (p) => { restart = ["max_concurrent_reviews"]; return { ok: true, added: [], removed: [], config_revision: 2, restart_required: restart }; },
+  });
+  const w = await X.open("general", daemon.handlers);
+  assert.equal(w.byId("save-note").hidden, true);
+  X.type(w, X.field(w, "defaults.max_concurrent_reviews"), "4");
+  await X.save(w);
+  assert.deepEqual(status(w), ["status ok", "Saved and applied. Restart the daemon to apply max_concurrent_reviews"]);
+  assert.equal(w.byId("save-note").hidden, false);
+  assert.equal(w.byId("save-note").textContent,
+    "max_concurrent_reviews applies after the daemon restarts: choose Restart daemon in the PRX menu, or run prx daemon stop and then prx daemon start.");
+  assert.deepEqual(X.markupIn(w.byId("save-note")), []);
+});
+
+test("offline at start: the window's poll loads the form once the daemon answers", async () => {
+  let up = false;
+  const w = await X.open("review", { "config.get": () => { if (!up) X.offline(); return X.config(); } });
+  assert.equal(w.page.querySelector(".empty-title").textContent, "The PRX daemon isn't running");
+  const tick = w.intervals.find((i) => i.ms === 10000).run;
+  tick();
+  await w.settle();
+  assert.equal(w.page.querySelector(".empty-title").textContent, "The PRX daemon isn't running");
+  up = true;
+  tick();
+  await w.settle();
+  assert.equal(w.page.querySelector("h1").textContent, "Review");
+  assert.equal(w.byId("daemon").textContent, "Daemon running");
 });

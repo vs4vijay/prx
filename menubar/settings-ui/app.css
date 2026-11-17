@@ -959,6 +959,11 @@ button.row-open:hover { color: var(--accent-text); text-decoration: underline; t
 .pr-facts { margin: 0; color: var(--muted); font-size: var(--text-caption); }
 .prompt-form { display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-5) var(--space-6); border-radius: var(--radius-md); background: var(--fill); max-width: 640px; }
 .prompt-form textarea { width: 100%; }
+.confirm-box { display: flex; flex-direction: column; gap: var(--space-4); padding: var(--space-5) var(--space-6); border-radius: var(--radius-md); background: var(--fill); max-width: 640px; }
+.confirm-box .confirm-title { font-weight: 600; margin: 0; }
+.confirm-box .confirm-lines { margin: 0; padding-left: var(--space-7); }
+.confirm-box .confirm-cost { margin: 0; color: var(--muted); font-size: var(--text-caption); }
+.confirm-box .inline { display: flex; align-items: center; gap: var(--space-7); flex-wrap: wrap; }
 .prompt-form .inline { display: flex; align-items: center; gap: var(--space-7); flex-wrap: wrap; }
 
 /* Row action menu (pages-prs.js): one ⋯ button per row. */
@@ -1043,6 +1048,34 @@ button.row-open:hover { color: var(--accent-text); text-decoration: underline; t
 .attention-item { display: flex; flex-direction: column; }
 .attention-item + .attention-item { border-top: 1px solid var(--line); }
 .attention-item .brief-card { margin: 0 var(--space-7) var(--space-5); }
+
+/* ------------------------------------------- PR details page (pages-pr.js) */
+
+.back-link { align-self: flex-start; margin: 0 0 var(--space-4) calc(-1 * var(--space-2)); font-size: var(--text-caption); }
+.pr-page { display: flex; flex-direction: column; gap: var(--space-8); }
+#page[data-page="pr"] > * { max-width: 760px; }
+.pr-page > section { margin-top: 0; }
+.pr-head { display: flex; flex-direction: column; gap: var(--space-4); }
+.pr-head-meta { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-3) var(--space-5); margin: 0; color: var(--muted); font-size: var(--text-caption); }
+.pr-head-meta .pr-skip { color: var(--fg); font-weight: var(--weight-medium); }
+.pr-title { overflow-wrap: anywhere; text-wrap: pretty; user-select: text; -webkit-user-select: text; }
+.pr-actions { display: flex; flex-direction: column; gap: var(--space-3); }
+.pr-actions-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-4); }
+.pr-actions-row .btn .icon { width: 14px; height: 14px; margin-right: var(--space-3); }
+/* The brief is the page's main text: reading size, measure and leading. */
+.pr-page .brief-card { padding: var(--space-8) var(--space-10); gap: var(--space-5); }
+.pr-page .brief-head h3, .review-card .brief-head h3 { font-size: var(--text-title-3); }
+.pr-page .brief-text { font-size: 15px; line-height: 1.6; max-width: 68ch; user-select: text; -webkit-user-select: text; cursor: text; }
+.review-card { display: flex; flex-direction: column; gap: var(--space-5); padding: var(--space-8) var(--space-10); border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--panel); }
+.review-verdict { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-5); }
+.review-findings { font-weight: var(--weight-medium); }
+.review-summary { margin: 0; line-height: var(--leading); overflow-wrap: anywhere; user-select: text; -webkit-user-select: text; }
+.review-findings-list h4 { margin: 0 0 var(--space-3); font-size: var(--text-caption); font-weight: var(--weight-semibold); color: var(--muted); }
+.review-findings-list ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: var(--space-3); max-width: 68ch; }
+.review-findings-list li { line-height: var(--leading); overflow-wrap: anywhere; white-space: pre-line; user-select: text; -webkit-user-select: text; }
+.pr-facts-list { display: grid; grid-template-columns: max-content 1fr; gap: var(--space-3) var(--space-8); margin: 0; font-size: var(--text-caption); }
+.pr-facts-list dt { color: var(--muted); }
+.pr-facts-list dd { margin: 0; overflow-wrap: anywhere; }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }

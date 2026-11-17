@@ -118,13 +118,28 @@ impl Stub {
                     .unwrap()
                     .iter()
                     .rev()
-                    .find(|(prefix, _, _)| request.line.starts_with(prefix.as_str()))
+                    .find(|(prefix, _, _)| {
+                        // A route prefix matches its own path only, with or
+                        // without a query (`POST /review` is not
+                        // `POST /review/preflight`).
+                        request
+                            .line
+                            .strip_prefix(prefix.as_str())
+                            .is_some_and(|rest| {
+                                rest.is_empty() || rest.starts_with('?') || rest.starts_with(' ')
+                            })
+                    })
                     .map(|(_, status, body)| (*status, body.clone()));
                 let (status, reply) = match scripted {
                     Some(reply) => reply,
                     None if request.line.starts_with("GET /status") => {
                         (200, status_body(json!({})))
                     }
+                    // Unscripted, the pre-flight finds nothing to confirm.
+                    None if request.line == "POST /review/preflight" => (
+                        200,
+                        json!({ "key": "org/one#1", "warnings": [] }).to_string(),
+                    ),
                     None => (404, r#"{"error":"no such route in the stub"}"#.to_string()),
                 };
                 log.lock().unwrap().push(request);
@@ -166,13 +181,14 @@ impl Stub {
         )
     }
 
-    /// Everything received so far except the discovery probes.
+    /// Everything received so far except the discovery probes and the
+    /// review pre-flights.
     fn requests(&self) -> Vec<Request> {
         self.seen
             .lock()
             .unwrap()
             .iter()
-            .filter(|r| r.line != "GET /status")
+            .filter(|r| r.line != "GET /status" && r.line != "POST /review/preflight")
             .cloned()
             .collect()
     }
@@ -344,6 +360,57 @@ fn status_warns_when_the_daemon_reports_a_config_error() {
     assert!(!stderr_of(&out).contains("warning"), "{}", stderr_of(&out));
 }
 
+/// Polls that keep failing make the table stale: `prx status` says so on
+/// stderr with the error and the fix, and stdout stays the same.
+#[test]
+fn status_warns_when_polls_keep_failing() {
+    let stub = Stub::start("status-poll-health");
+    let prs = json!([pr_row(
+        "org/one#1",
+        "\u{1f195}",
+        "Add feature",
+        "ready for review"
+    )]);
+    stub.reply("GET /status", 200, status_body(json!({ "prs": prs })));
+    let out = stub.run(&["status"]);
+    let table = ok_stdout(&out);
+    assert!(!stderr_of(&out).contains("warning"), "{}", stderr_of(&out));
+
+    stub.reply(
+        "GET /status",
+        200,
+        status_body(json!({
+            "prs": prs,
+            "poll_health": {
+                "org/one": {
+                    "consecutive_failures": 1100,
+                    "last_error": "tls: failed to verify certificate: x509: OSStatus -26276",
+                    "last_error_at": "2026-11-13T10:00:00Z",
+                    "failing_since": "2026-11-01T10:00:00Z",
+                    "last_success": "2026-11-01T09:45:00Z",
+                    "poll_interval_minutes": 15
+                }
+            },
+            "restart_recommended": true
+        })),
+    );
+    let out = stub.run(&["status"]);
+    assert_eq!(ok_stdout(&out), table);
+    let stderr = stderr_of(&out);
+    assert!(
+        stderr.contains(
+            "warning: GitHub polls are failing for org/one (1100 in a row since 2026-11-01 10:00 UTC; last success"
+        ),
+        "{stderr}"
+    );
+    assert!(stderr.contains("x509: OSStatus -26276"), "{stderr}");
+    assert!(stderr.contains("prx daemon stop"), "{stderr}");
+
+    let out = stub.run(&["status", "--json"]);
+    let entries: Vec<prx::status::StatusEntry> = serde_json::from_str(&ok_stdout(&out)).unwrap();
+    assert_eq!(entries.len(), 1);
+}
+
 // --------------------------------------------------------------- mutations
 
 /// `approve`, `snooze`, `ignore`, and `unignore` post the target as given
@@ -483,6 +550,84 @@ fn review_reports_what_was_queued() {
     assert_eq!(
         ok_stdout(&stub.run(&["review", "--all"])),
         "nothing was enqueued for review\n"
+    );
+}
+
+/// A single-PR review asks the daemon's pre-flight first. With warnings and
+/// no terminal it refuses and sends nothing; `--yes` sends it confirmed
+/// without asking; `--all` never asks.
+#[test]
+fn review_asks_the_preflight_and_confirms_only_with_yes() {
+    let stub = Stub::start("review-preflight");
+    stub.reply("POST /review", 200, json!({ "enqueued": ["org/one#1"] }));
+    stub.reply(
+        "POST /review/preflight",
+        200,
+        json!({
+            "key": "org/one#1",
+            "warnings": [{ "kind": "skipped", "message": "Skipped \u{2014} author dependabot[bot] excluded" }],
+            "size": { "files_changed": 2, "lines": 40, "max_files": 50, "max_lines": 4000 }
+        }),
+    );
+
+    let out = stub.run(&["review", "org/one#1"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    let err = stderr_of(&out);
+    assert!(
+        err.contains("org/one#1 needs your confirmation before review"),
+        "{err}"
+    );
+    assert!(
+        err.contains("- Skipped \u{2014} author dependabot[bot] excluded"),
+        "{err}"
+    );
+    assert!(err.contains("- Size \u{2014} 40 lines in 2 files"), "{err}");
+    assert!(err.contains("rerun with --yes"), "{err}");
+    let seen: Vec<String> = stub
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.line.clone())
+        .collect();
+    assert!(
+        seen.contains(&"POST /review/preflight".to_string()),
+        "{seen:?}"
+    );
+    assert!(stub.requests().is_empty(), "the review was sent");
+    stub.seen.lock().unwrap().clear();
+
+    assert_eq!(
+        ok_stdout(&stub.run(&["review", "org/one#1", "--yes"])),
+        "queued org/one#1 for review (the daemon will run it)\n"
+    );
+    let lines: Vec<String> = stub
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.line.clone())
+        .collect();
+    assert!(
+        !lines.contains(&"POST /review/preflight".to_string()),
+        "{lines:?}"
+    );
+    assert_eq!(
+        stub.body_of(&stub.take_one()),
+        json!({ "key": "org/one#1", "force": true, "confirm": true })
+    );
+
+    ok_stdout(&stub.run(&["review", "--all"]));
+    let lines: Vec<String> = stub
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|r| r.line.clone())
+        .collect();
+    assert!(
+        !lines.contains(&"POST /review/preflight".to_string()),
+        "{lines:?}"
     );
 }
 

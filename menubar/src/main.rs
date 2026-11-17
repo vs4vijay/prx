@@ -50,6 +50,7 @@ mod mainloop;
 mod model;
 mod notify_center;
 mod poller;
+mod review_chat;
 mod review_panel;
 mod settings;
 mod shellenv;
@@ -82,7 +83,7 @@ use icon::{Appearance, IconState};
 use mainloop::{MainThreadSender, Pending};
 use model::{
     ItemKind, MenuModel, ModelItem, PaginationState, Shortcut, Symbol, Tone, QUIT_ID, QUIT_KEEP_ID,
-    SHOW_LOG_ID, START_DAEMON_ID,
+    RESTART_DAEMON_ID, SHOW_LOG_ID, START_DAEMON_ID,
 };
 use poller::{PollOutcome, PollerCommand, PollerHandle, Snapshot};
 use supervisor::{DaemonState, Supervisor};
@@ -108,6 +109,9 @@ enum Msg {
     /// Approve / Block (audit P1): ask first (after the menu closes), then
     /// dispatch the action id.
     Confirm(String, actions::Confirmation),
+    /// A review whose pre-flight warned (skipped, over the diff caps): ask
+    /// first (after the menu closes), then send it confirmed.
+    ConfirmReview(actions::PendingReview),
 }
 
 /// What quitting does to a daemon the app started (task 6.5): "Quit PRX"
@@ -262,6 +266,7 @@ impl App {
             Msg::OpenWindow(page) => self.open_window(&page),
             Msg::Supervisor(state) => self.apply_daemon_state(state),
             Msg::Confirm(id, request) => self.confirm_action(&id, &request),
+            Msg::ConfirmReview(pending) => self.confirm_review(pending),
         }
     }
 
@@ -297,6 +302,12 @@ impl App {
         eprintln!("prx-menubar: {}", self.model.dump().trim_end());
         self.update_icon();
         self.swap_menu();
+        // A config change made anywhere (CLI, editor, another window):
+        // an open window re-loads its form.
+        if let Some(snapshot) = self.snapshot.as_ref().filter(|s| s.config_changed) {
+            self.settings
+                .config_changed(snapshot.status.config_state.config_revision);
+        }
     }
 
     /// Rebuild the model from the last snapshot (offline without one).
@@ -417,6 +428,18 @@ impl App {
         }
     }
 
+    /// Ask before a review the pre-flight warned about; send it with
+    /// `confirm: true` only on "Review anyway".
+    fn confirm_review(&mut self, pending: actions::PendingReview) {
+        let mtm = MainThreadMarker::new().expect("main-loop messages apply on the main thread");
+        if review_panel::confirm(mtm, &pending.confirmation) {
+            self.actions.dispatch_confirmed_review(pending);
+        } else {
+            eprintln!("prx-menubar: review of {} cancelled", pending.target);
+            self.apply_action_message(format!("{}: review not sent", pending.target));
+        }
+    }
+
     /// Show the window on `page` (focus and switch it if open; activate
     /// another process's window if one holds it). Failures become the
     /// message line.
@@ -465,12 +488,30 @@ impl App {
                 Some(supervisor) => supervisor.start_daemon(),
                 None => self.apply_action_message("⚠ no daemon supervisor in this run".into()),
             }
+        } else if id == RESTART_DAEMON_ID {
+            match &self.supervisor {
+                Some(supervisor) => {
+                    supervisor.restart_daemon();
+                    self.apply_action_message("Restarting the daemon\u{2026}".into());
+                }
+                None => self.apply_action_message("⚠ no daemon supervisor in this run".into()),
+            }
         } else if id == SHOW_LOG_ID {
             self.show_log();
         } else if let Some(page) = actions::page_action(id) {
             // Applied from the main-loop queue (after the menu closes), like
             // every other menu rebuild.
             self.sender.send(Msg::Page(page));
+        } else if let Some(key) = actions::details_key(id) {
+            // The PR details page (spec "PR details page"). Reading a PR's
+            // details acknowledges it in the bell, like opening it.
+            if self.bell.acknowledge(key) {
+                eprintln!("prx-menubar: bell: {key} details shown");
+                self.model.bell = self.bell.counts();
+                self.update_icon();
+            }
+            self.sender
+                .send(Msg::OpenWindow(settings::assets::pr_page(key)));
         } else if let Some(page) = actions::window_page(id) {
             // In-process window (no editor launch), opened from the
             // main-loop queue once the menu has closed.
@@ -609,6 +650,7 @@ fn visit_native(
 ///   headline's diagnostics). With key equivalents muda already set both
 ///   masks; without, the base gets an empty mask and the alternate ⌥.
 /// - `indent`: `indentationLevel` (the inline Approve).
+/// - `tooltip`: `toolTip` (the brief preview's full brief).
 /// - `symbol`: the SF Symbol image ([`symbol_image`]), marked always
 ///   visible ([`show_image`]); if it cannot load, the symbol's monochrome
 ///   text fallback prefixes the title instead.
@@ -627,6 +669,9 @@ fn decorate(menu: &NSMenu, index: isize, item: &ModelItem) {
     }
     if item.indent > 0 {
         native.setIndentationLevel(item.indent as isize);
+    }
+    if let Some(tooltip) = &item.tooltip {
+        native.setToolTip(Some(&NSString::from_str(tooltip)));
     }
     if let Some(symbol) = item.symbol {
         match symbol_image(symbol) {
@@ -841,12 +886,16 @@ fn main() -> ExitCode {
     let poller = PollerHandle::new(tx.clone());
     bell::set_waker(poller.clone());
     let action_sender = sender.clone();
+    let confirm_sender = sender.clone();
     let actions = ActionController::new(
         tx,
         Arc::new(move |message: String| {
             action_sender.send(Msg::Action(message));
         }),
-    );
+    )
+    .with_review_confirmer(Arc::new(move |pending| {
+        confirm_sender.send(Msg::ConfirmReview(pending));
+    }));
 
     // A3: attach to a running daemon, else spawn and supervise the bundled
     // one. State changes reach the menu through the main-loop queue.
@@ -879,12 +928,13 @@ fn main() -> ExitCode {
     // asks for permission once. None for a bare binary (fallback path).
     let _notification_delegate = notify_center::init();
 
+    let settings = settings::Settings::new(mtm, poller.clone());
     let app = Rc::new(RefCell::new(App::new(
         poller,
         actions,
         pending.clone(),
         sender.clone(),
-        settings::Settings::new(mtm),
+        settings,
         Some(supervisor),
         quit_mode,
     )));
@@ -990,6 +1040,7 @@ fn icon_report_submenu() -> ModelItem {
         indent: 0,
         symbol: Some(symbol),
         shortcut: None,
+        tooltip: None,
         children: Vec::new(),
     };
     ModelItem {

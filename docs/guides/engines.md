@@ -93,12 +93,46 @@ of the agent's JSON output (`json_field`) — and the next review appends `resum
 prx retries **immediately as a fresh session in the same attempt** — a broken session never fails
 a review on its own. Engines without `resume_args` behave as before: the session is cleared when a
 re-review is triggered. `llm_api` engines are stateless; `session_output`/`resume_args` on them is
-a validation error.
+a validation error. prx also records which engine reported the session and the directory the
+agent ran in (the daemon's working directory), so [Review Chat](review-chat.md) can reopen it.
+
+## Review Chat templates
+
+[Review Chat](review-chat.md) (`prx chat`) runs an agent interactively. An agent engine says how
+under `chat:`; each entry is an argv appended to `command`:
+
+```yaml
+engines:
+  my-agent:
+    type: agent
+    command: /usr/local/bin/my-agent
+    args: ["--print", "{{PROMPT}}"]
+    chat:
+      new_args: ["--session", "{{SESSION_ID}}", "{{PROMPT}}"]   # start; {{PROMPT}} required
+      resume_args: ["--session", "{{SESSION_ID}}"]              # reopen by id
+      continue_args: ["--continue"]                              # reopen the latest session
+```
+
+- `new_args` starts a new session with the chat prompt as one argument (an interactive agent keeps
+  the terminal on stdin, so there is no `-` form). If it contains `{{SESSION_ID}}`, prx generates a
+  UUID and records it, so the chat can be reopened by id. The repo's `agent_model` is applied
+  through `model_args` before it.
+- `resume_args` reopens a session by id: the PR's last chat, or the session of its last review
+  (in the directory the review ran in).
+- `continue_args` reopens the latest session in the chat's directory. prx uses it for a chat whose
+  id it could not set.
+
+Any of them may be left out; the engine then cannot do that step. The built-ins `claude`, `codex`,
+and `pi` have all three (listed in the [Review Chat guide](review-chat.md#engines)), and an engine
+without `chat:` whose command's file name is `claude`, `codex`, or `pi` uses that built-in's
+templates. `llm_api` engines cannot chat.
 
 ## Validation
 
 Loading rejects: an `engine` / `brief.engine` that names nothing; an
-agent argv with neither `-` nor `{{PROMPT}}`; `resume_args` without `{{SESSION_ID}}`; an
+agent argv with neither `-` nor `{{PROMPT}}`; `resume_args` without `{{SESSION_ID}}`;
+`chat.new_args` without `{{PROMPT}}`, `chat.resume_args` without `{{SESSION_ID}}`, or a placeholder
+in `chat.continue_args`; `chat`, `session_output`, or `resume_args` on an `llm_api` engine; an
 `llm_api` entry without `model` or `api_key_env`, with an `api_key_env` that isn't a variable name
 (e.g. a pasted `sk-…` key), with any inline key field (`api_key`, `token`, `secret`, …), or with
 `provider: openai_compatible` and no `base_url`. A missing key *variable* is not a load error (the

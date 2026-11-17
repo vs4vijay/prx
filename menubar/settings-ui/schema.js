@@ -185,14 +185,19 @@
       page: "menubar", section: "Menu bar" },
   ]);
 
-  // [id, label, icon, group] (design D16): Overview pages watch the daemon,
-  // Settings pages edit the shared config draft.
+  // [id, label, icon, group, parent?] (design D16): Overview pages watch the
+  // daemon, Settings pages edit the shared config draft. A page with a
+  // parent is not in the sidebar: it is reached from that page (its entry
+  // is marked current meanwhile).
   const PAGE_GROUPS = [["overview", "Overview"], ["settings", "Settings"]];
   const PAGES = [
     ["dashboard", "Dashboard", "gauge", "overview"],
     ["prs", "Pull requests", "pr", "overview"],
     ["history", "History", "clock", "overview"],
     ["usage", "Usage & stats", "chart", "overview"],
+    // One PR's details (brief, latest review, actions): opened at a PR with
+    // `#page=pr&pr=<key>` or app.openPr(key).
+    ["pr", "Pull request", "pr", "overview", "prs"],
     ["general", "General", "sliders", "settings"],
     ["review", "Review", "review", "settings"],
     ["messages", "Messages", "message", "settings"],
@@ -208,7 +213,7 @@
   // The sidebar: [{id, label, pages: [{id, label, icon}]}] in group order.
   function navGroups() {
     return PAGE_GROUPS.map(function (g) {
-      return { id: g[0], label: g[1], pages: PAGES.filter(function (p) { return p[3] === g[0]; })
+      return { id: g[0], label: g[1], pages: PAGES.filter(function (p) { return p[3] === g[0] && !p[4]; })
         .map(function (p) { return { id: p[0], label: p[1], icon: p[2] }; }) };
     });
   }
@@ -216,6 +221,26 @@
   function pageGroup(id) {
     const page = PAGES.find(function (p) { return p[0] === id; });
     return page ? page[3] : null;
+  }
+
+  // The sidebar entry a page belongs to: itself, or its parent.
+  function navPage(id) {
+    const page = PAGES.find(function (p) { return p[0] === id; });
+    return page ? page[4] || page[0] : null;
+  }
+
+  // A tracked PR key as the daemon writes it: `org/repo#n`.
+  function prKeyValid(key) {
+    return typeof key === "string" && /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#[0-9]+$/.test(key);
+  }
+
+  // The PR a window URL asks for (`#page=pr&pr=<url-encoded key>`), or null.
+  function prFromHash(hash) {
+    const match = /(?:^#|&)pr=([^&]*)/.exec(hash || "");
+    if (!match) return null;
+    let key;
+    try { key = decodeURIComponent(match[1]); } catch (e) { return null; }
+    return prKeyValid(key) ? key : null;
   }
 
   // The page a window URL asks for (`#page=<id>`), or null.
@@ -249,6 +274,7 @@
   const api = { MODES: MODES, MODE_OPTIONS: MODE_OPTIONS, TIERS: TIERS, EVENTS: EVENTS, SOUNDS: SOUNDS, BUILTIN_ENGINES: BUILTIN_ENGINES,
     LLM_PROVIDERS: LLM_PROVIDERS, USAGE_FIELDS: USAGE_FIELDS, FIELDS: FIELDS, OVERRIDE_FIELDS: OVERRIDE_FIELDS,
     PAGES: PAGES, PAGE_GROUPS: PAGE_GROUPS, navGroups: navGroups, pageGroup: pageGroup, pageFromHash: pageFromHash,
+    navPage: navPage, prKeyValid: prKeyValid, prFromHash: prFromHash,
     fieldFor: fieldFor, pageForField: pageForField };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.prxSchema = Object.freeze(api);

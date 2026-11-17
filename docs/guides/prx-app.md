@@ -40,9 +40,11 @@ the app did not start (CLI, launchd) keeps running either way.
 
 On launch the app attaches to a daemon that is already running, or starts one itself (creating
 the default config first when there is no config file; an existing one is never touched) and
-supervises it: a crashed daemon is restarted with a growing delay, and after 5 failures within 10
-minutes the menu shows *Daemon stopped* with *Start daemon* and *Show daemon log*. The details are
-in [PRX.app internals](../concepts/prx-app-internals.md#one-app-two-processes).
+supervises it, whichever it is: a daemon that stops is restarted with a growing delay, and after
+5 failures within 10 minutes the menu shows *Daemon stopped* with *Start daemon* and *Show daemon
+log*. A daemon stopped with `prx daemon stop` stays stopped until *Start daemon*. A daemon that
+keeps failing to reach GitHub in a way a fresh process fixes is replaced. The details are in
+[PRX.app internals](../concepts/prx-app-internals.md#one-app-two-processes).
 
 ## Menu bar icon
 
@@ -82,8 +84,11 @@ countdown takes the "next" slot: *· paused, 1h 12m left*). Its symbol follows t
 glyph (paused, reviewing, attention, all clear). Hold ⌥ to turn it into the diagnostics line:
 *PRX 1.1.0 · daemon 1.1.0 · pid 4242 · up 3h · 166 PRs · 1 reviewing · 0 queued*. A second line
 appears only for something extra: the outcome of the last action, or a daemon health problem
-with its fix — *config.yml not loaded: … — Open…* (opens the raw config) or *Daemon 1.0.0 is
-running, app is 1.1.0 — Show log*.
+with its fix — *config.yml not loaded: … — Open…* (opens the raw config), *Sync failing 2h 5m
+(acme/api): … — Restart daemon* (the last 3 or more polls of GitHub failed; see
+[Troubleshooting](../troubleshooting.md#prx-shows-github-sync-failing)), *Daemon 1.0.0 is
+running, app is 1.1.0 — Show log*, or *Restart daemon to apply max_concurrent_reviews* (a saved
+setting that waits for a daemon restart; a click restarts the daemon).
 
 ### Quick actions
 
@@ -138,9 +143,13 @@ review*. When the review comes back asking for changes, the row moves to *Change
 PR rows read `org/repo#n · author · age — title — summary`, where age is the time since
 the PR was opened (`45m`, `2h`, `3d`, `5w`). The summary is the one-line verdict of the latest
 review (*Retries can double-charge*); a row without one says where the PR stands instead (*ready
-for review*, *cooling down: review in 20m*, *review in progress*, *skipped: draft*, *snoozed until
-next push*, *merged*, *closed*). Long titles and summaries are cut short so the menu
-stays narrow (the full text is in the submenu and the app). The row's SF Symbol is its state, in
+for review*, *cooling down: review in 20m*, *review in progress*, *Skipped — draft*, *snoozed until
+next push*, *merged*, *closed*). A skipped row says which rule skipped it (*Skipped — author
+dependabot[bot] excluded*, *Skipped — label wip excluded*, *Skipped — branch release/1.2 matches
+release/\**), and a PR whose diff is over the caps says by how much (*Skipped — 2,140 lines changed
+(limit 1,500)*). Long titles and summaries are cut short so the menu
+stays narrow (the full text is in the submenu and the app; a skipped PR's submenu repeats the
+reason as its own line under *Open in GitHub*). The row's SF Symbol is its state, in
 the app window's state system and colours: needs review (`circle`; `hourglass` cooling down,
 `arrow.clockwise.circle` re-review pending), in review (`ellipsis.circle`), ready for approval
 (green `checkmark.circle`), approved (green `checkmark.circle.fill`), changes requested (red
@@ -152,9 +161,12 @@ use the same symbols (failed: red `exclamationmark.triangle.fill`; brief: `doc.t
 
 ![The submenu of acme/web#1288, open to the left of the menu: Open in GitHub; the verdict line Approved, 0 blocking, 2 nits, the one-line brief and updated 5h ago, with Copy brief and Regenerate brief; Review, Review with, Review without posting and Review with prompt; Approve, which is highlighted, and Block (request changes); Snooze and Ignore](../media/screenshots/menu-pr-actions.png)
 
-Per-PR submenu, grouped by separators (open · brief · review runs · your verdict · snooze/ignore): *Open in GitHub* (in the configured browser); when the PR has a
-[brief](briefs.md), the verdict line with blocking/nit counts, the brief (truncated to one line of
-~200 characters), its age (*updated 2h ago*, plus *· stale* once newer commits were pushed),
+Per-PR submenu, grouped by separators (open · why skipped · brief · review runs · your verdict · snooze/ignore): *Open in GitHub* (in the configured browser) and *Show details…*
+(the PR's [details page](#pr-details) in the PRX window); for a PR prx is not reviewing, the
+*Skipped — …* line; when the PR has a
+[brief](briefs.md), the verdict line with blocking/nit counts, a preview of the brief (about 100
+characters; hover it for the whole brief, click it to read it on the details page), its age
+(*updated 2h ago*, plus *· stale* once newer commits were pushed),
 *Copy brief* (the full text to the clipboard), and *Regenerate brief*; without a brief, *Write
 brief* (hidden when the repo's mode is `off` or briefs are disabled for it). Write and
 Regenerate send `POST /brief`; while the brief is being written the item reads *Writing brief…*
@@ -165,11 +177,18 @@ configured engine, the repo's own marked *(default)*; hidden with a daemon too o
 engines), *Review without posting* (no GitHub writes; the verdict and history still update), and
 *Review with prompt…* (a panel with the prompt text, an engine picker, and a *Post to GitHub*
 checkbox — only what differs from the defaults is sent), all per-run options exactly like
-[`prx review`](../reference/cli.md#prx-review)'s flags; *Approve…* (the human-only approve path), *Block (request
+[`prx review`](../reference/cli.md#prx-review)'s flags, and *Open Review Chat…*, which opens a
+Terminal window running `prx chat` for the PR ([Review Chat](review-chat.md); it also works for
+merged/closed PRs); *Approve…* (the human-only approve path), *Block (request
 changes)…* — or *Unblock* when prx's identity holds the PR's request-changes review — *Snooze*
 (1 h / 2 h / 4 h / until next push), and one skip toggle keyed on the PR's state: *Ignore*,
 *Stop ignoring* (ignored PRs), or *Unsnooze* (snoozed PRs, which offer no *Ignore*). Approve and
-Block post a review to GitHub as you, so they ask for confirmation first. Mutating entries are disabled for merged/closed PRs;
+Block post a review to GitHub as you, so they ask for confirmation first. The review actions
+(and the *Review PR…* panel) ask first too when the PR is skipped or its diff is over the caps: an
+alert titled *Review acme/api#42 anyway?* lists why (*Skipped — draft*, *Large PR — 2,140 lines
+changed (limit 1,500)*) and that a review can use many tokens; nothing is sent until you click
+*Review anyway*. The PR stays skipped afterwards. See
+[`prx review`](../reference/cli.md#confirmation-before-a-risky-review). Mutating entries are disabled for merged/closed PRs;
 *Open* always works.
 
 *Approve…* in the submenu and the *↳ Approve #n…* item under a ready row open the same alert,
@@ -245,12 +264,14 @@ visible and show an offline state (with a retry) when the daemon is down:
   recent activity, and the last 7 days' tokens and cost (runs without usage data are noted).
 - **Pull requests** — a table of tracked PRs, sortable and filterable by repo, state, and text,
   initially in `menu.sort` order. Row actions: *Open*, *Review*, *Review with* (engine picker),
-  *Review without posting*, and *Review with prompt* (prompt, engine, post); results and daemon
-  errors show inline, and actions are disabled for merged/closed PRs. A *Review PR…* box takes any
+  *Review without posting*, *Review with prompt* (prompt, engine, post), and *Open Review Chat…*
+  (a Terminal window running `prx chat`, see [Review Chat](review-chat.md)); results and daemon
+  errors show inline, and review actions are disabled for merged/closed PRs. A *Review PR…* box takes any
   [target form](../reference/cli.md#prx-review). Clicking a PR's title opens its detail row with the **brief card**:
   the full [brief](briefs.md), when it was created and last updated, a *Stale* marker when newer
   commits were pushed since, and *Regenerate* (*Write brief* when there is none), which shows
   *Writing brief…* until the brief's `updated_at` changes, or the error inline when the run fails.
+  *Show details* (in the detail row and in the row's ⋯ menu) opens the PR's details page.
 - **History** — newest-first events with the engine, tokens, and a *not posted* marker; filters by
   repo, event type, and engine; *Load more* pages back (`GET /history?before=`); a completed
   review opens a detail view with its brief and its *Review usage* / *Brief usage*; an on-demand
@@ -260,6 +281,32 @@ visible and show an offline state (with a retry) when the daemon is down:
   toggles, a per-group totals table, the overall totals with a *runs without usage data* callout,
   and the [insights](insights.md) panel for the same window. With a daemon too old to serve
   `/usage`, the page asks you to update the daemon.
+
+### PR details
+
+One PR on its own page, opened from the menu bar (*Show details…*, or a click on the brief
+preview) or from *Show details* on the Pull requests page; *‹ Pull requests* goes back. It shows:
+
+- the title, `repo#number`, author, how long ago the PR was opened, and its state, with the
+  reason when prx is not reviewing it (*author dependabot[bot] excluded*, *Review skipped — 2,140
+  lines changed (limit 1,500)*);
+- an actions row: *Open in GitHub*, *Review*, and a ⋯ menu with *Review with* (one entry per
+  engine) and *Review without posting*, disabled for merged and closed PRs, and *Open Review
+  Chat…* ([Review Chat](review-chat.md); works on merged and closed PRs too). The reviews are the
+  same requests as the Pull requests page, with the same pre-flight: a PR that is skipped or over
+  the diff caps asks *Review … anyway?* first and is reviewed only on *Review anyway*. Nothing
+  here approves;
+- the brief card, with the brief in large type you can select and copy, and *Write brief* /
+  *Regenerate*;
+- the **latest review**: verdict, blocking and nit counts, when, with which engine, how long it
+  took, whether it was posted to GitHub, and the text of each blocking finding (from the PR's
+  history); nit texts are not recorded, so read them in the review on GitHub;
+- the skip reason, branch, review engine, and when you approved, when known.
+
+When the polls of the PR's repo keep failing (3 or more in a row), a banner above the page says
+it may be out of date, like the Overview's
+([Troubleshooting](../troubleshooting.md#prx-shows-github-sync-failing)). A PR that is no longer
+tracked shows a short note with a way back to the list.
 
 ![The History page: newest-first events for each pull request, with the verdict, the engine, and the tokens and cost of completed reviews](../media/screenshots/history.png)
 
@@ -272,7 +319,11 @@ visible and show an offline state (with a retry) when the daemon is down:
 
 *Settings…* in the menu bar footer (shortcut **⌘,** while the menu is open, or any time the
 window has focus) opens the PRX window on its settings pages (an AppKit window hosting a local
-web UI — no editor, no browser). There is only ever one window, in the one running PRX: opening it
+web UI — no editor, no browser). A save is applied by the daemon before it answers, and the menu
+bar refreshes at once. A change made elsewhere (`prx config set`, an editor) re-loads the open
+settings page unless you have unsaved edits; then the save bar says the file changed and *Revert*
+loads it. A setting that needs a daemon restart (`max_concurrent_reviews`) is called out after the
+save and in the save bar, and the menu bar offers *Restart daemon to apply …* until it is applied. There is only ever one window, in the one running PRX: opening it
 again brings it to the front (the app's single-instance guard is `app.pid` in the data dir). While
 it is open PRX shows a Dock icon and takes normal keyboard focus; closing it leaves the menu bar
 item running.

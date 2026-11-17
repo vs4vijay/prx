@@ -14,6 +14,87 @@ Newest first. One entry per decision, in this format:
 What changed, why, and what to do differently from now on. Link the files or docs involved.
 ```
 
+### 2026-11-17: One window flow for every manual review; restart-required gets the restart action
+
+The PR details page (`menubar/settings-ui/pages-pr.js`) and the Pull requests page share the
+review pre-flight and its confirm box, now in `overview.js` (`reviewPreflight`, `confirmBox`,
+`needsConfirmation`, `confirmLines`, `confirmCost`); `pages-prs.js` re-exports the pure ones. The
+details page also offers *Open Review Chat…* (`app.review_chat.open`), shows the skip detail in
+its header and facts, and puts a sync banner above the page when the PR's repo is failing
+(`O.FAILING_AFTER`, the same 3 polls as `src/health.rs` and the dashboard). In the menu, a
+non-empty `restart_required` shows *Restart daemon to apply …* (`RESTART_DAEMON_ID`, the same
+supervisor restart as the *Sync failing* line, below every warning). From now on, a new window
+entry point for a manual review goes through `O.reviewPreflight` and `O.confirmBox`.
+
+### 2026-11-17: Review Chat — `prx chat` and "Open Review Chat…"
+
+`prx chat <pr>` (`src/chat.rs`) runs an agent interactively in the foreground: it reopens the
+PR's last chat, else its last review's session (`PrRecord.review_session_info` now records the
+engine and working directory of `review_session`), else starts a new session with a prompt built
+by `chat::chat_prompt`. Agent engines describe this with `engines.<name>.chat`
+(`new_args` / `resume_args` / `continue_args`); built-ins have them. Chats are recorded in
+`data_dir/chats.json`, which only `prx chat` writes; the daemon never touches it. PRX.app opens a
+chat by writing a `.command` file (`prx::chat::terminal_script`: quoted paths and a validated key,
+nothing from PR text) and running `open -a Terminal` on it (`menubar/src/review_chat.rs`). From
+now on, never splice PR text into a shell or AppleScript string, keep agent argv as separate
+arguments (no shell), and tests that touch chats inject a `TerminalLauncher` so no test opens a
+terminal. See [Review Chat](docs/guides/review-chat.md) and `openspec/changes/review-chat/`.
+
+### 2026-11-17: One PR has its own page in the PRX window; open it with `pr_page(key)`
+
+The window has a PR details page (`menubar/settings-ui/pages-pr.js`, page id `pr`, not in the
+sidebar): title, state, an actions row, the brief in reading size, the latest review with its
+blocking finding texts (from `history.list`), and facts. The menu's *Show details…* and the brief
+preview line open it. From now on, anything that shows one PR in the window goes there instead of
+growing the Pull requests table: in Rust pass `settings::assets::pr_page(key)` wherever a page id
+goes (`Settings::open`, `Msg::OpenWindow`); in the page call `app.openPr(key)`; the URL is
+`#page=pr&pr=<url-encoded key>`. New per-PR actions are an `actionsFor` descriptor plus a
+`HANDLERS` entry, new facts a `factsFor` line. See `openspec/changes/pr-details-view/`.
+
+### 2026-11-17: Skip details, and a confirmed manual review of a skipped or oversized PR
+
+`PrRecord.skip_detail` and `StatusEntry.skip_detail` (both optional) say in a few words why prx is
+not reviewing a PR: the matched rule for `skip_reason: config` (set by `machine::skip_decision`),
+or the diff size against the cap (set by the pipeline). Read it through `PrRecord::skip_text`,
+which covers every reason; the `skip_reason` values did not change. A manual review now has a
+pre-flight (`src/preflight.rs`, `POST /review/preflight`): warnings for a `draft`/`config` skip and
+for a diff over the caps, `blocked` for what nothing overrides (mode `off`, snoozed, ignored, in
+review, terminal). `POST /review` takes `confirm`; only a confirmed run (`Pipeline.confirmed`) may
+review a rule-skipped PR (it stays skipped) or pass the cap. Without `confirm` the daemon behaves as
+before, so an older client can never start such a review. From now on, any new manual-review
+entry point (CLI, menu, window) runs the pre-flight and asks before sending `confirm: true`;
+automatic paths never set it. `prx review` asks on a TTY, `--yes` skips the question, and without
+a TTY it refuses. See `openspec/changes/skip-reasons-and-review-confirm/` and
+[IPC API](docs/reference/ipc-api.md#review-pre-flight).
+
+### 2026-11-17: Poll health in `/status`; PRX.app supervises every daemon and replaces stale ones
+
+A daemon whose `gh` calls all failed (TLS errors in an orphaned app session) stayed broken for days
+with no sign anywhere. Now the daemon records per-repo poll health (`/status` `poll_health`,
+`restart_recommended`), judged by the pure `src/health.rs` (failing after 3 consecutive failed
+polls; restart only for TLS/network/timeout errors on every repo for 30 min, never for auth).
+The menu, the window's dashboard, and `prx status` warn. PRX.app's supervisor
+(`menubar/src/supervisor.rs`) probes every 5 s whether it spawned the daemon or attached to it:
+a daemon that goes away is restarted unless `prx daemon stop` left `daemon.stop-requested`, and a
+daemon that recommends a restart is replaced (`HealthPolicy`: 30 min, doubling to 4 h). A
+supervised daemon (`PRX_SUPERVISED` with a live parent, or launchd's `com.prx.daemon`) exits 75
+for a fresh start. From now on, a new poll-failure signal goes through `src/health.rs` so all
+three surfaces agree, and supervisor tests use fake daemons that claim the pid file and write a
+token (`FAKE_READY`), since the app reports *Running* only once a daemon is ready. See
+`openspec/changes/daemon-health-and-recovery/`.
+
+### 2026-11-17: Config changes carry a revision; every writer makes them run at once
+
+The daemon keeps a `config_revision` (in `GET /status`, `GET /config`, `PUT /config`) that goes up
+each time a different config is applied, plus `restart_required` for keys that wait for a restart
+(`max_concurrent_reviews`). `POST /config/reload` re-reads the file now and reports `applied`,
+`unchanged`, or `rejected`. From now on: a CLI command that writes `config.yml` calls
+`nudge_daemon_reload` (`src/main.rs`) after the write; a settings-bridge call that changes the
+daemon reports its `Effect` so PRX.app's poller refreshes at once (`menubar/src/settings/bridge.rs`,
+`menubar/src/poller.rs`); and anything PRX.app derives from the config is refreshed when the
+revision changes, not on a timer of its own. A new setting that cannot hot-apply goes into
+`restart_required_for` (`src/daemon.rs`). See `openspec/changes/prompt-config-reload/`.
+
 ### 2026-10-29: HistoryEntry tolerates unknown variants; new variants are fine
 
 `HistoryEntry` (`src/history.rs`) has a catch-all `#[serde(other)] Unknown` variant. A history
@@ -156,6 +237,9 @@ src/                  core crate: CLI, daemon, state machine, review pipeline, I
   machine.rs, state.rs  pure lifecycle transition table; persisted PR state
   review.rs, prompt.rs  review orchestration and briefs; prompt rendering and the output contract
   agent.rs, llm.rs      agent-CLI engines; LLM API engines
+  chat.rs               Review Chat: `prx chat`, resume/new decision, chat prompt, terminal script
+  preflight.rs          manual-review pre-flight: skip and diff-size warnings, `blocked` reasons
+  health.rs             pure per-repo poll health: failing streaks, restart recommendation
   github.rs             all GitHub I/O, through the `gh` CLI
   config.rs, config_edit.rs   YAML config load/validate/merge and the starter config; `prx config set|edit`
   history.rs, insights.rs, usage.rs   history log, analytics, token usage
@@ -281,6 +365,9 @@ Do not commit or push unless asked.
 - **Menubar client header.** A `DaemonClient` is anonymous unless it opts in with
   `discover_as_menubar()` / `as_menubar()`. Only `menubar/` may opt in; a CLI command that did
   would mute the daemon's banners for as long as a menubar client counts as recently seen.
+- **Deliberate stop marker.** `prx daemon stop` writes `daemon.stop-requested`; a starting daemon
+  (and PRX.app before it spawns one) removes it. While it exists PRX.app does not restart a daemon
+  on its own. Exit code 75 from a daemon means "restart me" (poll health), not a crash.
 - **`prx daemon start` waits.** It returns only once the daemon has claimed the pid file and
   published its IPC token (10 s limit), and on failure prints the reason the daemon gave, so a
   command run right after it reaches the daemon.
@@ -295,7 +382,7 @@ Do not commit or push unless asked.
 - **Workflow.** Changes are planned as OpenSpec proposals under `openspec/changes/` before
   implementation.
 - **Hot reload exception.** Config reloads live, except `max_concurrent_reviews`, which is sized
-  at daemon start.
+  at daemon start; until a restart the daemon reports it in `restart_required`.
 - **Legacy names still accepted.** `agents:` / `agent` (now `engines:` / `engine`) and
   `executive_summary` (now `brief`) are read as aliases; rewrites save the new names.
 - **Shared files.** `assets/` is brand material with its own README; do not restyle it in passing.
@@ -313,8 +400,8 @@ Terms and rules that the code assumes. Extend this section as you learn things t
 obvious from one file.
 
 - **Lifecycle states** (`src/state.rs`): `pending`, `in_review`, `reviewed_approved`,
-  `reviewed_changes_requested`, `skipped` (reasons `draft`, `config`, `snoozed`, `ignored`),
-  `merged`, `closed`. `in_review` is held in memory only until the run ends, so a crash never
+  `reviewed_changes_requested`, `skipped` (reasons `draft`, `config`, `snoozed`, `ignored`; a
+  `config` skip stores the matched rule in `skip_detail`), `merged`, `closed`. `in_review` is held in memory only until the run ends, so a crash never
   strands a PR there.
 - **Review manifest**: the engine's only output. `manifest_version` 1; `verdict` is `approved`,
   `changes_requested`, or `comment_only`; findings have severity `blocking` or `nit`. Any
@@ -345,6 +432,10 @@ obvious from one file.
   suppresses its own banners while a menubar client has been seen recently. The tier decides the
   banner; the sound is `notifications.sounds.<event>`, else the event's built-in sound (only
   `on_review_complete_approved`: `Glass`), else the tier's (`Notifications::behavior_for`).
+- **Poll health**: a repo is *failing* after 3 consecutive failed polls (`src/health.rs`). A
+  restart is recommended only when every polled repo fails with a TLS, network, or timeout error,
+  the newest streak is 30 min old, and the daemon has run 30 min. Auth errors keep the old
+  handling (log, retry next interval).
 - **Token usage** semantics are uniform: `input_tokens` is uncached input; cache reads and writes
   are separate; cost is recorded only when the engine reports it.
 - **Data locations**: config at `~/.config/prx/config.yml` (`PRX_CONFIG`), data at

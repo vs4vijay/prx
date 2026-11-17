@@ -23,6 +23,7 @@ request read-only, and posts the result itself. Only you approve. New here? Read
 | [Commentary](guides/commentary.md) | Inline comments and the review body template |
 | [Briefs](guides/briefs.md) | Plain-language descriptions of what a PR does |
 | [Engines](guides/engines.md) | Agent CLIs and LLM APIs, sessions, validation |
+| [Review Chat](guides/review-chat.md) | Talk to a coding agent about a PR, in its review session or a new one |
 | [Token usage](guides/token-usage.md) | What is recorded, per engine, and how to map your own |
 | [Insights](guides/insights.md) | Throughput, recurring blockers, review effectiveness |
 | [Notifications](guides/notifications.md) | Banners from the daemon and from PRX.app |

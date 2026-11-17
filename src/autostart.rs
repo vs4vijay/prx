@@ -44,6 +44,8 @@ use anyhow::{bail, Context, Result};
 
 /// launchd label and plist file stem (macOS).
 const LABEL: &str = "com.prx.daemon";
+/// The daemon's launchd label: launchd sets `XPC_SERVICE_NAME` to it.
+pub const LAUNCHD_LABEL: &str = LABEL;
 /// launchd label and plist file stem for the menubar agent (macOS).
 const MENUBAR_LABEL: &str = "com.prx.menubar";
 /// The menubar binary's file name, resolved next to the daemon binary.
@@ -732,6 +734,7 @@ Description=prx daemon (local-first PR review lifecycle manager)
 
 [Service]
 ExecStart={exe} daemon start --foreground
+Environment=PRX_SUPERVISED=1
 Restart=on-failure
 
 [Install]

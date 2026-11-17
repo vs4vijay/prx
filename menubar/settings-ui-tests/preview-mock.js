@@ -267,11 +267,26 @@
         return left > 0 ? "cooling down: review in " + hm(left) : "ready for review";
       }
       case "in_review": return "review in progress";
-      case "skipped": return extra.skip === "snoozed" ? "snoozed until next push" : "skipped: " + extra.skip;
+      case "skipped": return extra.skip === "snoozed" ? "snoozed until next push" : "Skipped \u2014 " + (skipDetail(extra) || extra.skip);
       case "merged": return "merged";
       case "closed": return "closed";
       default: return extra.summary;
     }
+  }
+
+  // Why a skipped PR is skipped (status `skip_detail`): the matched rule.
+  function skipDetail(extra) {
+    if (extra.skip === "draft") return "draft";
+    if (extra.skip === "config") return "author renovate[bot] excluded";
+    return undefined;
+  }
+
+  // POST /review/preflight: a draft or rule-skipped PR needs confirming.
+  function preflight(p) {
+    const pr = status().prs.find(function (e) { return e.key === p.target; });
+    if (!pr) return { key: p.target, warnings: [] };
+    const warnings = pr.skip_detail ? [{ kind: "skipped", message: "Skipped \u2014 " + pr.skip_detail }] : [];
+    return { key: pr.key, warnings: warnings, size: { files_changed: 4, lines: 180, max_files: 60, max_lines: 1500 } };
   }
 
   function statusEntry(row) {
@@ -279,7 +294,7 @@
     const repo = key.split("#")[0], number = Number(key.split("#")[1]);
     const verdict = extra.verdict || null;
     return {
-      key: key, icon: "", state: row[3], skip_reason: extra.skip || null, title: row[1], author: row[2],
+      key: key, icon: "", state: row[3], skip_reason: extra.skip || null, skip_detail: skipDetail(extra), title: row[1], author: row[2],
       head_branch: extra.branch, is_draft: !!extra.draft,
       last_verdict: verdict, blocking_count: extra.blocking || 0, nit_count: extra.nits || 0,
       last_review_at: extra.last ? ago(extra.last) : null,
@@ -791,6 +806,8 @@
         ? { ok: false, error: { kind: "unsupported", message: "the daemon has no /usage endpoint" } } : wrap(usage(p));
       case "insights.get": return { ok: true, result: insights(p) };
       case "review.request": return wrap(review(p));
+      case "review.preflight": return { ok: true, result: preflight(p) };
+      case "app.review_chat.open": return { ok: true, result: { opened: p.key } };
       case "brief.request": return wrap(requestBrief(p));
       case "pause.start": return wrap(startPause(p));
       case "pause.resume": pausedUntil = undefined; return { ok: true, result: { ok: true, changed: true, paused_until: null } };

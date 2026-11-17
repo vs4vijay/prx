@@ -29,7 +29,7 @@ use crate::config::{
     self, Config, ConfigError, EffectiveRepo, EffectiveWithSources, Identity, MenuSettings,
     RepoConfig, ReviewMode,
 };
-use crate::daemon::{BriefRequestError, ConfigWriteError, Job, LiveConfig, Shared};
+use crate::daemon::{BriefRequestError, ConfigCheck, ConfigWriteError, Job, LiveConfig, Shared};
 use crate::effects::EffectsDeps;
 use crate::github::{Gh, GhCli, GhError, PrLifecycle};
 use crate::history::{self, HistoryEntry};
@@ -163,6 +163,63 @@ pub struct StatusResponse {
     /// which reads as the defaults.
     #[serde(default)]
     pub menu: MenuSettings,
+    /// The running config's revision (`config_revision`,
+    /// `config_loaded_at`) and `restart_required`. Absent from older
+    /// daemons.
+    #[serde(flatten)]
+    pub config_state: ConfigRevision,
+    /// Poll successes and failures per polled repo (see [`crate::health`]).
+    /// Empty from older daemons and before the first poll.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub poll_health: BTreeMap<String, crate::health::RepoPollHealth>,
+    /// Every polled repo has been failing long enough, with errors a fresh
+    /// daemon process can fix, that a restart is recommended. PRX.app acts
+    /// on it; `false` from older daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub restart_recommended: bool,
+}
+
+/// Which config the daemon runs: `config_revision` starts at 1 and goes up
+/// each time a different config is applied (file watcher, `PUT /config`,
+/// `POST /review-mode`, `POST /config/reload`); `config_loaded_at` is when
+/// that happened. A client that sees the revision change re-reads what it
+/// derives from the config. `restart_required` lists config keys whose
+/// new value applies only after a daemon restart (`max_concurrent_reviews`).
+/// Flattened into the payloads that carry it; every field is optional on
+/// the wire, so older daemons and older clients interoperate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigRevision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_loaded_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_required: Vec<String>,
+}
+
+/// `POST /config/reload` answer: what re-reading the config file did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigReloadResponse {
+    /// `applied` (new content is running), `unchanged` (the file is what
+    /// already runs), or `rejected` (the file is broken; the last-good
+    /// config keeps running and `error` says why).
+    pub outcome: ConfigReloadOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub added: Vec<String>,
+    #[serde(default)]
+    pub removed: Vec<String>,
+    #[serde(flatten)]
+    pub config_state: ConfigRevision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigReloadOutcome {
+    Applied,
+    Unchanged,
+    Rejected,
 }
 
 /// D2: a rejected config reload — the parse/validate error and when the
@@ -234,6 +291,10 @@ pub struct ConfigResponse {
     /// can show what is posted while they are unset.
     #[serde(default)]
     pub shipped_templates: BTreeMap<String, String>,
+    /// The running config's revision and `restart_required` (absent from
+    /// older daemons).
+    #[serde(flatten)]
+    pub config_state: ConfigRevision,
 }
 
 /// The merged view inside [`ConfigResponse`]: `defaults` as every repo
@@ -265,6 +326,10 @@ pub struct ConfigWriteResponse {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub discarded: Vec<String>,
+    /// The revision now running, and keys that wait for a daemon restart
+    /// (absent from older daemons).
+    #[serde(flatten)]
+    pub config_state: ConfigRevision,
 }
 
 /// A rejected config write (HTTP 422): nothing was written or applied.
@@ -337,6 +402,7 @@ fn build_router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/status", get(status_handler))
         .route("/review", post(review_handler))
+        .route("/review/preflight", post(preflight_handler))
         .route("/brief", post(brief_handler))
         .route("/approve", post(approve_handler))
         .route("/snooze", post(snooze_handler))
@@ -347,6 +413,7 @@ fn build_router(shared: Arc<Shared>) -> Router {
         .route("/pause", post(pause_handler))
         .route("/resume", post(resume_handler))
         .route("/config", get(get_config_handler).put(put_config_handler))
+        .route("/config/reload", post(reload_config_handler))
         .route("/review-mode", post(review_mode_handler))
         .route("/block", post(block_handler))
         .route("/unblock", post(unblock_handler))
@@ -421,6 +488,9 @@ async fn status_handler(State(shared): State<Arc<Shared>>) -> Response {
         paused_until: state.active_pause(Utc::now()),
         engines: live.config.engine_names(),
         menu: live.config.menu,
+        config_state: shared.config_revision(),
+        poll_health: shared.poll_health().await,
+        restart_recommended: shared.restart_recommended().await,
     })
     .into_response()
 }
@@ -443,6 +513,20 @@ pub struct ReviewRequest {
     /// run; absent lets the repo's review mode decide.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post: Option<bool>,
+    /// The human confirmed the pre-flight warnings (`POST
+    /// /review/preflight`): a single-PR review may then run on a PR skipped
+    /// as `draft` or `config` and past the diff-size cap. Absent (an older
+    /// client) is `false`: such a PR is not enqueued, and an oversized one
+    /// is held back by the cap without an engine run, as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub confirm: bool,
+}
+
+/// `POST /review/preflight`: the PR reference to check (any form
+/// `POST /review` takes, but not `all`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreflightRequest {
+    pub key: String,
 }
 
 impl ReviewRequest {
@@ -509,6 +593,7 @@ async fn review_handler(
                         due: now,
                         force: req.force,
                         overrides: overrides.clone(),
+                        confirmed: false,
                     });
                 }
             }
@@ -559,7 +644,7 @@ async fn review_handler(
         );
     };
     let eligible = if req.force {
-        is_reviewable(rec)
+        is_reviewable(rec) || (req.confirm && confirmable(rec))
     } else {
         machine::is_review_due(rec, &repo.cooldown, now)
     };
@@ -577,6 +662,7 @@ async fn review_handler(
             due: now,
             force: req.force,
             overrides,
+            confirmed: req.confirm,
         }])
         .await;
     let mut notes = Vec::new();
@@ -772,24 +858,74 @@ async fn track_on_demand(
     shared.publish(&state);
 }
 
-/// Why a tracked PR is not enqueued: its state, plus the skip reason.
+/// Why a tracked PR is not enqueued: its state, plus the skip in a few
+/// words (`skipped — author dependabot[bot] excluded`), and how to review
+/// a rule-skipped PR anyway.
 fn not_eligible_note(key: &str, rec: &PrRecord) -> String {
-    let reason = rec
-        .skip_reason
-        .map(|reason| {
-            let reason = match reason {
-                SkipReason::Draft => "draft",
-                SkipReason::Config => "config rules",
-                SkipReason::Snoozed => "snoozed",
-                SkipReason::Ignored => "ignored",
+    let what = match (rec.state, rec.skip_text()) {
+        (PrState::Skipped, Some(text)) => format!("skipped \u{2014} {text}"),
+        (state, _) => format!("state {state:?}"),
+    };
+    let hint = if confirmable(rec) {
+        "; confirm the review to run it anyway"
+    } else {
+        ""
+    };
+    format!("{key} is not eligible for review right now ({what}){hint}")
+}
+
+/// A PR a confirmed single-PR review may run on although it is skipped:
+/// a `draft` or `config` skip (never a snooze or an ignore).
+fn confirmable(rec: &PrRecord) -> bool {
+    rec.state == PrState::Skipped && crate::preflight::confirmable_skip(rec.skip_reason)
+}
+
+/// `POST /review/preflight` (read-only): what a manual review of one PR
+/// needs confirmed first — a `draft` / `config` skip, a diff over the caps
+/// — or why it cannot run at all, plus the PR's size. Resolves the target
+/// like `POST /review`, but never tracks an untracked PR: the skip rules
+/// are evaluated on its fetched snapshot instead. The size is one
+/// `gh pr view`; when gh fails the answer has no size.
+async fn preflight_handler(
+    State(shared): State<Arc<Shared>>,
+    Json(req): Json<PreflightRequest>,
+) -> Response {
+    if req.key.trim() == "all" {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the pre-flight checks one PR, not `all`",
+        );
+    }
+    let live = shared.live();
+    let target = match resolve_target(&shared, &live, &req.key).await {
+        Ok(target) => target,
+        Err((status, message)) => return error_response(status, message),
+    };
+    let Some(repo) = live.repo(&target.repo) else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            format!("repo '{}' is not watched by this daemon", target.repo),
+        );
+    };
+    let key = PrRecord::key_for(&target.repo, target.number);
+    let snapshot = shared.snapshot();
+    let record = snapshot.prs.get(&key);
+    let mut input = crate::preflight::PreflightInput::for_repo(&key, repo);
+    input.record = record;
+    if repo.review_mode != ReviewMode::Off {
+        if record.is_none() {
+            let fetched = match target.fetched {
+                Some(fetched) => fetched,
+                None => match fetch_open_pr(&shared, &target.repo, target.number).await {
+                    Ok(fetched) => fetched,
+                    Err((status, message)) => return error_response(status, message),
+                },
             };
-            format!(", reason {reason}")
-        })
-        .unwrap_or_default();
-    format!(
-        "{key} is not eligible for review right now (state {:?}{reason})",
-        rec.state
-    )
+            input.untracked_skip = machine::skip_decision(&fetched, &repo.skip);
+        }
+        input.size = crate::preflight::measure(&shared.deps.gh, &target.repo, target.number).await;
+    }
+    Json(crate::preflight::check(&input)).into_response()
 }
 
 /// The pipeline's own legality check: pending or already reviewed (a force
@@ -1147,6 +1283,7 @@ async fn get_config_handler(State(shared): State<Arc<Shared>>) -> Response {
                     .to_string(),
             ),
         ]),
+        config_state: shared.config_revision(),
     })
     .into_response()
 }
@@ -1226,10 +1363,41 @@ async fn put_config_handler(
             added: summary.added,
             removed: summary.removed,
             discarded: summary.discarded,
+            config_state: shared.config_revision(),
         })
         .into_response(),
         Err(e) => config_write_error_response(e),
     }
+}
+
+/// `POST /config/reload`: re-read the config file now (the watcher's path,
+/// without waiting for its next look) and say what happened. CLI commands
+/// that edit the file and PRX.app (on a file change) call it so the change
+/// is running before they report or refresh.
+async fn reload_config_handler(State(shared): State<Arc<Shared>>) -> Response {
+    let (outcome, error, added, removed) = match shared.check_config_file().await {
+        ConfigCheck::NoFile => {
+            return error_response(StatusCode::CONFLICT, "this daemon has no config file")
+        }
+        ConfigCheck::Unchanged => (ConfigReloadOutcome::Unchanged, None, vec![], vec![]),
+        ConfigCheck::Applied(summary) => (
+            ConfigReloadOutcome::Applied,
+            None,
+            summary.added,
+            summary.removed,
+        ),
+        ConfigCheck::Rejected(message) => {
+            (ConfigReloadOutcome::Rejected, Some(message), vec![], vec![])
+        }
+    };
+    Json(ConfigReloadResponse {
+        outcome,
+        error,
+        added,
+        removed,
+        config_state: shared.config_revision(),
+    })
+    .into_response()
 }
 
 /// `POST /review-mode` (design D5/D3): set `defaults.review_mode`, persist
@@ -1862,15 +2030,53 @@ impl DaemonClient {
         force: bool,
         overrides: &ReviewOverrides,
     ) -> Result<ReviewResponse> {
+        self.review_confirmed(target, force, overrides, false).await
+    }
+
+    /// [`DaemonClient::review_with`] with the human's confirmation of the
+    /// pre-flight warnings (`confirm`).
+    pub async fn review_confirmed(
+        &self,
+        target: &str,
+        force: bool,
+        overrides: &ReviewOverrides,
+        confirm: bool,
+    ) -> Result<ReviewResponse> {
         let body = ReviewRequest {
             key: target.to_string(),
             force,
             extra_prompt: overrides.extra_prompt.clone(),
             engine: overrides.engine.clone(),
             post: overrides.post,
+            confirm,
         };
         let body = serde_json::to_value(&body).context("cannot encode the review request")?;
         self.request("POST", "/review", Some(body)).await
+    }
+
+    /// `POST /review/preflight` for one target. `Ok(None)` when the daemon
+    /// predates the route (a bare 404 with no error body): such a daemon
+    /// never runs a skipped or oversized review, so there is nothing to
+    /// confirm.
+    pub async fn preflight(&self, target: &str) -> Result<Option<crate::preflight::Preflight>> {
+        let body = serde_json::to_value(PreflightRequest {
+            key: target.to_string(),
+        })
+        .context("cannot encode the pre-flight request")?;
+        let (status, bytes) = self
+            .raw("POST", "/review/preflight", Some(body))
+            .await
+            .context("daemon request failed")?;
+        if status.is_success() {
+            return serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|e| anyhow!("invalid daemon response: {e}"));
+        }
+        match serde_json::from_slice::<ApiError>(&bytes) {
+            Ok(e) => anyhow::bail!("daemon returned {status}: {}", e.error),
+            Err(_) if status == StatusCode::NOT_FOUND => Ok(None),
+            Err(_) => anyhow::bail!("daemon returned {status}: HTTP {status}"),
+        }
     }
 
     pub async fn get_config(&self) -> Result<ConfigResponse> {
@@ -1922,6 +2128,12 @@ impl DaemonClient {
             anyhow::bail!("daemon returned {status}: {message}");
         }
         serde_json::from_slice(&bytes).map_err(|e| anyhow!("invalid daemon response: {e}"))
+    }
+
+    /// `POST /config/reload`: have the daemon re-read the config file now.
+    pub async fn reload_config(&self) -> Result<ConfigReloadResponse> {
+        self.request("POST", "/config/reload", Some(json!({})))
+            .await
     }
 
     /// `GET /discover/agents`.
@@ -2131,7 +2343,36 @@ mod tests {
             paused_until: None,
             engines: vec![],
             menu: MenuSettings::default(),
+            config_state: ConfigRevision::default(),
+            poll_health: BTreeMap::new(),
+            restart_recommended: false,
         }
+    }
+
+    /// Poll health is additive: absent while empty or false, and a payload
+    /// without it (an older daemon) decodes as healthy.
+    #[test]
+    fn status_payload_carries_poll_health_only_when_present() {
+        let healthy = serde_json::to_value(status_payload(None, ReviewMode::Monitor)).unwrap();
+        assert!(healthy.get("poll_health").is_none());
+        assert!(healthy.get("restart_recommended").is_none());
+
+        let mut failing = status_payload(None, ReviewMode::Monitor);
+        let mut record = crate::health::RepoPollHealth::default();
+        record.record_failure(Utc::now(), "tls: failed to verify certificate");
+        failing.poll_health.insert("org/one".into(), record);
+        failing.restart_recommended = true;
+        let json = serde_json::to_value(&failing).unwrap();
+        assert_eq!(json["poll_health"]["org/one"]["consecutive_failures"], 1);
+        assert_eq!(json["restart_recommended"], true);
+        let back: StatusResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(back.poll_health, failing.poll_health);
+        assert!(back.restart_recommended);
+
+        let mut older = healthy;
+        older.as_object_mut().unwrap().remove("menu");
+        let parsed: StatusResponse = serde_json::from_value(older).unwrap();
+        assert!(parsed.poll_health.is_empty() && !parsed.restart_recommended);
     }
 
     /// 5.1: the payload carries `review_mode` and (only while set)
@@ -2177,6 +2418,29 @@ mod tests {
         let parsed: StatusResponse = serde_json::from_value(old).unwrap();
         assert_eq!(parsed.review_mode, ReviewMode::ReviewComment);
         assert_eq!(parsed.config_error, None);
+        assert_eq!(parsed.config_state, ConfigRevision::default());
+    }
+
+    /// The config revision rides flat on the payload, only when known, and
+    /// reads back; `restart_required` is omitted while empty.
+    #[test]
+    fn status_payload_carries_the_config_revision_flat() {
+        let mut payload = status_payload(None, ReviewMode::Monitor);
+        let quiet = serde_json::to_value(&payload).unwrap();
+        for field in ["config_revision", "config_loaded_at", "restart_required"] {
+            assert!(quiet.get(field).is_none(), "{field} present");
+        }
+        payload.config_state = ConfigRevision {
+            config_revision: Some(4),
+            config_loaded_at: Some("2026-11-01T00:00:00Z".parse().unwrap()),
+            restart_required: vec!["max_concurrent_reviews".into()],
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["config_revision"], 4);
+        assert_eq!(value["config_loaded_at"], "2026-11-01T00:00:00Z");
+        assert_eq!(value["restart_required"][0], "max_concurrent_reviews");
+        let back: StatusResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(back.config_state, payload.config_state);
     }
 
     /// Wire compatibility, daemon → newer client: a `/status` body holding

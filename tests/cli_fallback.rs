@@ -436,6 +436,57 @@ fn review_needs_a_target_or_all_but_not_both() {
     assert!(env.gh_calls().is_empty());
 }
 
+/// With the daemon down, a PR skipped by a rule names the rule in
+/// `prx status`, and `prx review` asks before reviewing it: without a
+/// terminal and without `--yes` it refuses, naming the skip and `--yes`,
+/// and no engine runs.
+#[test]
+fn review_of_a_rule_skipped_pr_needs_confirmation_in_process() {
+    let env = Env::bare("review-skip");
+    write_file(
+        &env.config,
+        &config_with(&["org/one"], "  skip:\n    authors: [alice]\n"),
+    );
+    write_list_fixture(
+        env.gh_dir.path(),
+        "org/one",
+        &[pr_json(
+            1,
+            "Add feature",
+            "alice",
+            "f/x",
+            "aaaa",
+            false,
+            "2026-09-01T10:00:00Z",
+        )],
+    );
+    let out = env.run(&["status"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("Skipped \u{2014} author alice excluded"),
+        "{}",
+        stdout_of(&out)
+    );
+    let rec = env.state().prs["org/one#1"].clone();
+    assert_eq!(rec.skip_detail.as_deref(), Some("author alice excluded"));
+
+    let out = env.run(&["review", "org/one#1"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout_of(&out));
+    let err = stderr_of(&out);
+    assert!(err.contains("daemon not running"), "{err}");
+    assert!(
+        err.contains("- Skipped \u{2014} author alice excluded"),
+        "{err}"
+    );
+    assert!(err.contains("rerun with --yes"), "{err}");
+    assert!(
+        !env.gh_calls().iter().any(|c| c.contains("pr review")),
+        "{:?}",
+        env.gh_calls()
+    );
+    assert_eq!(env.state().prs["org/one#1"].last_verdict, None);
+}
+
 // --------------------------------------------------------------- no config
 
 /// With no config file, every command that needs one fails with exit code

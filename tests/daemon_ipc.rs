@@ -3821,7 +3821,8 @@ async fn review_targets_resolve_against_watched_repos_and_track_on_demand() {
     assert!(resp.enqueued.is_empty(), "{resp:?}");
     let note = resp.note.unwrap_or_default();
     assert!(note.contains("not eligible"), "{note}");
-    assert!(note.contains("reason draft"), "{note}");
+    assert!(note.contains("skipped \u{2014} draft"), "{note}");
+    assert!(note.contains("confirm"), "{note}");
     let rec = env.state().prs["org/two#50"].clone();
     assert_eq!(rec.state, PrState::Skipped);
     assert_eq!(rec.skip_reason, Some(SkipReason::Draft));
@@ -5394,5 +5395,196 @@ async fn a_crashing_or_hanging_agent_fails_the_review_and_frees_the_queue() {
     assert_eq!(rec.state, PrState::ReviewedApproved);
     assert_eq!(rec.last_verdict, Some(Verdict::Approved));
     assert_eq!(count_calls(&env.gh_dir, "pr review"), 1);
+    handle.shutdown().await;
+}
+
+// ------------------------------------------------------------ poll health
+
+/// Polls that keep failing show in `/status` per repo, a TLS failure on
+/// every repo raises the restart request (thresholds shrunk for the test),
+/// a successful poll clears the record, and an auth failure never asks for
+/// a restart.
+#[tokio::test]
+async fn failing_polls_are_reported_and_recommend_a_restart_only_for_environment_errors() {
+    let _env = env_guard();
+    let env = Env::new("ipc-poll-health");
+    env.configure(&["org/one", "org/two"], "", &[]);
+    for repo in ["org/one", "org/two"] {
+        write_list_fixture(env.gh_dir.path(), repo, &[]);
+    }
+    let tls = "Post \"https://api.github.com/graphql\": tls: failed to verify certificate: \
+               x509: OSStatus -26276";
+    write_file(&env.gh_dir.child("list.error"), &format!("{tls}\n"));
+    let handle = env
+        .start(SchedulerOptions {
+            health: prx::health::HealthThresholds {
+                failing_after: 3,
+                restart_after_streak: Duration::ZERO,
+                restart_min_uptime: Duration::ZERO,
+            },
+            ..fast_opts()
+        })
+        .await;
+    let client = env.client(&handle);
+
+    wait_for(
+        || async {
+            client.get_status().await.is_ok_and(|s| {
+                s.poll_health.len() == 2
+                    && s.poll_health.values().all(|h| h.consecutive_failures >= 3)
+            })
+        },
+        Duration::from_secs(20),
+        "three failed polls per repo",
+    )
+    .await;
+    let status = client.get_status().await.unwrap();
+    let one = &status.poll_health["org/one"];
+    assert_eq!(one.last_error.as_deref(), Some(tls));
+    assert!(one.failing_since.is_some() && one.last_success.is_none());
+    assert_eq!(one.poll_interval_minutes, 15);
+    assert!(status.restart_recommended);
+    tokio::time::timeout(Duration::from_secs(5), handle.shared.restart_requested())
+        .await
+        .expect("the restart request is raised");
+
+    // GitHub is reachable again: the next poll clears the record.
+    std::fs::remove_file(env.gh_dir.child("list.error")).unwrap();
+    wait_for(
+        || async {
+            client.get_status().await.is_ok_and(|s| {
+                s.poll_health
+                    .values()
+                    .all(|h| h.consecutive_failures == 0 && h.last_success.is_some())
+            })
+        },
+        Duration::from_secs(20),
+        "a successful poll",
+    )
+    .await;
+    let status = client.get_status().await.unwrap();
+    assert!(!status.restart_recommended);
+    assert!(status.poll_health["org/one"].last_error.is_none());
+
+    // Auth expiry: failing, but a restart cannot fix it.
+    write_file(
+        &env.gh_dir.child("list.error"),
+        "gh: To get started with GitHub CLI, please run: gh auth login\n",
+    );
+    wait_for(
+        || async {
+            client
+                .get_status()
+                .await
+                .is_ok_and(|s| s.poll_health.values().all(|h| h.consecutive_failures >= 3))
+        },
+        Duration::from_secs(20),
+        "three failed polls per repo",
+    )
+    .await;
+    assert!(!client.get_status().await.unwrap().restart_recommended);
+    handle.shutdown().await;
+}
+
+/// The review pre-flight (`POST /review/preflight`) and `confirm`: a draft
+/// warns with its skip, an oversized PR with its size against the cap, a
+/// plain PR needs nothing; the pre-flight tracks nothing. Without `confirm`
+/// a draft is not enqueued (an older client's behaviour); confirmed, it is
+/// reviewed once and stays skipped. Mode `off` is blocked, not a warning.
+#[tokio::test]
+async fn preflight_warns_and_a_confirmed_review_runs_past_the_skip() {
+    let _env = env_guard();
+    let env = Env::new("ipc-preflight");
+    let manifest = approved_manifest();
+    env.configure(
+        &["org/one", "org/three"],
+        "  diff_max_lines: 1500\n",
+        &[("FAKE_AGENT_MANIFEST_JSON", manifest.as_str())],
+    );
+    let config = std::fs::read_to_string(&env.config).unwrap().replacen(
+        "  - name: org/three\n",
+        "  - name: org/three\n    review_mode: off\n",
+        1,
+    );
+    write_file(&env.config, &config);
+    for repo in ["org/one", "org/three"] {
+        write_list_fixture(env.gh_dir.path(), repo, &[]);
+    }
+    let gh = env.gh_dir.path();
+    write_pr_fixture(gh, "org/one", 5, &fresh_pr(5, true));
+    write_pr_fixture(gh, "org/one", 6, &fresh_pr(6, false));
+    write_pr_fixture(gh, "org/one", 7, &fresh_pr(7, false));
+    write_pr_fixture(gh, "org/three", 8, &fresh_pr(8, false));
+    write_file(
+        &env.gh_dir.child("org_one#6.detail.json"),
+        r#"{"files":[{"path":"a"}],"additions":2000,"deletions":140,"commits":[{"oid":"aaaa"}]}"#,
+    );
+    write_file(
+        &env.gh_dir.child("org_one#7.detail.json"),
+        r#"{"files":[{"path":"a"}],"additions":10,"deletions":2,"commits":[{"oid":"aaaa"}]}"#,
+    );
+    let handle = env.start(fast_opts()).await;
+    let client = env.client(&handle);
+
+    let draft = client.preflight("org/one#5").await.unwrap().unwrap();
+    assert!(draft.needs_confirmation(), "{draft:?}");
+    assert_eq!(draft.warnings[0].message, "Skipped \u{2014} draft");
+    let large = client.preflight("6").await.unwrap().unwrap();
+    assert_eq!(large.key, "org/one#6");
+    assert_eq!(
+        large.warnings[0].message,
+        "Large PR \u{2014} 2,140 lines changed (limit 1,500)"
+    );
+    assert_eq!(large.size.unwrap().lines, 2140);
+    let plain = client.preflight("org/one#7").await.unwrap().unwrap();
+    assert!(!plain.needs_confirmation(), "{plain:?}");
+    assert_eq!(plain.size.unwrap().lines, 12);
+    let off = client.preflight("org/three#8").await.unwrap().unwrap();
+    assert_eq!(
+        off.blocked.as_deref(),
+        Some("review mode is off for org/three")
+    );
+    assert!(!off.needs_confirmation());
+    assert!(env.state().prs.is_empty(), "the pre-flight tracks nothing");
+
+    // Unconfirmed (an older client): tracked as skipped, not enqueued.
+    let plain_opts = ReviewOverrides::default();
+    let resp = client
+        .review_with("org/one#5", true, &plain_opts)
+        .await
+        .unwrap();
+    assert!(resp.enqueued.is_empty(), "{resp:?}");
+    assert!(
+        resp.note
+            .unwrap_or_default()
+            .contains("skipped \u{2014} draft"),
+        "the note names the skip"
+    );
+    let rec = env.state().prs["org/one#5"].clone();
+    assert_eq!(rec.skip_reason, Some(SkipReason::Draft));
+    let status = client.get_status().await.unwrap();
+    let entry = status.prs.iter().find(|e| e.key == "org/one#5").unwrap();
+    assert_eq!(entry.skip_detail.as_deref(), Some("draft"));
+    assert_eq!(entry.summary, "Skipped \u{2014} draft");
+
+    // Confirmed: reviewed once, and still skipped as a draft.
+    let resp = client
+        .review_confirmed("org/one#5", true, &plain_opts, true)
+        .await
+        .unwrap();
+    assert_eq!(resp.enqueued, vec!["org/one#5".to_string()]);
+    wait_completed_and_idle(&env, &client, 1, "the confirmed review").await;
+    let rec = env.state().prs["org/one#5"].clone();
+    assert_eq!(rec.state, PrState::Skipped);
+    assert_eq!(rec.skip_reason, Some(SkipReason::Draft));
+    assert!(rec.last_verdict.is_some(), "{rec:?}");
+
+    // Mode off declines, confirmed or not.
+    let resp = client
+        .review_confirmed("org/three#8", true, &plain_opts, true)
+        .await
+        .unwrap();
+    assert!(resp.enqueued.is_empty());
+    assert!(resp.note.unwrap_or_default().contains("review mode is off"));
     handle.shutdown().await;
 }

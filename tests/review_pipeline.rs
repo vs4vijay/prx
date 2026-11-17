@@ -208,6 +208,15 @@ fn review_end_to_end_changes_requested() {
     assert_eq!(rec.nit_count, 2);
     assert_eq!(rec.last_reviewed_sha.as_deref(), Some("aaaa"));
     assert_eq!(rec.review_session.as_deref(), Some("sess-7"));
+    // Review Chat: where the session lives (the engine and the directory
+    // the agent ran in, which is prx's own) and the run's manifest.
+    let info = rec.review_session_info.clone().expect("session origin");
+    assert_eq!(info.engine, "fake");
+    assert_eq!(info.workdir, std::env::current_dir().ok());
+    let manifest = rec.last_manifest.clone().expect("manifest path");
+    assert!(std::fs::read_to_string(&manifest)
+        .unwrap()
+        .contains("fixture summary"));
     assert!(!rec.diff_too_large);
 
     // History: one enriched review_completed entry.
@@ -457,12 +466,27 @@ fn review_diff_cap_skips_the_agent_and_posts_nothing() {
     );
 
     let manifest = blocking_manifest();
+    // A manual review asks first; without a terminal it is refused before
+    // anything runs or is recorded.
     let out = env.run(
         &["review", "org/one#1"],
         &[("FAKE_AGENT_MANIFEST_JSON", manifest.as_str())],
     );
+    assert!(!out.status.success(), "{}", stdout_of(&out));
+    assert!(
+        stderr_of(&out).contains("Large PR \u{2014} 3 files changed (limit 2)"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(env.history().is_empty());
+
+    // `--all` (automatic) is held back by the cap.
+    let out = env.run(
+        &["review", "--all"],
+        &[("FAKE_AGENT_MANIFEST_JSON", manifest.as_str())],
+    );
     assert!(out.status.success(), "{}", stderr_of(&out));
-    assert!(stdout_of(&out).contains("skipped \u{2014} diff too large"));
+    assert!(stdout_of(&out).contains("org/one#1: skipped \u{2014} diff too large"));
 
     // NO agent ran: no manifest anywhere, no gh writes, state stays pending
     // but flagged (A14), history records the skip.
@@ -476,25 +500,61 @@ fn review_diff_cap_skips_the_agent_and_posts_nothing() {
     assert_eq!(rec.last_verdict, None);
 
     // The line-count cap triggers the same skip for PR 2.
-    let out = env.run(
-        &["review", "org/one#2"],
-        &[("FAKE_AGENT_MANIFEST_JSON", manifest.as_str())],
-    );
-    assert!(out.status.success());
-    assert!(stdout_of(&out).contains("diff too large"));
+    assert!(stdout_of(&out).contains("org/one#2: skipped \u{2014} diff too large"));
     assert!(env.state().prs["org/one#2"].diff_too_large);
 
-    // History: two review_skipped entries.
+    // History: two review_skipped entries naming the size.
     let history = env.history();
-    assert_eq!(history.len(), 2, "{history:?}");
-    assert!(history.iter().all(|e| matches!(
-        e,
-        prx::history::HistoryEntry::ReviewSkipped { reason, .. } if reason == "diff too large"
-    )));
+    let reasons: Vec<String> = history
+        .iter()
+        .filter_map(|e| match e {
+            prx::history::HistoryEntry::ReviewSkipped { reason, .. } => Some(reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reasons
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "diff too large \u{2014} 3 files changed (limit 2)",
+            "diff too large \u{2014} 5,000 lines changed (limit 4,000)",
+        ]
+        .into_iter()
+        .collect(),
+        "{history:?}"
+    );
 
-    // Status surfaces the note.
-    let out = env.run(&["status"], &[]);
-    assert!(stdout_of(&out).contains("diff too large"));
+    // Status names the size.
+    let out = env.run(&["status", "--json"], &[]);
+    let entries: serde_json::Value = serde_json::from_str(&stdout_of(&out)).unwrap();
+    let pr2 = entries
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["key"] == "org/one#2")
+        .unwrap();
+    assert_eq!(
+        pr2["summary"],
+        "Skipped \u{2014} 5,000 lines changed (limit 4,000)"
+    );
+    assert_eq!(pr2["skip_detail"], "5,000 lines changed (limit 4,000)");
+
+    // Confirmed with --yes, the review runs past the cap.
+    let out = env.run(
+        &["review", "org/one#2", "--yes"],
+        &[("FAKE_AGENT_MANIFEST_JSON", manifest.as_str())],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains("org/one#2: reviewed"),
+        "{}",
+        stdout_of(&out)
+    );
+    let rec = env.state().prs["org/one#2"].clone();
+    assert!(!rec.diff_too_large);
+    assert_eq!(rec.skip_detail, None);
 }
 
 #[test]
@@ -2021,10 +2081,11 @@ fn re_review_cooldown_starts_when_new_commits_are_seen() {
     );
 }
 
-/// A draft is skipped, and an explicit review does not override that: no
-/// agent run, no GitHub write, and the reason is named.
+/// A draft is skipped, and an explicit review does not override that
+/// without a confirmation: no agent run, no GitHub write, and the reason is
+/// named. With `--yes` it is reviewed once and stays skipped.
 #[test]
-fn explicit_review_of_a_draft_is_refused() {
+fn explicit_review_of_a_draft_needs_confirmation() {
     let env = Env::new("rev-draft");
     env.write_config(&["org/one"], "");
     env.write_default_prompt(DEFAULT_PROMPT);
@@ -2044,10 +2105,11 @@ fn explicit_review_of_a_draft_is_refused() {
     );
     assert!(!out.status.success());
     assert!(
-        stderr_of(&out).contains("org/one#1 is skipped (draft)"),
+        stderr_of(&out).contains("- Skipped \u{2014} draft"),
         "{}",
         stderr_of(&out)
     );
+    assert!(stderr_of(&out).contains("--yes"), "{}", stderr_of(&out));
     assert_eq!(agent_runs(&runs_log), 0);
     assert!(github_writes(&env).is_empty(), "{:?}", env.calls());
     let rec = env.state().prs["org/one#1"].clone();
@@ -2055,6 +2117,24 @@ fn explicit_review_of_a_draft_is_refused() {
     assert_eq!(rec.skip_reason, Some(prx::state::SkipReason::Draft));
 
     // --all never picks a draft up either.
+    let out = env.run(&["review", "--all"], &[]);
+    assert!(stdout_of(&out).contains("no PRs are due for review"));
+
+    // Confirmed, the draft is reviewed once and stays skipped as a draft.
+    let out = env.run(
+        &["review", "org/one#1", "--yes"],
+        &[
+            ("FAKE_AGENT_MANIFEST_JSON", manifest.as_str()),
+            ("FAKE_AGENT_RUNS_LOG", runs_log.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(agent_runs(&runs_log), 1);
+    let rec = env.state().prs["org/one#1"].clone();
+    assert_eq!(rec.state, prx::state::PrState::Skipped);
+    assert_eq!(rec.skip_reason, Some(prx::state::SkipReason::Draft));
+    assert_eq!(rec.last_verdict, Some(prx::state::Verdict::Approved));
+    assert_eq!(rec.last_reviewed_sha.as_deref(), Some("aaaa"));
     let out = env.run(&["review", "--all"], &[]);
     assert!(stdout_of(&out).contains("no PRs are due for review"));
 }

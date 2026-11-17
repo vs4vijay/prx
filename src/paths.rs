@@ -67,6 +67,13 @@ pub fn daemon_token_file() -> PathBuf {
     data_dir().join("daemon.token")
 }
 
+/// Written by `prx daemon stop` and removed by the next daemon start: while
+/// it exists, the last daemon was stopped on purpose, so PRX.app does not
+/// start a new one on its own.
+pub fn daemon_stop_marker() -> PathBuf {
+    data_dir().join("daemon.stop-requested")
+}
+
 fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }

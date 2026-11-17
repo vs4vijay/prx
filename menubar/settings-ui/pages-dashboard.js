@@ -9,6 +9,8 @@
   const O = node ? require("./overview.js") : root.prxOverview;
 
   const ATTENTION_ROWS = 5;
+  // Consecutive failed polls that make a repo "failing" (prx::health).
+  const FAILING_AFTER = O.FAILING_AFTER;
   const RECENT_ROWS = 6;
   // The bridge calls one refresh makes. History asks for more rows than it
   // shows: Recent activity keeps only the latest event per PR.
@@ -54,6 +56,7 @@
           stateId: entryState(e) };
       }),
       configError: (status && status.config_error) || null,
+      sync: syncWarning(status, now),
       week: overall ? {
         tokens: O.tokenTotal(overall),
         tokensText: O.formatTokens(O.tokenTotal(overall)),
@@ -63,6 +66,32 @@
         withoutUsage: usage.runs_without_usage || 0,
       } : null,
       usageUnsupported: !!usageError && usageError.kind === "unsupported",
+    };
+  }
+
+  // GET /status poll_health -> the failing repos in one view (null when
+  // every repo syncs): names, the streak's start, the longest streak and
+  // its error, and whether the daemon recommends a restart.
+  function syncWarning(status, now) {
+    const health = (status && status.poll_health) || {};
+    const failing = Object.keys(health).sort().filter(function (repo) {
+      return (health[repo].consecutive_failures || 0) >= FAILING_AFTER;
+    });
+    if (!failing.length) return null;
+    const worst = failing.reduce(function (a, b) {
+      return (health[b].consecutive_failures || 0) > (health[a].consecutive_failures || 0) ? b : a;
+    });
+    const starts = failing.map(function (r) { return health[r].failing_since; }).filter(Boolean).sort();
+    const polled = Object.keys(health).length;
+    return {
+      repos: failing,
+      label: failing.length === 1 ? failing[0]
+        : failing.length < polled ? failing[0] + " and " + (failing.length - 1) + " more"
+          : "all " + failing.length + " repos",
+      failures: health[worst].consecutive_failures,
+      error: health[worst].last_error || "unknown error",
+      since: starts.length ? O.ago(starts[0], now) : "",
+      restart: !!status.restart_recommended,
     };
   }
 
@@ -88,7 +117,7 @@
     return null;
   }
 
-  const api = { QUERIES: QUERIES, dashboardModel: dashboardModel, latestPerPr: latestPerPr, entryState: entryState };
+  const api = { QUERIES: QUERIES, dashboardModel: dashboardModel, latestPerPr: latestPerPr, entryState: entryState, syncWarning: syncWarning };
   if (node) { module.exports = api; return; }
 
   // ---- window -------------------------------------------------------------
@@ -124,6 +153,14 @@
       nodes.push(UI.banner("error", "alert", "config.yml has an error.",
         "PRX keeps running the last good version until it is fixed: `" + (m.configError.message || "invalid configuration") + "`",
         [UI.button("Open config.yml", function () { app.go("raw"); })]));
+    }
+    if (m.sync) {
+      nodes.push(UI.banner("error", "alert", "PRX can't sync with GitHub.",
+        "Polls for " + m.sync.label + " have failed " + m.sync.failures + " times in a row" +
+        (m.sync.since ? " (since " + m.sync.since + ")" : "") + ", so this page may be out of date: `" + m.sync.error + "`. " +
+        (m.sync.restart
+          ? "A fresh daemon should fix this, and PRX restarts it on its own. To restart it now, choose the Sync failing line in the PRX menu."
+          : "To restart the daemon, choose the Sync failing line in the PRX menu.")));
     }
     const S = root.prxSchema;
     const option = (S && S.MODE_OPTIONS || []).find(function (o) { return o.value === m.mode.mode; }) || { icon: "review", detail: "" };

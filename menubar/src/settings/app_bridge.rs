@@ -8,7 +8,11 @@
 //! JS → Rust   {"id": 1, "method": "app.info",            "params": {}}
 //!             {"id": 2, "method": "app.login_item.set",  "params": {"enabled": true}}
 //!             {"id": 3, "method": "app.cli.install",     "params": {}}
+//!             {"id": 4, "method": "app.review_chat.open", "params": {"key": "org/repo#13"}}
 //! ```
+//!
+//! `app.review_chat.open` (openspec change `review-chat`) opens a terminal
+//! window running the bundled `prx chat <key>` and answers `{opened: key}`.
 //!
 //! `app.info` answers `{bundle, version, login_item: {enabled, app,
 //! this_app}, cli: {link, target, state, on_path}}` where `state` is
@@ -46,6 +50,21 @@ pub fn handle(body: &str) -> Response {
             )),
         },
         "app.cli.install" => install_cli(&context),
+        "app.review_chat.open" => match params.get("key").and_then(Value::as_str) {
+            Some(key) => crate::review_chat::open_review_chat(
+                key,
+                context.prx.clone(),
+                &prx::paths::data_dir(),
+                &prx::paths::config_path(),
+                &crate::review_chat::SystemTerminal::default(),
+            )
+            .map(|_| json!({ "opened": key }))
+            .map_err(|e| app_error("rejected", e)),
+            None => Err(app_error(
+                "bad_request",
+                "app.review_chat.open: `key` must be a PR key like org/repo#13",
+            )),
+        },
         other => Err(app_error(
             "bad_request",
             format!("unknown bridge method '{other}'"),
@@ -338,6 +357,22 @@ mod tests {
         );
         assert_eq!(std::fs::read_link(&link).unwrap(), target);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `app.review_chat.open` needs a valid key; a bad one is refused
+    /// before anything is written or opened (the real launcher is never
+    /// reached in tests).
+    #[test]
+    fn review_chat_open_validates_its_key() {
+        let reply = |body: &str| serde_json::to_value(handle(body)).unwrap();
+        let missing = reply(r#"{"id":1,"method":"app.review_chat.open","params":{}}"#);
+        assert_eq!(missing["ok"], false);
+        assert_eq!(missing["error"]["kind"], "bad_request");
+        let hostile = reply(
+            r#"{"id":2,"method":"app.review_chat.open","params":{"key":"org/repo#1'; rm -rf ~"}}"#,
+        );
+        assert_eq!(hostile["ok"], false);
+        assert_eq!(hostile["error"]["kind"], "rejected");
     }
 
     #[test]

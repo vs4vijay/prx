@@ -76,8 +76,9 @@ function prs() {
     pr("acme/web#6", "reviewed_changes_requested", { title: LONG, last_verdict: "changes_requested", blocking_count: 2, nit_count: 1,
       last_review_at: ago(30 * MIN), summary: "2 blocking", engine: "codex",
       brief: { text: "Rewrites the session store.", created_at: ago(DAY), updated_at: ago(DAY), head_sha: "old", source: "on_demand", stale: true } }),
-    pr("solo/tool#7", "skipped", { skip_reason: "draft" }),
-    pr("solo/tool#8", "skipped", { skip_reason: "config" }),
+    pr("solo/tool#7", "skipped", { skip_reason: "draft", skip_detail: "draft", summary: "Skipped \u2014 draft" }),
+    pr("solo/tool#8", "skipped", { skip_reason: "config", skip_detail: "author dependabot[bot] excluded",
+      summary: "Skipped \u2014 author dependabot[bot] excluded" }),
     pr("solo/tool#9", "skipped", { skip_reason: "snoozed" }),
     pr("solo/tool#10", "skipped", { skip_reason: "ignored", brief_available: false }),
     pr("acme/api#11", "merged", { last_verdict: "approved", last_review_at: ago(3 * DAY), created_at: ago(9 * DAY) }),
@@ -152,6 +153,18 @@ function insights() {
   };
 }
 
+// POST /review/preflight for a PR that is skipped and over the line cap.
+function riskyPreflight(key) {
+  return {
+    key: key,
+    warnings: [
+      { kind: "skipped", message: "Skipped \u2014 author dependabot[bot] excluded" },
+      { kind: "too_large", message: "Large PR \u2014 2,140 lines changed (limit 1,500)" },
+    ],
+    size: { files_changed: 3, lines: 2140, max_files: 60, max_lines: 1500 },
+  };
+}
+
 // A daemon answering every bridge call the pages make. `handlers` overrides
 // per method: a value is returned as is, a function is called with the
 // params (and may throw a bridgeError).
@@ -167,7 +180,9 @@ function daemon(handlers) {
     "discover.repos": () => ({ repos: [] }),
     "browsers.list": () => ({ browsers: [], extra: [] }),
     "app.info": () => ({ bundle: null, login_item: { enabled: false }, cli: { state: "unavailable" } }),
+    "review.preflight": (params) => ({ key: params.target, warnings: [] }),
     "review.request": (params) => ({ enqueued: [params.target] }),
+    "app.review_chat.open": (params) => ({ opened: params.key }),
     "brief.request": () => ({ ok: true }),
     "pause.start": () => ({ ok: true }),
     "pause.resume": () => ({ ok: true }),
@@ -184,6 +199,13 @@ async function open(page, handlers, opts) {
   const w = boot(Object.assign({ hash: "#page=" + page, now: NOW, daemon: daemon(handlers) }, opts || {}));
   await w.settle();
   return w;
+}
+
+// The window opened on the PR details page at `key` (a raw hash when
+// `key` starts with "#").
+async function openPr(key, handlers, opts) {
+  const hash = key.startsWith("#") ? key : "#page=pr&pr=" + encodeURIComponent(key);
+  return open("pr", handlers, Object.assign({ hash: hash }, opts || {}));
 }
 
 // ---- driving a settings page ----------------------------------------------
@@ -243,5 +265,5 @@ function activeAttributes(node) {
 }
 
 module.exports = { NOW, MIN, HOUR, DAY, ago, EVIL, LONG, UNICODE, CONTRACT, SHIPPED_PROMPT, USAGE, config, pr, prs, status, entry, history, totals, usage,
-  insights, daemon, open, offline, failing, markupIn, activeAttributes,
+  insights, riskyPreflight, daemon, open, openPr, offline, failing, markupIn, activeAttributes,
   field, rowOf, errorOf, type, toggle, choose, pickOption, optionLabels, save, lastPut, storing };

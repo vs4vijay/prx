@@ -261,7 +261,7 @@ test("daemon offline: the offline state, the sidebar, and recovery on Try again"
   const gate = (answer) => () => { if (!up) X.offline(); return answer(); };
   const w = await X.open("dashboard", { "config.get": gate(X.config), "status.get": gate(X.status), "history.list": gate(() => ({ entries: X.history() })), "usage.get": gate(() => X.usage({})) });
   assert.equal(w.page.querySelector(".empty-title").textContent, "Daemon offline");
-  assert.match(w.page.querySelector(".empty-text").textContent, /Start it from the PRX menu bar \(Start daemon\) or with prx daemon start/);
+  assert.match(w.page.querySelector(".empty-text").textContent, /PRX starts it on its own.*choose Start daemon in the PRX menu bar, or run prx daemon start/);
   assert.equal(w.page.querySelector(".overview-body").getAttribute("aria-busy"), null);
   assert.equal(w.byId("daemon").textContent, "Daemon not running");
   assert.equal(w.byId("daemon").className, "daemon off");
@@ -379,4 +379,42 @@ test("a refused brief shows why, inline, on its own card only", async () => {
   await off.settle();
   assert.equal(section(off, "Needs attention").querySelectorAll("section.brief-card")[1].querySelector("[role=alert]").textContent,
     "Couldn't write the brief: the PRX daemon is not running.");
+});
+
+// ---- poll health -------------------------------------------------------------
+
+const TLS = "tls: failed to verify certificate: x509: OSStatus -26276";
+const failing = (n, since) => ({ consecutive_failures: n, last_error: TLS, failing_since: since, poll_interval_minutes: 15 });
+
+test("model: the sync warning needs three failed polls and names the repos", () => {
+  const base = { prs: [], poll_health: { "acme/api": failing(2, X.ago(3 * 60 * X.MIN)), "acme/web": { consecutive_failures: 0, last_success: X.ago(X.MIN) } } };
+  assert.equal(D.dashboardModel(base, null, null, null, X.NOW).sync, null);
+  assert.equal(D.dashboardModel({ prs: [] }, null, null, null, X.NOW).sync, null, "an older daemon reports nothing");
+  base.poll_health["acme/api"] = failing(5, X.ago(3 * 60 * X.MIN));
+  const one = D.dashboardModel(base, null, null, null, X.NOW).sync;
+  assert.deepEqual(one, { repos: ["acme/api"], label: "acme/api", failures: 5, error: TLS, since: "3h ago", restart: false });
+  base.poll_health["acme/web"] = failing(7, X.ago(60 * X.MIN));
+  base.restart_recommended = true;
+  const all = D.dashboardModel(base, null, null, null, X.NOW).sync;
+  assert.equal(all.label, "all 2 repos");
+  assert.equal(all.failures, 7);
+  assert.equal(all.since, "3h ago", "the earliest streak");
+  assert.equal(all.restart, true);
+});
+
+test("failing polls show a banner with the error, as text", async () => {
+  const w = await X.open("dashboard", { "status.get": () => X.status((s) => {
+    s.poll_health = { "acme/api": Object.assign(failing(4, X.ago(2 * 60 * X.MIN)), { last_error: X.EVIL }) };
+    s.restart_recommended = true;
+  }) });
+  const banner = w.page.querySelector(".banner.error");
+  assert.equal(banner.getAttribute("role"), "alert");
+  assert.equal(banner.querySelector("strong").textContent, "PRX can't sync with GitHub. ");
+  assert.match(banner.textContent, /Polls for acme\/api have failed 4 times in a row \(since 2h ago\)/);
+  assert.equal(banner.querySelector("code").textContent, X.EVIL);
+  assert.match(banner.textContent, /PRX restarts it on its own/);
+  assert.deepEqual(X.markupIn(banner), []);
+  // Synced again: the banner goes away on the next poll.
+  const healthy = await X.open("dashboard");
+  assert.equal(healthy.page.querySelector(".banner.error"), null);
 });

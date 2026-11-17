@@ -255,6 +255,7 @@ async fn review_once(engine: Engine) -> (Observed, Option<FakeTransport>) {
         store: &store,
         dry_run: false,
         fresh_session: false,
+        confirmed: false,
     };
     let outcome = pipeline
         .run_and_brief(&mut state, "org/one#1")

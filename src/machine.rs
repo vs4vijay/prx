@@ -214,28 +214,47 @@ pub fn apply(current: Option<&PrRecord>, event: Event, ctx: &MachineCtx) -> Tran
 /// Evaluate skip rules (DEV-PLAN §4, audits A11/A19). Draft skip wins when
 /// several rules match; all non-draft reasons collapse into `Config`.
 pub fn evaluate_skip(snapshot: &PrSnapshot, skip: &SkipConfig) -> Option<SkipReason> {
+    skip_decision(snapshot, skip).map(|(reason, _)| reason)
+}
+
+/// [`evaluate_skip`] plus which rule matched, in a few words, for
+/// `PrRecord.skip_detail`: `None` for a draft (the reason says it all),
+/// else `author <login> excluded`, `label <name> excluded`, or
+/// `branch <branch> matches <pattern>`. Rules are checked in that order.
+pub fn skip_decision(
+    snapshot: &PrSnapshot,
+    skip: &SkipConfig,
+) -> Option<(SkipReason, Option<String>)> {
     if skip.drafts && snapshot.is_draft {
-        return Some(SkipReason::Draft);
+        return Some((SkipReason::Draft, None));
     }
     if skip.authors.iter().any(|a| a == &snapshot.author) {
-        return Some(SkipReason::Config);
+        return Some((
+            SkipReason::Config,
+            Some(format!("author {} excluded", snapshot.author)),
+        ));
     }
     // A19: labels are case-insensitive EXACT matches, not prefixes.
-    if skip
+    if let Some(label) = snapshot
         .labels
         .iter()
-        .any(|l| snapshot.labels.iter().any(|pl| pl.eq_ignore_ascii_case(l)))
+        .find(|pl| skip.labels.iter().any(|l| pl.eq_ignore_ascii_case(l)))
     {
-        return Some(SkipReason::Config);
+        return Some((SkipReason::Config, Some(format!("label {label} excluded"))));
     }
     // Branch patterns are globs; invalid patterns were rejected by config
     // validation and are ignored here to keep the machine total.
-    if skip.branches.iter().any(|p| {
+    if let Some(pattern) = skip.branches.iter().find(|p| {
         Pattern::new(p)
             .map(|p| p.matches(&snapshot.head_branch))
             .unwrap_or(false)
     }) {
-        return Some(SkipReason::Config);
+        let detail = if *pattern == snapshot.head_branch {
+            format!("branch {pattern} excluded")
+        } else {
+            format!("branch {} matches {pattern}", snapshot.head_branch)
+        };
+        return Some((SkipReason::Config, Some(detail)));
     }
     None
 }
@@ -249,10 +268,11 @@ fn poll_new_pr(current: Option<&PrRecord>, snap: &PrSnapshot, ctx: &MachineCtx) 
         refresh_from_snapshot(&mut rec, snap, ctx.now);
         return Transition::changed(rec, Vec::new());
     }
-    match evaluate_skip(snap, ctx.skip) {
-        Some(reason) => {
+    match skip_decision(snap, ctx.skip) {
+        Some((reason, detail)) => {
             let mut rec = record_from_snapshot(snap, PrState::Skipped, ctx.now);
             rec.skip_reason = Some(reason);
+            rec.skip_detail = detail;
             Transition::changed(rec, vec![Effect::Notify(NotifyEvent::Skipped)])
         }
         None => {
@@ -410,10 +430,12 @@ fn poll_reopened(current: Option<&PrRecord>, snap: &PrSnapshot, ctx: &MachineCtx
             rec.review_session = None;
             rec.review_attempts = 0;
             rec.diff_too_large = false;
-            match evaluate_skip(snap, ctx.skip) {
-                Some(reason) => {
+            rec.skip_detail = None;
+            match skip_decision(snap, ctx.skip) {
+                Some((reason, detail)) => {
                     rec.state = PrState::Skipped;
                     rec.skip_reason = Some(reason);
+                    rec.skip_detail = detail;
                     rec.review_anchor_at = None;
                     Transition::changed(rec, vec![Effect::Notify(NotifyEvent::Skipped)])
                 }
@@ -468,6 +490,7 @@ fn poll_draft_flipped(
             }
             PrState::Skipped => {
                 rec.skip_reason = Some(SkipReason::Draft);
+                rec.skip_detail = None;
                 Transition::changed(rec, Vec::new())
             }
             // §6: `draft: true` from a non-draft → skipped(draft). If a
@@ -493,9 +516,10 @@ fn poll_draft_flipped(
             // §6: draft→ready flips Skipped(draft) → pending. Any other skip
             // reason needs its own exit (unignore / snooze expiry).
             PrState::Skipped if rec.skip_reason == Some(SkipReason::Draft) => {
-                match evaluate_skip(snap, ctx.skip) {
-                    Some(reason) => {
+                match skip_decision(snap, ctx.skip) {
+                    Some((reason, detail)) => {
                         rec.skip_reason = Some(reason);
+                        rec.skip_detail = detail;
                         Transition::changed(rec, Vec::new())
                     }
                     None => {
@@ -823,8 +847,11 @@ fn record_from_snapshot(snap: &PrSnapshot, state: PrState, now: DateTime<Utc>) -
         blocking_count: 0,
         nit_count: 0,
         review_session: None,
+        review_session_info: None,
+        last_manifest: None,
         review_attempts: 0,
         diff_too_large: false,
+        skip_detail: None,
         human_approved_at: None,
         exec_summary: None,
         brief: None,
@@ -2789,6 +2816,97 @@ mod tests {
             None
         );
         assert_eq!(evaluate_skip(&with("alice", "[unclosed"), &skip), None);
+    }
+
+    /// The skip detail names the rule that matched, in a few words.
+    #[test]
+    fn skip_decision_names_the_matching_rule() {
+        let skip = SkipConfig {
+            drafts: true,
+            authors: vec!["dependabot[bot]".into()],
+            labels: vec!["WIP".into()],
+            branches: vec!["release/*".into(), "main".into()],
+        };
+        let with = |author: &str, branch: &str, labels: &[&str], draft: bool| PrSnapshot {
+            author: author.into(),
+            head_branch: branch.into(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            is_draft: draft,
+            ..snap("aaaa")
+        };
+        let detail = |s: &PrSnapshot| skip_decision(s, &skip);
+        assert_eq!(
+            detail(&with("dependabot[bot]", "x", &[], true)),
+            Some((SkipReason::Draft, None)),
+            "a draft wins over every other rule"
+        );
+        assert_eq!(
+            detail(&with("dependabot[bot]", "x", &[], false)),
+            Some((
+                SkipReason::Config,
+                Some("author dependabot[bot] excluded".into())
+            ))
+        );
+        assert_eq!(
+            detail(&with("alice", "x", &["bug", "wip"], false)),
+            Some((SkipReason::Config, Some("label wip excluded".into())))
+        );
+        assert_eq!(
+            detail(&with("alice", "release/1.2", &[], false)),
+            Some((
+                SkipReason::Config,
+                Some("branch release/1.2 matches release/*".into())
+            ))
+        );
+        assert_eq!(
+            detail(&with("alice", "main", &[], false)),
+            Some((SkipReason::Config, Some("branch main excluded".into())))
+        );
+        assert_eq!(detail(&with("alice", "feat/x", &[], false)), None);
+    }
+
+    /// The machine stores the detail with the reason, and a draft flip
+    /// drops a rule detail that no longer applies.
+    #[test]
+    fn skipped_records_carry_their_detail() {
+        let skip = SkipConfig {
+            drafts: true,
+            authors: vec!["bot".into()],
+            labels: vec![],
+            branches: vec![],
+        };
+        let ctx = MachineCtx {
+            now: Utc::now(),
+            skip: &skip,
+            resume_sessions: false,
+        };
+        let snapshot = PrSnapshot {
+            author: "bot".into(),
+            ..snap("aaaa")
+        };
+        let tr = apply(
+            None,
+            Event::PollNewPr {
+                snapshot: snapshot.clone(),
+            },
+            &ctx,
+        );
+        let rec = record_of(&tr);
+        assert_eq!(rec.skip_detail.as_deref(), Some("author bot excluded"));
+        assert_eq!(rec.skip_text().as_deref(), Some("author bot excluded"));
+        let drafted = PrSnapshot {
+            is_draft: true,
+            ..snapshot
+        };
+        let tr = apply(
+            Some(&rec),
+            Event::PollDraftFlipped { snapshot: drafted },
+            &ctx,
+        );
+        let rec = record_of(&tr);
+        assert_eq!(rec.skip_reason, Some(SkipReason::Draft));
+        assert_eq!(rec.skip_detail, None);
+        assert_eq!(rec.skip_text().as_deref(), Some("draft"));
     }
 
     // -------------------------------------------------- misc invariants

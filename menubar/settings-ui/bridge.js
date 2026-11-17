@@ -43,5 +43,7 @@
     putConfigYaml: function (yaml) { return call("config.put", { yaml: yaml }); },
     // POST /review-mode: "off" | "monitor" | "review comment"
     setReviewMode: function (mode) { return call("review_mode.set", { mode: mode }); },
+    // Review Chat: a terminal window running `prx chat <key>` -> { opened }
+    openReviewChat: function (key) { return call("app.review_chat.open", { key: key }); },
   });
 })();

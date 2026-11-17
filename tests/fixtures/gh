@@ -24,6 +24,9 @@
 #                           verdict reviews (simulates GitHub's "Can not
 #                           request changes on your own pull request");
 #                           `--comment` reviews still succeed (degrade path)
+#                        list.error -> when present, every `gh pr list` prints
+#                           its text on stderr and exits 1 (a TLS or network
+#                           failure; delete the file to recover)
 #                        <org>_<repo>#<n>.review-body.txt <- stdin body captured
 #                           from `gh pr review ... --body-file -`
 #   FAKE_GH_LOG        if set, every invocation's args are appended (one line);
@@ -165,6 +168,10 @@ if [ "${1:-}" = "pr" ]; then
   name="${repo##*/}"
 
   if [ "$sub" = "list" ]; then
+    if [ -f "${FAKE_GH_DIR:-}/list.error" ]; then
+      cat "${FAKE_GH_DIR:-}/list.error" >&2
+      exit 1
+    fi
     if [ -n "${FAKE_GH_LIST_FAIL:-}" ]; then
       cfile="${FAKE_GH_DIR:-}/.list_fail_count"
       remaining=$(cat "$cfile" 2>/dev/null || echo "${FAKE_GH_LIST_FAIL}")

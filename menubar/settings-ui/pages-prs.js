@@ -1,10 +1,13 @@
 // Pull requests (app-window spec): every tracked PR in a sortable,
 // filterable table whose first sort follows `menu.sort`, with the menu bar's
 // review actions per row (Review, Review with an engine, Review without
-// posting, Review with prompt), a "Review PR…" box taking any PR
-// reference, and a detail row per PR (open it from the title) with the
-// PR's brief card (task 4.3). Reads status.get, sends review.request and
-// brief.request. The pure parts (sort,
+// posting, Review with prompt, Open Review Chat), a "Review PR…" box taking
+// any PR reference, and a detail row per PR (open it from the title) with
+// the PR's brief card (task 4.3) and a link to the PR details page. Reads
+// status.get, sends review.preflight, review.request, brief.request and
+// app.review_chat.open. A review whose pre-flight warns (the PR is skipped,
+// or its diff is over the caps) shows a confirm box first and is sent with
+// `confirm: true` only on "Review anyway". The pure parts (sort,
 // filters, the request each action sends) are exported for the node tests.
 (function (root) {
   "use strict";
@@ -119,6 +122,10 @@
     return target ? { target: target } : null;
   }
 
+  // The pre-flight confirmation helpers live in overview.js (shared with the
+  // PR details page); re-exported here for the node tests.
+  const needsConfirmation = O.needsConfirmation, confirmLines = O.confirmLines, confirmCost = O.confirmCost;
+
   // What to show after review.request answers.
   function reviewNote(result) {
     if (result && result.note) return result.note;
@@ -134,13 +141,14 @@
       age: O.shortAge(pr.created_at, now), verdict: O.verdictLabel(pr.last_verdict),
       findings: !pr.last_verdict ? "" : pr.blocking_count || pr.nit_count ? O.findings(pr.blocking_count, pr.nit_count) : "No findings",
       lastReview: pr.last_review_at ? O.ago(pr.last_review_at, now) : "never", engine: pr.engine || "", summary: pr.summary || "",
-      reviewable: canReview(pr),
+      reviewable: canReview(pr), skipNote: O.skipNote(pr),
     };
   }
 
   const api = { COLUMNS: COLUMNS, STATE_FILTERS: STATE_FILTERS, initialSort: initialSort, toggleSort: toggleSort, sortRows: sortRows,
     filterRows: filterRows, repoNames: repoNames, engineChoices: engineChoices, canReview: canReview, reviewRequest: reviewRequest,
-    targetRequest: targetRequest, reviewNote: reviewNote, rowModel: rowModel };
+    targetRequest: targetRequest, reviewNote: reviewNote, rowModel: rowModel,
+    needsConfirmation: needsConfirmation, confirmLines: confirmLines, confirmCost: confirmCost };
   if (node) { module.exports = api; return; }
 
   // ---- window -------------------------------------------------------------
@@ -163,7 +171,7 @@
     const view = app.view("prs", function () { return {}; });
     // The Dashboard's links create this view with only a `preset` when the
     // page has not been opened yet, so every other part is filled in here.
-    const blank = { filter: { repo: "", state: "", text: "" }, sort: null, notes: {}, prompt: null, pick: "", open: null };
+    const blank = { filter: { repo: "", state: "", text: "" }, sort: null, notes: {}, prompt: null, pick: "", open: null, confirm: null };
     Object.keys(blank).forEach(function (k) { if (view[k] === undefined) view[k] = blank[k]; });
     if (view.preset) { view.filter = view.preset; view.preset = null; }
     let status = null;
@@ -177,10 +185,15 @@
     const target = el("input", { type: "text", placeholder: "acme/api#42, a PR URL, api#42, or 42", "aria-label": "PR to review", spellcheck: "false" });
     target.value = view.pick;
     const pickNote = el("p", { class: "inline-note", role: "status" });
-    function pick() {
-      const req = targetRequest(target.value);
-      view.pick = target.value;
-      if (!req) { target.focus(); return; }
+    const pickConfirm = el("div");
+    function errorText(error) { return O.isOffline(error) ? "The PRX daemon is not running." : error.message; }
+
+    // The pre-flight, then `send` — or the confirm box (overview.js), which
+    // sends with `confirm: true` on "Review anyway".
+    function preflight(req, ask, send, fail) { O.reviewPreflight(bridge, req, ask, send, fail); }
+    function confirmBox(answer, onCancel, onConfirm) { return O.confirmBox(UI, answer, onCancel, onConfirm); }
+
+    function sendPick(req) {
       pickNote.className = "inline-note";
       pickNote.textContent = "Requesting…";
       bridge.call("review.request", req).then(function (result) {
@@ -190,7 +203,30 @@
         live.refresh();
       }, function (error) {
         pickNote.className = "inline-note error";
-        pickNote.textContent = O.isOffline(error) ? "The PRX daemon is not running." : error.message;
+        pickNote.textContent = errorText(error);
+      });
+    }
+
+    function pick() {
+      const req = targetRequest(target.value);
+      view.pick = target.value;
+      pickConfirm.replaceChildren();
+      if (!req) { target.focus(); return; }
+      pickNote.className = "inline-note";
+      pickNote.textContent = "Requesting…";
+      preflight(req, function (answer) {
+        pickNote.textContent = "";
+        pickConfirm.replaceChildren(confirmBox(answer, function () {
+          pickConfirm.replaceChildren();
+          pickNote.className = "inline-note";
+          pickNote.textContent = "Not reviewed.";
+        }, function () {
+          pickConfirm.replaceChildren();
+          sendPick(Object.assign({}, req, { confirm: true }));
+        }));
+      }, sendPick, function (error) {
+        pickNote.className = "inline-note error";
+        pickNote.textContent = errorText(error);
       });
     }
     target.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); pick(); } });
@@ -199,12 +235,14 @@
     rootNode.append(
       UI.header("Pull requests", "Every open PR in your watched repos. Select a title to see its brief and details."),
       el("div", { class: "review-pr" }, [el("label", { class: "row-label", text: "Review PR" }), target, UI.button("Review", pick, "primary"), pickNote]),
+      pickConfirm,
       el("div", { class: "toolbar" }, [search, repoBox, stateSelect, count]),
       tableBox);
 
     const briefs = root.prxBrief.controller(app, bridge, function () { draw(); }, function () { live.refresh(); });
 
-    // The PR detail (task 4.3): the brief card, then the row's facts.
+    // The PR detail (task 4.3): the brief card, then the row's facts and a
+    // link to the PR's own page (pages-pr.js).
     function detail(pr, r) {
       const facts = [r.verdict ? "Last verdict: " + r.verdict + (r.findings ? " (" + r.findings + ")" : "") : "Not reviewed yet",
         "Last review: " + r.lastReview, r.engine ? "Engine: " + r.engine : null, r.author ? "Author: " + r.author : null,
@@ -212,20 +250,48 @@
       return el("div", { class: "pr-detail", id: "pr-detail-" + pr.key.replace(/[^A-Za-z0-9_-]/g, "_") }, [
         briefs.card(pr),
         el("p", { class: "pr-facts", text: facts.join(" · ") }),
+        el("div", {}, [UI.button("Show details", function () { app.openPr(pr.key); }, "small")]),
       ]);
     }
 
-    function run(pr, action, opts) {
-      const req = reviewRequest(action, pr, opts);
+    function send(pr, req) {
       view.notes[pr.key] = { kind: "", text: "Requesting…" };
-      if (action === "prompt") view.prompt = null;
       draw();
       bridge.call("review.request", req).then(function (result) {
         view.notes[pr.key] = { kind: "ok", text: reviewNote(result) };
         draw();
         live.refresh();
       }, function (error) {
-        view.notes[pr.key] = { kind: "error", text: O.isOffline(error) ? "The PRX daemon is not running." : error.message };
+        view.notes[pr.key] = { kind: "error", text: errorText(error) };
+        draw();
+      });
+    }
+
+    function run(pr, action, opts) {
+      const req = reviewRequest(action, pr, opts);
+      view.notes[pr.key] = { kind: "", text: "Requesting…" };
+      if (action === "prompt") view.prompt = null;
+      view.confirm = null;
+      draw();
+      preflight(req, function (answer) {
+        delete view.notes[pr.key];
+        view.confirm = { key: pr.key, req: req, answer: answer };
+        draw();
+      }, function (r) { send(pr, r); }, function (error) {
+        view.notes[pr.key] = { kind: "error", text: errorText(error) };
+        draw();
+      });
+    }
+
+    // Review Chat: PRX.app opens a terminal running `prx chat <key>`.
+    function openChat(pr) {
+      view.notes[pr.key] = { kind: "", text: "Opening Review Chat…" };
+      draw();
+      bridge.call("app.review_chat.open", { key: pr.key }).then(function () {
+        view.notes[pr.key] = { kind: "ok", text: "Review Chat opened in Terminal." };
+        draw();
+      }, function (error) {
+        view.notes[pr.key] = { kind: "error", text: error.message };
         draw();
       });
     }
@@ -268,8 +334,12 @@
         view.prompt = { key: pr.key, prompt: "", engine: pr.engine || "", post: true };
         draw();
       } });
+      // Show details and Review Chat change nothing in PRX, so they stay on
+      // merged PRs too.
+      items.push({ separator: true });
+      items.push({ label: "Show details", onclick: function () { app.openPr(pr.key); } });
+      items.push({ label: "Open Review Chat…", onclick: function () { openChat(pr); } });
       if (row.url) {
-        items.push({ separator: true });
         items.push({ label: "Open in GitHub", onclick: function () { window.open(row.url, "_blank", "noopener"); } });
       }
       const review = UI.button("Review", function () { run(pr, "review"); }, "small");
@@ -314,7 +384,8 @@
         const open = view.open === pr.key;
         const detailId = "pr-detail-" + pr.key.replace(/[^A-Za-z0-9_-]/g, "_");
         body.append(el("tr", { class: "pr-row" + (r.terminal ? " terminal" : "") + (open ? " open" : "") }, [
-          el("td", { class: "state-cell" }, [O.pill(UI, r.stateId, r.state), r.findings ? el("span", { class: "sub", text: r.findings }) : null]),
+          el("td", { class: "state-cell" }, [O.pill(UI, r.stateId, r.state), r.findings ? el("span", { class: "sub", text: r.findings }) : null,
+            r.skipNote ? el("span", { class: "sub skip-note", text: r.skipNote }) : null]),
           el("td", {}, [el("div", { class: "pr-cell" }, [
             el("button", { type: "button", class: "row-open", title: r.title, "aria-expanded": open ? "true" : "false", "aria-controls": detailId,
               onclick: function () { view.open = open ? null : pr.key; draw(); }, text: r.title }),
@@ -330,6 +401,17 @@
         }
         if (view.prompt && view.prompt.key === pr.key && r.reviewable) {
           body.append(el("tr", { class: "detail-row" }, [el("td", { colspan: COLUMNS.length + 1 }, [promptForm(pr)])]));
+        }
+        const ask = view.confirm && view.confirm.key === pr.key && r.reviewable ? view.confirm : null;
+        if (ask) {
+          body.append(el("tr", { class: "detail-row" }, [el("td", { colspan: COLUMNS.length + 1 }, [confirmBox(ask.answer, function () {
+            view.confirm = null;
+            view.notes[pr.key] = { kind: "", text: "Not reviewed." };
+            draw();
+          }, function () {
+            view.confirm = null;
+            send(pr, Object.assign({}, ask.req, { confirm: true }));
+          })])]));
         }
         if (note) {
           body.append(el("tr", { class: "detail-row" }, [el("td", { colspan: COLUMNS.length + 1 }, [

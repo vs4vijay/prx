@@ -27,8 +27,9 @@ use crate::browser::{self, Opener, SystemOpener};
 use crate::config::{self, Config, ConfigError, EffectiveRepo, ReviewMode};
 use crate::effects::EffectsDeps;
 use crate::github::GhCli;
+use crate::health::{self, HealthThresholds, RepoPollHealth};
 use crate::history;
-use crate::ipc::ConfigErrorInfo;
+use crate::ipc::{ConfigErrorInfo, ConfigRevision};
 use crate::machine;
 use crate::notify::{CommandNotifier, Notifier, NotifyError, TierBehavior, TierTable};
 use crate::paths;
@@ -193,6 +194,9 @@ pub struct ReloadSummary {
     pub removed: Vec<String>,
     /// Queued (not yet running) review keys discarded with removed repos.
     pub discarded: Vec<String>,
+    /// The applied config differs from the one it replaced, so the config
+    /// revision went up. `false` for a re-apply of identical content.
+    pub config_changed: bool,
 }
 
 impl ReloadSummary {
@@ -208,6 +212,49 @@ impl ReloadSummary {
 enum ConfigFingerprint {
     Content(u64),
     Unreadable,
+}
+
+/// What one look at the config file did (`POST /config/reload`, the
+/// watcher, review-now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCheck {
+    /// The daemon runs without a config file (tests / embedded use).
+    NoFile,
+    /// The content is the one already processed and it is running.
+    Unchanged,
+    /// New content was validated and applied.
+    Applied(ReloadSummary),
+    /// The file fails to read, parse, or validate (now or since its last
+    /// change): the last-good config keeps running. The message is the
+    /// error, as in `config_error`.
+    Rejected(String),
+}
+
+/// The review concurrency cap `live` asks for: the largest
+/// `max_concurrent_reviews` among defaults and every watched repo, at
+/// least 1. Sized once at daemon start (the semaphore cannot shrink).
+fn concurrency_cap(live: &LiveConfig) -> usize {
+    live.config
+        .defaults
+        .max_concurrent_reviews
+        .max(
+            live.repos
+                .iter()
+                .map(|r| r.max_concurrent_reviews)
+                .max()
+                .unwrap_or(1),
+        )
+        .max(1) as usize
+}
+
+/// Config keys whose new value in `live` applies only after a daemon
+/// restart, given the cap the daemon started with.
+fn restart_required_for(live: &LiveConfig, running_cap: usize) -> Vec<String> {
+    if concurrency_cap(live) != running_cap {
+        vec!["max_concurrent_reviews".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Change detection only (not security): exact for any edit, independent of
@@ -248,6 +295,10 @@ pub struct Job {
     /// They live in the in-memory queue alone — never in state, history, or
     /// config — so they are ephemeral by construction.
     pub overrides: ReviewOverrides,
+    /// The human confirmed this single-PR review past its pre-flight
+    /// warnings (`POST /review` with `confirm: true`): it may run on a
+    /// `draft` / `config`-skipped PR and past the diff cap.
+    pub confirmed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -261,6 +312,8 @@ struct Runtime {
     /// D11: next review-enqueue tick per repo with an effective `schedule`
     /// (repos on the interval cadence have no entry).
     next_review_tick: BTreeMap<String, DateTime<Utc>>,
+    /// Poll successes and failures per repo (`/status` `poll_health`).
+    poll_health: BTreeMap<String, RepoPollHealth>,
 }
 
 /// Tunables for the scheduler loop. `Default` is the production shape; tests
@@ -283,6 +336,9 @@ pub struct SchedulerOptions {
     /// D11 schedule ticks). Test hook: shift it to reach a cron tick
     /// without waiting for wall time.
     pub clock: fn() -> DateTime<Utc>,
+    /// When failing polls become a warning and a restart is recommended.
+    /// Test hook: shrink the restart periods.
+    pub health: HealthThresholds,
 }
 
 impl Default for SchedulerOptions {
@@ -294,6 +350,7 @@ impl Default for SchedulerOptions {
             interval_scale: 1.0,
             config_check: Duration::from_secs(1),
             clock: Utc::now,
+            health: HealthThresholds::default(),
         }
     }
 }
@@ -332,6 +389,10 @@ pub struct Shared {
     /// Wakes the scheduler after a reload so added repos are polled now
     /// rather than on the next tick.
     config_applied: Notify,
+    /// The config revision (starts at 1, +1 per applied config that differs
+    /// from the running one) and when that config was applied. Clients
+    /// compare revisions to notice a change they did not make.
+    config_revision: std::sync::Mutex<(u64, DateTime<Utc>)>,
     /// D9/D12: gh-authenticated logins resolved by Block/Unblock, keyed by
     /// the identity's credential reference (`None` = gh's own account).
     /// Fills in the status payload's identity login when config sets none.
@@ -345,6 +406,10 @@ pub struct Shared {
     /// Design B4: on-demand brief runs share these slots — apart from the
     /// review slots — so a burst of Regenerate clicks cannot fan out agents.
     pub brief_semaphore: Arc<Semaphore>,
+    /// Set once poll health recommends a restart ([`health::restart_recommended`]);
+    /// `run_foreground` waits on [`Shared::restart_requested`] when supervised.
+    restart_flag: std::sync::atomic::AtomicBool,
+    restart_requested: Notify,
 }
 
 /// Concurrent on-demand brief runs (design B4).
@@ -371,19 +436,9 @@ impl Shared {
         // announcements: one liveness cell, two owners.
         let menubar_liveness = deps.notifier.liveness.clone();
         // The concurrency cap is sized once at startup; a reload that
-        // changes max_concurrent_reviews applies on the next daemon start.
-        let cap = live
-            .config
-            .defaults
-            .max_concurrent_reviews
-            .max(
-                live.repos
-                    .iter()
-                    .map(|r| r.max_concurrent_reviews)
-                    .max()
-                    .unwrap_or(1),
-            )
-            .max(1) as usize;
+        // changes max_concurrent_reviews applies on the next daemon start
+        // (reported as `restart_required` until then).
+        let cap = concurrency_cap(&live);
         Ok(Shared {
             semaphore: Arc::new(Semaphore::new(cap)),
             max_concurrent: cap,
@@ -404,10 +459,13 @@ impl Shared {
             // (a no-op reconcile when it still matches the startup config).
             config_seen: tokio::sync::Mutex::new(None),
             config_applied: Notify::new(),
+            config_revision: std::sync::Mutex::new((1, Utc::now())),
             gh_logins: std::sync::Mutex::new(BTreeMap::new()),
             briefs_in_flight: std::sync::Mutex::new(HashSet::new()),
             brief_errors: std::sync::Mutex::new(BTreeMap::new()),
             brief_semaphore: Arc::new(Semaphore::new(BRIEF_CONCURRENCY)),
+            restart_flag: std::sync::atomic::AtomicBool::new(false),
+            restart_requested: Notify::new(),
         })
     }
 
@@ -520,6 +578,21 @@ impl Shared {
             .clone()
     }
 
+    /// The running config's revision, when it was applied, and the keys
+    /// that wait for a daemon restart (the payload fields of `/status`,
+    /// `/config`, and config writes).
+    pub fn config_revision(&self) -> ConfigRevision {
+        let (revision, loaded_at) = *self
+            .config_revision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ConfigRevision {
+            config_revision: Some(revision),
+            config_loaded_at: Some(loaded_at),
+            restart_required: restart_required_for(&self.live(), self.max_concurrent),
+        }
+    }
+
     fn set_config_error(&self, error: Option<ConfigErrorInfo>) {
         *self
             .config_error
@@ -535,8 +608,9 @@ impl Shared {
     /// yet, so the next scheduler pass polls them; the scheduler is woken
     /// for that); removed repos leave the rotation, their queued reviews are
     /// discarded (in-flight ones finish), and their state records stay in
-    /// `state.json` but drop out of status; a changed poll interval
-    /// reschedules the repo from the next pass.
+    /// `state.json` but drop out of status; a changed poll interval, and a
+    /// switch from mode `off` back to an active mode, poll the repo now.
+    /// A config that differs from the running one bumps the revision.
     pub async fn apply_config(&self, config: Config) -> Result<ReloadSummary, ConfigError> {
         self.swap_config(config, true).await
     }
@@ -563,6 +637,7 @@ impl Shared {
     ) -> Result<ReloadSummary, ConfigError> {
         let next = Arc::new(LiveConfig::from_config(config)?);
         let mut summary = ReloadSummary::default();
+        let now = Utc::now();
         {
             // Swap under the runtime lock: anything that checks the live
             // repo set while holding it sees either the old set with the
@@ -579,7 +654,7 @@ impl Shared {
                 match prev.repo(&repo.name) {
                     None => summary.added.push(repo.name.clone()),
                     Some(old) => {
-                        if old.poll_interval_minutes != repo.poll_interval_minutes {
+                        if reschedules_now(old, repo) {
                             rt.next_poll.remove(&repo.name);
                         }
                         // D11: a changed schedule re-derives its next tick.
@@ -608,6 +683,14 @@ impl Shared {
                 }
                 keep
             });
+            if prev.config != next.config {
+                summary.config_changed = true;
+                let mut revision = self
+                    .config_revision
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *revision = (revision.0 + 1, now);
+            }
         }
         if clear_error {
             self.set_config_error(None);
@@ -618,10 +701,12 @@ impl Shared {
 
     /// D1/D2: re-read the config file if its content changed since the last
     /// check and apply it; a failed read/parse/validate keeps the last-good
-    /// config running and records `config_error` until a good read.
-    pub async fn check_config_file(&self) {
+    /// config running and records `config_error` until a good read. The
+    /// watcher runs this every second; `POST /config/reload` runs it on
+    /// demand and reports the outcome.
+    pub async fn check_config_file(&self) -> ConfigCheck {
         let Some(path) = self.deps.config_path.as_deref() else {
-            return;
+            return ConfigCheck::NoFile;
         };
         let mut seen = self.config_seen.lock().await;
         let read = std::fs::read(path);
@@ -630,7 +715,11 @@ impl Shared {
             Err(_) => ConfigFingerprint::Unreadable,
         };
         if *seen == Some(fingerprint) {
-            return;
+            // Already processed: still broken if it was rejected then.
+            return match self.config_error() {
+                Some(error) => ConfigCheck::Rejected(error.message),
+                None => ConfigCheck::Unchanged,
+            };
         }
         *seen = Some(fingerprint);
 
@@ -654,19 +743,34 @@ impl Shared {
             Err(e) => Err(e),
         };
         match applied {
-            Ok(summary) if summary.is_noop() => tracing::debug!("config re-read; no repo changes"),
-            Ok(summary) => tracing::info!(
-                "config reloaded: added {:?}, removed {:?}, discarded {} queued review(s)",
-                summary.added,
-                summary.removed,
-                summary.discarded.len()
-            ),
+            Ok(summary) => {
+                if summary.is_noop() {
+                    tracing::debug!(
+                        "config re-read (changed: {}); no repo changes",
+                        summary.config_changed
+                    );
+                } else {
+                    tracing::info!(
+                        "config reloaded: added {:?}, removed {:?}, discarded {} queued review(s)",
+                        summary.added,
+                        summary.removed,
+                        summary.discarded.len()
+                    );
+                }
+                if summary.config_changed {
+                    ConfigCheck::Applied(summary)
+                } else {
+                    ConfigCheck::Unchanged
+                }
+            }
             Err(e) => {
                 tracing::warn!("config reload failed; keeping the last-good config: {e}");
+                let message = e.to_string();
                 self.set_config_error(Some(ConfigErrorInfo {
-                    message: e.to_string(),
+                    message: message.clone(),
                     at: Utc::now(),
                 }));
+                ConfigCheck::Rejected(message)
             }
         }
     }
@@ -805,6 +909,12 @@ impl Shared {
                     existing.overrides = job.overrides;
                     upgraded = true;
                 }
+                // A confirmation upgrades a queued unconfirmed run of the
+                // same PR.
+                if job.confirmed && !existing.confirmed {
+                    existing.confirmed = true;
+                    upgraded = true;
+                }
                 if upgraded {
                     enqueued.push(job.key);
                 }
@@ -863,6 +973,66 @@ impl Shared {
 
     pub async fn last_poll_map(&self) -> BTreeMap<String, DateTime<Utc>> {
         self.runtime.lock().await.last_poll.clone()
+    }
+
+    /// Poll health per repo (`/status` `poll_health`), limited to the repos
+    /// the running config polls: a removed repo or one in mode `off` keeps
+    /// no warning alive.
+    pub async fn poll_health(&self) -> BTreeMap<String, RepoPollHealth> {
+        let live = self.live();
+        let rt = self.runtime.lock().await;
+        rt.poll_health
+            .iter()
+            .filter(|(name, _)| {
+                live.repo(name)
+                    .is_some_and(|repo| repo.review_mode != ReviewMode::Off)
+            })
+            .map(|(name, h)| (name.clone(), h.clone()))
+            .collect()
+    }
+
+    /// Whether a fresh daemon process is likely to fix the failing polls
+    /// (`/status` `restart_recommended`; see [`health::restart_recommended`]).
+    pub async fn restart_recommended(&self) -> bool {
+        health::restart_recommended(
+            &self.poll_health().await,
+            self.started_at.elapsed(),
+            (self.options.clock)(),
+            &self.options.health,
+        )
+    }
+
+    /// Resolves once poll health has recommended a restart (immediately if
+    /// it already has).
+    pub async fn restart_requested(&self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let notified = self.restart_requested.notified();
+            if self.restart_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// After a poll pass: raise the restart request once it is recommended.
+    async fn check_restart(&self) {
+        use std::sync::atomic::Ordering;
+        if self.restart_flag.load(Ordering::SeqCst) || !self.restart_recommended().await {
+            return;
+        }
+        let health = self.poll_health().await;
+        if let Some(warning) = health::sync_warning(&health, &self.options.health) {
+            tracing::warn!(
+                "every poll has failed for {} ({} in a row, environment errors): {}; \
+                 a fresh daemon process is recommended",
+                warning.repos_label(),
+                warning.failures,
+                warning.error
+            );
+        }
+        self.restart_flag.store(true, Ordering::SeqCst);
+        self.restart_requested.notify_waiters();
     }
 
     /// The soonest scheduled repo poll (`/status` `next_poll`, the menu's
@@ -1107,15 +1277,39 @@ pub async fn run_foreground() -> Result<()> {
     let deps = Deps::production(config_path, paths::data_dir());
 
     let pid_guard = PidGuard::acquire(&deps.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A daemon runs again: the last `prx daemon stop` no longer applies.
+    let _ = std::fs::remove_file(paths::daemon_stop_marker());
     let handle = spawn_core(deps, config, SchedulerOptions::default(), Some(pid_guard)).await?;
+    let supervised = supervised_for_restart();
     tracing::info!(
-        "prx daemon started (pid {}): watching {} repo(s), IPC on 127.0.0.1:{}",
+        "prx daemon started (pid {}): watching {} repo(s), IPC on 127.0.0.1:{}{}",
         handle.shared.pid,
         handle.shared.live().repos.len(),
-        handle.port
+        handle.port,
+        if supervised { ", supervised" } else { "" }
     );
 
-    wait_for_shutdown_signal().await;
+    // A supervised daemon whose polls keep failing in a way a fresh process
+    // can fix (see `health::restart_recommended`) exits for a restart; an
+    // unsupervised one keeps running and reports the failures in `/status`.
+    let restart = async {
+        if supervised {
+            handle.shared.restart_requested().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let restarting = tokio::select! {
+        _ = wait_for_shutdown_signal() => false,
+        _ = restart => true,
+    };
+    if restarting {
+        tracing::warn!(
+            "exiting with code {RESTART_EXIT_CODE} so the supervisor starts a fresh daemon"
+        );
+        handle.shutdown().await;
+        return Err(anyhow::Error::new(RestartRequested));
+    }
     // Graceful shutdown choice (documented): stop scheduling, let the current
     // tick finish, persist state, and exit. In-flight reviews are abandoned —
     // the pipeline persists state only at completion, so state.json stays
@@ -1125,6 +1319,44 @@ pub async fn run_foreground() -> Result<()> {
     tracing::info!("shutdown signal received; finishing up");
     handle.shutdown().await;
     Ok(())
+}
+
+/// Exit code of a daemon that stopped so its supervisor starts a fresh one
+/// (`EX_TEMPFAIL`). launchd's `KeepAlive { SuccessfulExit = false }`,
+/// systemd's `Restart=on-failure`, and PRX.app all restart a non-zero exit.
+pub const RESTART_EXIT_CODE: i32 = 75;
+
+/// The error `run_foreground` returns when it stopped for a restart; `main`
+/// turns it into [`RESTART_EXIT_CODE`].
+#[derive(Debug, Error)]
+#[error("the daemon stopped so its supervisor starts a fresh one")]
+pub struct RestartRequested;
+
+/// Whether something will start this daemon again if it exits non-zero:
+/// launchd running it as the `prx daemon install` job, or a supervisor that
+/// set `PRX_SUPERVISED` (PRX.app, the systemd unit) and is still its parent.
+/// A daemon orphaned by an app that has exited (reparented to pid 1) is not
+/// supervised: it keeps running, and the next PRX.app replaces it.
+pub fn supervised_for_restart() -> bool {
+    let launchd =
+        std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| name == crate::autostart::LAUNCHD_LABEL);
+    let flagged = std::env::var_os(SUPERVISED_ENV).is_some_and(|v| !v.is_empty());
+    launchd || (flagged && parent_alive())
+}
+
+/// Set by a supervisor that restarts the daemon when it exits non-zero.
+pub const SUPERVISED_ENV: &str = "PRX_SUPERVISED";
+
+#[cfg(unix)]
+fn parent_alive() -> bool {
+    // SAFETY: getppid(2) cannot fail.
+    let parent = unsafe { libc::getppid() };
+    parent != 1
+}
+
+#[cfg(not(unix))]
+fn parent_alive() -> bool {
+    false
 }
 
 /// Resolve the shutdown future: SIGTERM and SIGINT (unix).
@@ -1318,6 +1550,9 @@ pub async fn run_stop() -> Result<()> {
         let _ = std::fs::remove_file(&pid_path);
         return Ok(());
     }
+    // Tell PRX.app this stop is deliberate, so it does not start a new
+    // daemon on its own; the next daemon start removes the marker.
+    let _ = std::fs::write(paths::daemon_stop_marker(), format!("{pid}\n"));
     send_signal(pid, libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -1431,7 +1666,7 @@ async fn scheduler_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>
             _ = shared.poll_requested.notified() => {
                 // D1: review-now (menu "Refresh now") implies a reload check,
                 // run first so the poll already covers newly added repos.
-                shared.check_config_file().await;
+                let _ = shared.check_config_file().await;
                 poll_repos(&shared, PollMode::All).await;
             }
             // Added repos have no next_poll yet, so a Due pass polls them.
@@ -1451,7 +1686,9 @@ async fn config_reload_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<b
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
-            _ = ticker.tick() => shared.check_config_file().await,
+            _ = ticker.tick() => {
+                let _ = shared.check_config_file().await;
+            }
         }
     }
 }
@@ -1486,7 +1723,7 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
             continue;
         }
         let deps = EffectsDeps::for_repo(&shared.deps.notifier, &live.tiers, repo);
-        let synced = {
+        let outcome = {
             let mut state = shared.lock_state().await;
             match status::sync_repo(&shared.deps.gh, repo, &mut state, now, &deps).await {
                 Ok(()) => {
@@ -1510,19 +1747,21 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
                                     due: now,
                                     force: false,
                                     overrides: ReviewOverrides::default(),
+                                    confirmed: false,
                                 });
                             }
                         }
                     }
                     shared.publish(&state);
-                    true
+                    Ok(())
                 }
                 Err(e) => {
                     tracing::warn!("poll of {} failed: {e}", repo.name);
-                    false
+                    Err(e.to_string())
                 }
             }
         };
+        let synced = outcome.is_ok();
         let mut rt = shared.runtime.lock().await;
         if shared.live().repo(&repo.name).is_none() {
             // Removed by a reload while this pass ran: leave it unscheduled.
@@ -1530,6 +1769,12 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
         }
         if synced {
             rt.last_poll.insert(repo.name.clone(), now);
+        }
+        let record = rt.poll_health.entry(repo.name.clone()).or_default();
+        record.poll_interval_minutes = repo.poll_interval_minutes;
+        match &outcome {
+            Ok(()) => record.record_success(now),
+            Err(error) => record.record_failure(now, error),
         }
         // Failed polls retry after the plain interval (no jitter) rather than
         // hammering gh every tick.
@@ -1554,6 +1799,16 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
     if !due_jobs.is_empty() {
         shared.enqueue(due_jobs).await;
     }
+    shared.check_restart().await;
+}
+
+/// Whether a reload that turns `old` into `new` (same repo) should poll the
+/// repo now instead of keeping its planned `next_poll`: its interval
+/// changed, or it was switched from `off` (not polled, so its plan is
+/// stale) to an active mode.
+fn reschedules_now(old: &EffectiveRepo, new: &EffectiveRepo) -> bool {
+    old.poll_interval_minutes != new.poll_interval_minutes
+        || (old.review_mode == ReviewMode::Off && new.review_mode != ReviewMode::Off)
 }
 
 /// When a repo's due-scan may enqueue reviews (D11).
@@ -1788,6 +2043,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, permit: tokio::sync::OwnedSe
         store: &shared.deps.store,
         dry_run: false,
         fresh_session,
+        confirmed: job.confirmed,
     };
     if let Some(reason) = unusable {
         let outcome = {
@@ -1907,6 +2163,7 @@ async fn run_brief(
         store: &shared.deps.store,
         dry_run: false,
         fresh_session: true,
+        confirmed: false,
     };
     tracing::info!("{}: writing brief", request.key);
     let run = pipeline.generate_brief(request).await;
@@ -2417,6 +2674,7 @@ mod tests {
             due,
             force: false,
             overrides: ReviewOverrides::default(),
+            confirmed: false,
         }
     }
 
@@ -2473,6 +2731,183 @@ mod tests {
         let three = queue_shared("cap3", 3);
         assert_eq!(three.max_concurrent, 3);
         assert_eq!(three.semaphore.available_permits(), 3);
+    }
+
+    fn parsed(yaml: &str) -> Config {
+        Config::parse(yaml, Path::new("config.yml")).unwrap()
+    }
+
+    /// The revision starts at 1, goes up once per applied config that
+    /// differs from the running one, and stays put for an identical one.
+    #[tokio::test]
+    async fn config_revision_bumps_only_on_a_different_config() {
+        let shared = queue_shared("revision", 1);
+        let start = shared.config_revision();
+        assert_eq!(start.config_revision, Some(1));
+        assert!(start.restart_required.is_empty());
+
+        let same = shared.live().config.clone();
+        let summary = shared.apply_config(same).await.unwrap();
+        assert!(!summary.config_changed);
+        assert_eq!(shared.config_revision().config_revision, Some(1));
+
+        let summary = shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 7\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert!(summary.config_changed);
+        let next = shared.config_revision();
+        assert_eq!(next.config_revision, Some(2));
+        assert!(next.config_loaded_at >= start.config_loaded_at);
+
+        // A rejected config changes nothing.
+        assert!(shared
+            .apply_config(parsed(
+                "defaults:\n  poll_interval_minutes: 0\nrepos:\n  - name: org/one\n"
+            ))
+            .await
+            .is_err());
+        assert_eq!(shared.config_revision().config_revision, Some(2));
+    }
+
+    /// A new `max_concurrent_reviews` cannot resize the running semaphore:
+    /// it is reported as waiting for a restart until the config matches the
+    /// running cap again.
+    #[tokio::test]
+    async fn concurrency_change_is_reported_as_restart_required() {
+        let shared = queue_shared("restart", 1);
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 3\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            shared.config_revision().restart_required,
+            ["max_concurrent_reviews"]
+        );
+        assert_eq!(shared.max_concurrent, 1);
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert!(shared.config_revision().restart_required.is_empty());
+    }
+
+    /// A reload polls a repo now when its interval changed or it came back
+    /// from `off`; other edits keep its planned poll.
+    #[tokio::test]
+    async fn reload_reschedules_changed_interval_and_reactivated_repos() {
+        let shared = queue_shared("reschedule", 1);
+        let later = Utc::now() + chrono::Duration::minutes(30);
+        async fn plan(shared: &Shared, at: DateTime<Utc>) {
+            shared
+                .runtime
+                .lock()
+                .await
+                .next_poll
+                .insert("org/one".into(), at);
+        }
+        async fn planned(shared: &Shared) -> Option<DateTime<Utc>> {
+            shared
+                .runtime
+                .lock()
+                .await
+                .next_poll
+                .get("org/one")
+                .copied()
+        }
+
+        // A notification edit keeps the plan.
+        plan(&shared, later).await;
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  notifications:\n    enabled: false\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, Some(later));
+
+        // A new interval drops it: the next pass polls now.
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 2\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, None);
+
+        // Off keeps the stale plan (an off repo is not polled) …
+        plan(&shared, later).await;
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 2\nrepos:\n  - name: org/one\n    review_mode: \"off\"\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, Some(later));
+        // … and switching back on drops it.
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 2\nrepos:\n  - name: org/one\n    review_mode: monitor\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, None);
+    }
+
+    /// `check_config_file` reports what it did: applied for new valid
+    /// content, unchanged for content already running, rejected (again)
+    /// for a broken file, and no file when the daemon watches none.
+    #[tokio::test]
+    async fn check_config_file_reports_its_outcome() {
+        assert_eq!(
+            queue_shared("nofile", 1).check_config_file().await,
+            ConfigCheck::NoFile
+        );
+        let d = dir("check");
+        let path = d.join("config.yml");
+        let base = "defaults:\n  max_concurrent_reviews: 1\nrepos:\n  - name: org/one\n";
+        std::fs::write(&path, base).unwrap();
+        let deps = Deps {
+            gh: GhCli::with_binary("/nonexistent/gh"),
+            adapter: EngineAdapter::default(),
+            notifier: MenubarDeferringNotifier::wrapping(CommandNotifier),
+            config_path: Some(path.clone()),
+            store: StateStore::new(d.join("state.json")),
+            history_path: d.join("history.jsonl"),
+            data_dir: d,
+            opener: Arc::new(SystemOpener),
+        };
+        let shared = Arc::new(
+            Shared::new(deps, parsed(base), "t".into(), SchedulerOptions::default()).unwrap(),
+        );
+        // First look: same content as the startup config.
+        assert_eq!(shared.check_config_file().await, ConfigCheck::Unchanged);
+
+        std::fs::write(&path, format!("{base}  - name: org/two\n")).unwrap();
+        match shared.check_config_file().await {
+            ConfigCheck::Applied(summary) => assert_eq!(summary.added, ["org/two"]),
+            other => panic!("expected applied, got {other:?}"),
+        }
+        assert_eq!(shared.config_revision().config_revision, Some(2));
+        assert_eq!(shared.check_config_file().await, ConfigCheck::Unchanged);
+
+        std::fs::write(&path, "defaults: [broken\n").unwrap();
+        assert!(matches!(
+            shared.check_config_file().await,
+            ConfigCheck::Rejected(_)
+        ));
+        // Still broken on the next look, without re-parsing.
+        assert!(matches!(
+            shared.check_config_file().await,
+            ConfigCheck::Rejected(_)
+        ));
+        assert_eq!(shared.config_revision().config_revision, Some(2));
     }
 
     /// A finished job gives its concurrency slot back before the drainer is

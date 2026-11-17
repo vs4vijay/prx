@@ -89,8 +89,26 @@ pub struct PrRecord {
     pub blocking_count: u32,
     pub nit_count: u32,
     pub review_session: Option<String>,
+    /// Where `review_session` came from (Review Chat, design C1): the engine
+    /// that reported it and the directory the agent ran in, which an agent
+    /// CLI such as `claude` needs to find the session again. Meaningful only
+    /// while `review_session` is set. Additive and serde-defaulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_session_info: Option<ReviewSessionInfo>,
+    /// The manifest file of the last completed review (Review Chat, design
+    /// C5: the chat prompt quotes its findings). Additive and serde-defaulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_manifest: Option<PathBuf>,
     pub review_attempts: u32,
     pub diff_too_large: bool,
+    /// Why prx is not reviewing this PR, in a few words, decided where the
+    /// skip was decided: the matched rule for `skip_reason: config`
+    /// (`author dependabot[bot] excluded`), or the size against the cap
+    /// when the pipeline held the PR back (`diff_too_large`). Read it
+    /// through [`PrRecord::skip_text`], which covers every reason.
+    /// Additive and serde-defaulted (schema stays v1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_detail: Option<String>,
     /// Legacy executive summary (pre-brief, design D8). Still read so
     /// [`StateStore::load`] can migrate it into [`PrRecord::brief`] (design
     /// B5), and kept as stored so a downgrade still finds it. New code never
@@ -112,6 +130,16 @@ pub struct PrRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_approved_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// The origin of a PR's retained review session (Review Chat, design C1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewSessionInfo {
+    /// The engine whose run reported the session.
+    pub engine: String,
+    /// The working directory of that run; `None` when it was unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<PathBuf>,
 }
 
 /// Who produced a brief (design B2).
@@ -151,6 +179,38 @@ impl Brief {
 }
 
 impl PrRecord {
+    /// Why prx is not reviewing this PR, in a few words (`draft`,
+    /// `author dependabot[bot] excluded`, `snoozed until …`, `ignored`,
+    /// `2,140 lines changed (limit 1,500)`), or `None` when nothing holds it
+    /// back. A skipped PR answers for its skip reason; a pending PR answers
+    /// when the diff-size cap held its last review back.
+    pub fn skip_text(&self) -> Option<String> {
+        match self.state {
+            PrState::Skipped => Some(match self.skip_reason {
+                Some(SkipReason::Draft) => "draft".to_string(),
+                Some(SkipReason::Config) => self
+                    .skip_detail
+                    .clone()
+                    .unwrap_or_else(|| "skip rule".to_string()),
+                Some(SkipReason::Snoozed) => match (self.snooze_until, self.snooze_until_push) {
+                    (Some(until), _) => {
+                        format!("snoozed until {}", until.format("%Y-%m-%d %H:%M UTC"))
+                    }
+                    (None, true) => "snoozed until next push".to_string(),
+                    (None, false) => "snoozed".to_string(),
+                },
+                Some(SkipReason::Ignored) => "ignored".to_string(),
+                None => "skipped".to_string(),
+            }),
+            PrState::Pending if self.diff_too_large => Some(
+                self.skip_detail
+                    .clone()
+                    .unwrap_or_else(|| "diff too large".to_string()),
+            ),
+            _ => None,
+        }
+    }
+
     /// Design B5: turn a legacy `exec_summary` into a brief when the record
     /// has none yet. Timestamps come from the last review (else the record's
     /// `updated_at`), the head from the last reviewed SHA (else the current
@@ -350,13 +410,73 @@ mod tests {
             blocking_count: 0,
             nit_count: 0,
             review_session: None,
+            review_session_info: None,
+            last_manifest: None,
             review_attempts: 0,
             diff_too_large: false,
+            skip_detail: None,
             human_approved_at: None,
             exec_summary: None,
             brief: None,
             updated_at: Utc::now(),
         }
+    }
+
+    /// The skip text covers every reason, uses the stored detail for a
+    /// rule or size skip, and is absent when nothing holds the PR back.
+    #[test]
+    fn skip_text_says_why_in_a_few_words() {
+        let mut rec = sample_record("o/r", 1);
+        assert_eq!(rec.skip_text(), None);
+        rec.diff_too_large = true;
+        assert_eq!(rec.skip_text().as_deref(), Some("diff too large"));
+        rec.skip_detail = Some("2,140 lines changed (limit 1,500)".into());
+        assert_eq!(
+            rec.skip_text().as_deref(),
+            Some("2,140 lines changed (limit 1,500)")
+        );
+        rec.diff_too_large = false;
+        assert_eq!(rec.skip_text(), None, "a stale detail is not shown");
+
+        rec.state = PrState::Skipped;
+        let text = |rec: &PrRecord, reason| {
+            PrRecord {
+                skip_reason: reason,
+                ..rec.clone()
+            }
+            .skip_text()
+            .unwrap()
+        };
+        rec.skip_detail = Some("label wip excluded".into());
+        assert_eq!(text(&rec, Some(SkipReason::Draft)), "draft");
+        assert_eq!(text(&rec, Some(SkipReason::Config)), "label wip excluded");
+        assert_eq!(text(&rec, Some(SkipReason::Ignored)), "ignored");
+        assert_eq!(text(&rec, Some(SkipReason::Snoozed)), "snoozed");
+        rec.snooze_until_push = true;
+        assert_eq!(
+            text(&rec, Some(SkipReason::Snoozed)),
+            "snoozed until next push"
+        );
+        rec.skip_detail = None;
+        assert_eq!(text(&rec, Some(SkipReason::Config)), "skip rule");
+        assert_eq!(text(&rec, None), "skipped");
+    }
+
+    /// `skip_detail` is additive: absent from older files, omitted when
+    /// unset.
+    #[test]
+    fn skip_detail_is_optional_on_the_wire() {
+        let rec = sample_record("o/r", 1);
+        let json = serde_json::to_value(&rec).unwrap();
+        assert!(json.get("skip_detail").is_none());
+        let back: PrRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(back.skip_detail, None);
+        let with = PrRecord {
+            skip_detail: Some("author bot excluded".into()),
+            ..rec
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["skip_detail"], "author bot excluded");
     }
 
     #[test]

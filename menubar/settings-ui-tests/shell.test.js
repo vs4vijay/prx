@@ -42,14 +42,16 @@ test("bridge: the named calls map onto the documented methods and payloads", () 
   bridge.putConfig(config);
   bridge.putConfigYaml("defaults: {}\n");
   bridge.setReviewMode("monitor");
+  bridge.openReviewChat("acme/api#1");
   assert.deepEqual(w.sent.map((m) => [m.method, m.params]), [
     ["config.get", {}],
     ["config.put", { config: config }],
     ["config.put", { yaml: "defaults: {}\n" }],
     ["review_mode.set", { mode: "monitor" }],
+    ["app.review_chat.open", { key: "acme/api#1" }],
   ]);
   assert.equal(Object.isFrozen(bridge), true);
-  assert.deepEqual(Object.keys(bridge).sort(), ["__resolve", "call", "getConfig", "putConfig", "putConfigYaml", "setReviewMode"]);
+  assert.deepEqual(Object.keys(bridge).sort(), ["__resolve", "call", "getConfig", "openReviewChat", "putConfig", "putConfigYaml", "setReviewMode"]);
 });
 
 test("bridge: replies resolve their own call, in any order, once", async () => {

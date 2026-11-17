@@ -154,9 +154,11 @@ fn notification_text(rec: &PrRecord, event: NotifyEvent) -> (String, String) {
         NotifyEvent::Merged => format!("{key} merged"),
         NotifyEvent::Closed => format!("{key} closed"),
         NotifyEvent::Failure => format!("{key}: review failed — check agent and logs"),
-        NotifyEvent::Skipped => match rec.diff_too_large {
-            true => format!("{key}: review skipped — diff too large"),
-            false => format!("{key}: review skipped"),
+        // The skip's own words: `draft`, the matched rule, or the size
+        // against the cap.
+        NotifyEvent::Skipped => match rec.skip_text() {
+            Some(why) => format!("{key}: review skipped — {why}"),
+            None => format!("{key}: review skipped"),
         },
     };
     (title, body)
@@ -167,7 +169,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, OrgConfig, PartialNotifications, PartialOverrides, RepoConfig};
     use crate::notify::{NotifyError, Tier, TierBehavior};
-    use crate::state::PrState;
+    use crate::state::{PrState, SkipReason};
 
     /// Records the tier behavior each notification was delivered with.
     #[derive(Default)]
@@ -208,8 +210,11 @@ mod tests {
             blocking_count: 0,
             nit_count: 0,
             review_session: None,
+            review_session_info: None,
+            last_manifest: None,
             review_attempts: 0,
             diff_too_large: false,
+            skip_detail: None,
             human_approved_at: None,
             exec_summary: None,
             brief: None,
@@ -418,10 +423,24 @@ mod tests {
             "o/r#7 review: 4 blocking issue(s) found"
         );
         assert_eq!(body(&pr, NotifyEvent::Skipped), "o/r#7: review skipped");
+        pr.state = PrState::Pending;
         pr.diff_too_large = true;
         assert_eq!(
             body(&pr, NotifyEvent::Skipped),
             "o/r#7: review skipped \u{2014} diff too large"
+        );
+        pr.skip_detail = Some("2,140 lines changed (limit 1,500)".into());
+        assert_eq!(
+            body(&pr, NotifyEvent::Skipped),
+            "o/r#7: review skipped \u{2014} 2,140 lines changed (limit 1,500)"
+        );
+        pr.diff_too_large = false;
+        pr.state = PrState::Skipped;
+        pr.skip_reason = Some(SkipReason::Config);
+        pr.skip_detail = Some("author bot excluded".into());
+        assert_eq!(
+            body(&pr, NotifyEvent::Skipped),
+            "o/r#7: review skipped \u{2014} author bot excluded"
         );
     }
 }

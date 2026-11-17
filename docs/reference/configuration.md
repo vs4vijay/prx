@@ -76,6 +76,9 @@ Guides for the larger topics: [review modes](../guides/review-modes.md),
 | `engines.<name>.model_args` | — | *agent:* extra argv appended when `agent_model` is set; `{{MODEL}}` is substituted. Built-ins: `--model {{MODEL}}` (`pi`, `claude`), `-m {{MODEL}}` (`codex`). |
 | `engines.<name>.session_output` | `stdout_prefix: "prx-session:"` | *agent:* how a run reports its session id — exactly one of `stdout_prefix` or `json_field`. |
 | `engines.<name>.resume_args` | `[]` | *agent:* argv appended to resume the PR's previous session; must contain `{{SESSION_ID}}`. Empty = no resume. |
+| `engines.<name>.chat.new_args` | *(built-in for `claude`/`codex`/`pi`)* | *agent:* argv that starts an interactive [Review Chat](../guides/review-chat.md) session; must contain `{{PROMPT}}`; `{{SESSION_ID}}` (optional) is a UUID prx generates and records. |
+| `engines.<name>.chat.resume_args` | *(built-in)* | *agent:* argv that reopens a session by id; must contain `{{SESSION_ID}}`. |
+| `engines.<name>.chat.continue_args` | *(built-in)* | *agent:* argv that reopens the latest session in the chat's directory; no placeholders. An engine without `chat` whose command's file name is `claude`, `codex`, or `pi` uses the built-in templates; rejected on `llm_api` engines — see [Engines](../guides/engines.md#review-chat-templates). |
 | `engines.<name>.usage_output` | *(built-in for `claude`/`codex`)* | *agent:* map of token-usage fields (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `model`, `session_id`) to dotted JSON paths in the agent's stdout (e.g. `usage.input_tokens`). Overrides the built-in parsing; rejected on `llm_api` engines — see [Token usage](../guides/token-usage.md). |
 | `engines.<name>.provider` | — | *llm_api:* `anthropic`, `openai`, or `openai_compatible`. |
 | `engines.<name>.base_url` | per provider | *llm_api:* `https://api.anthropic.com` / `https://api.openai.com/v1`; **required** for `openai_compatible`. Must be `http(s)://`. |
@@ -181,15 +184,29 @@ One caveat: the menu bar's mode selector shows and sets the global `defaults.rev
 ## Live reload
 
 The daemon re-reads `config.yml` on its own: it hashes the file every second (and again on
-*Check GitHub now* / `prx review-now`), so `prx repos add/remove`, `prx config set`, hand edits, and
-settings-app saves apply within about a second — no restart. Added repos are polled right away;
-removed repos stop being tracked, their queued reviews are discarded, and their history is kept.
-Changed intervals, cooldowns, schedules, prompts, skip rules, modes, tiers, engines, and comment /
-summary / auto-open settings apply to the next poll or review (a review already running finishes with the config it started with).
+*Check GitHub now* / `prx review-now`), so hand edits apply within about a second — no restart.
+Settings-app saves are applied before the save answers. `prx config set`, `prx config edit`, and
+`prx repos add/remove` ask a running daemon to reload at once (`POST /config/reload`) and say on
+stderr what it did: *the running daemon applied the change (config revision N)*, or a warning with
+the reason it rejected the file. Added repos are polled right away, and so are repos whose poll
+interval changed and repos switched from `off` back to an active mode; removed repos stop being
+tracked, their queued reviews are discarded, and their history is kept; a repo switched to `off`
+loses its queued reviews at once. Cooldowns, schedules, prompts, skip rules, modes, tiers, engines,
+and comment / summary / auto-open settings apply to the next poll or review (a review already
+running finishes with the config it started with).
+
+Each applied change raises the daemon's `config_revision` (in `GET /status`). PRX.app watches it,
+and the config file itself: after any change, by any route, it refreshes the menu at once and then
+every 2 seconds for a few polls (so a new repo's PRs show as soon as the daemon has polled it), and
+an open PRX window re-loads its settings unless you have unsaved edits there (then it says the file
+changed; *Revert* loads it).
 
 If an edit breaks the file (bad YAML or a failed validation), the daemon keeps running on the
 **last good** config and reports the reason as `config_error` in `GET /status` and the settings app;
 fixing the file clears it automatically. A menu bar mode switch made while the file is broken applies
 to the running config only (answered with `persisted: false` and a "not saved" note) — the file
 is left alone, and once fixed its own `review_mode` wins. **`max_concurrent_reviews` does not hot-reload**:
-the queue is sized at daemon start, so restart the daemon after changing it.
+the queue is sized at daemon start, so restart the daemon after changing it. Until then the daemon
+lists it in `restart_required`, the PRX window says so after the save and in its save bar, and
+`prx config set` prints a note. To restart: choose *Restart daemon to apply …* at the top of the
+PRX menu, or `prx daemon stop` and then `prx daemon start`.

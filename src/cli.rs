@@ -51,6 +51,10 @@ pub enum Command {
         /// Extra instructions appended to this run's prompt
         #[arg(long, value_name = "TEXT", conflicts_with = "all")]
         prompt: Option<String>,
+        /// Review a skipped or oversized PR without asking first (without a
+        /// terminal, such a review is refused unless this is given)
+        #[arg(short = 'y', long, conflicts_with = "all")]
+        yes: bool,
     },
     /// Print a PR's brief (what it does, in plain language) and its dates
     /// (through the daemon when it is up)
@@ -61,6 +65,28 @@ pub enum Command {
         /// Generate a new brief first (never posts to GitHub)
         #[arg(long)]
         regenerate: bool,
+    },
+    /// Review Chat: talk to a coding agent about a PR in this terminal.
+    /// Reopens the PR's session (its last chat, else its last review's) or
+    /// starts a new one with the PR's context. Never posts to GitHub.
+    Chat {
+        /// PR target: org/repo#123, a GitHub PR URL, repo#123, 123, or #123
+        /// (the short forms resolve against the tracked PRs)
+        target: String,
+        /// Start a new session even if one exists
+        #[arg(long)]
+        new: bool,
+        /// Agent engine for a new session (default: the repo's engine);
+        /// starts a new session
+        #[arg(long, value_name = "NAME")]
+        engine: Option<String>,
+        /// Run a new session in this directory, e.g. your clone of the repo
+        /// (default: the PR's own chat directory); starts a new session
+        #[arg(long, value_name = "DIR")]
+        dir: Option<std::path::PathBuf>,
+        /// Print what would run, change nothing
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Post your GitHub approval on a PR (the only approve path)
     Approve {
@@ -334,12 +360,13 @@ mod tests {
             engine,
             no_post,
             prompt,
+            yes,
         } = parse(&["review"])
         else {
             panic!("not a review command");
         };
         assert_eq!(target, None);
-        assert!(!all && !dry_run && !no_post);
+        assert!(!all && !dry_run && !no_post && !yes);
         assert_eq!(engine, None);
         assert_eq!(prompt, None);
     }
@@ -353,6 +380,7 @@ mod tests {
             engine,
             no_post,
             prompt,
+            ..
         } = parse(&[
             "review",
             "org/repo#12",
@@ -376,6 +404,13 @@ mod tests {
             panic!("not a review command");
         };
         assert_eq!(target.as_deref(), Some("#12"));
+
+        for flag in ["-y", "--yes"] {
+            let Command::Review { yes, .. } = parse(&["review", "org/repo#12", flag]) else {
+                panic!("not a review command");
+            };
+            assert!(yes, "{flag}");
+        }
     }
 
     /// The per-run overrides apply to one explicit PR; combining them with
@@ -386,6 +421,7 @@ mod tests {
             &["--engine", "claude"][..],
             &["--no-post"],
             &["--prompt", "be brief"],
+            &["--yes"],
         ] {
             let mut args = vec!["review", "--all"];
             args.extend_from_slice(flags);

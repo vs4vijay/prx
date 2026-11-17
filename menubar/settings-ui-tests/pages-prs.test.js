@@ -307,7 +307,7 @@ test("the ⋯ menu: Review with an engine, without posting, and open in GitHub",
   const w = await X.open("prs");
   const m = menu(w, "acme/web#6");
   assert.equal(m.anchor.querySelector("button[aria-haspopup=menu]").getAttribute("aria-label"), "More actions for acme/web#6");
-  assert.deepEqual(m.items.map((i) => i.textContent), ["cheap", "claude", "codex (default)", "Review without posting", "Review with prompt…", "Open in GitHub"]);
+  assert.deepEqual(m.items.map((i) => i.textContent), ["cheap", "claude", "codex (default)", "Review without posting", "Review with prompt…", "Show details", "Open Review Chat…", "Open in GitHub"]);
   assert.equal(m.anchor.querySelector(".menu-label").textContent, "Review with");
   w.fire(m.item("cheap"), "click");
   await w.settle();
@@ -318,8 +318,22 @@ test("the ⋯ menu: Review with an engine, without posting, and open in GitHub",
   assert.deepEqual(plain(w.window.opened), [["https://github.com/acme/web/pull/6", "_blank", "noopener"]]);
   // An older daemon lists no engines: no "Review with" group.
   const old = await X.open("prs", { "status.get": () => X.status((s) => { delete s.engines; }) });
-  assert.deepEqual(menu(old, "acme/web#6").items.map((i) => i.textContent), ["Review without posting", "Review with prompt…", "Open in GitHub"]);
+  assert.deepEqual(menu(old, "acme/web#6").items.map((i) => i.textContent), ["Review without posting", "Review with prompt…", "Show details", "Open Review Chat…", "Open in GitHub"]);
   assert.equal(menu(old, "acme/web#6").anchor.querySelector(".menu-label"), null);
+});
+
+test("Open Review Chat asks the app for a terminal and says how it went", async () => {
+  const w = await X.open("prs");
+  w.fire(menu(w, "acme/web#6").item("Open Review Chat…"), "click");
+  await w.settle();
+  assert.deepEqual(w.calls("app.review_chat.open"), [{ key: "acme/web#6" }]);
+  assert.equal(w.calls("review.request").length, 0);
+  assert.match(w.page.textContent, /Review Chat opened in Terminal\./);
+  // A refusal (e.g. no bundled prx) is shown, not swallowed.
+  const failing = await X.open("prs", { "app.review_chat.open": () => { throw bridgeError("rejected", "cannot open Review Chat: the bundled prx command-line tool was not found"); } });
+  failing.fire(menu(failing, "acme/web#6").item("Open Review Chat…"), "click");
+  await failing.settle();
+  assert.match(failing.page.textContent, /bundled prx command-line tool was not found/);
 });
 
 test("merged and closed PRs offer no review action at all", async () => {
@@ -328,7 +342,8 @@ test("merged and closed PRs offer no review action at all", async () => {
     const review = row(w, key).querySelector(".row-actions > button.btn");
     assert.equal(review.disabled, true, key);
     review.click();
-    const items = menu(w, key).items.filter((i) => i.textContent !== "Open in GitHub");
+    const items = menu(w, key).items.filter((i) => !["Open in GitHub", "Show details", "Open Review Chat…"].includes(i.textContent));
+    assert.equal(menu(w, key).item("Open Review Chat…").disabled, false, key);
     assert.ok(items.length >= 2 && items.every((i) => i.disabled), key);
   }
   await w.settle();
@@ -505,4 +520,103 @@ test("a poll does not rebuild the table while a row menu is open", async () => {
   tick(w);
   await w.settle();
   assert.equal(rows(w).length, 2);
+});
+
+// ---- skip details and the review confirmation ---------------------------------
+
+test("model: the confirm box lists the warnings, the size, and the cost", () => {
+  const risky = X.riskyPreflight("solo/tool#8");
+  assert.equal(P.needsConfirmation(risky), true);
+  assert.equal(P.needsConfirmation(null), false, "an older daemon has no pre-flight");
+  assert.equal(P.needsConfirmation({ key: "a/b#1", warnings: [] }), false);
+  assert.equal(P.needsConfirmation(Object.assign({}, risky, { blocked: "review mode is off for a/b" })), false);
+  assert.deepEqual(P.confirmLines(risky), ["Skipped — author dependabot[bot] excluded", "Large PR — 2,140 lines changed (limit 1,500)"]);
+  assert.deepEqual(P.confirmLines({ warnings: [{ kind: "skipped", message: "Skipped — draft" }], size: { files_changed: 1, lines: 12000 } }),
+    ["Skipped — draft", "Size — 12,000 lines in 1 file"]);
+  assert.equal(P.confirmCost(risky), "Reviewing it runs the engine and can use many tokens. The PR stays skipped for automatic reviews.");
+  assert.equal(P.confirmCost({ warnings: [{ kind: "too_large", message: "m" }] }), "Reviewing it runs the engine and can use many tokens.");
+});
+
+test("a skipped row says why under its state", async () => {
+  const w = await X.open("prs", { "status.get": () => X.status((s) => {
+    s.prs.push(X.pr("acme/api#13", "pending", { skip_detail: "2,140 lines changed (limit 1,500)", summary: "Skipped — 2,140 lines changed (limit 1,500)" }));
+  }) });
+  const note = (key) => { const n = row(w, key).querySelector(".state-cell .skip-note"); return n && n.textContent; };
+  assert.equal(note("solo/tool#7"), "draft");
+  assert.equal(note("solo/tool#8"), "author dependabot[bot] excluded");
+  assert.equal(note("acme/api#13"), "Review skipped — 2,140 lines changed (limit 1,500)");
+  assert.equal(note("acme/api#1"), null, "nothing holds it back");
+  assert.equal(note("solo/tool#9"), null, "an older daemon sends no detail");
+});
+
+test("Review on a risky PR asks first; Cancel sends nothing, Review anyway sends it confirmed", async () => {
+  const w = await X.open("prs", { "review.preflight": (p) => X.riskyPreflight(p.target) });
+  w.fire(row(w, "solo/tool#8").querySelector(".row-actions > button.btn"), "click");
+  await w.settle();
+  assert.deepEqual(w.calls("review.preflight"), [{ target: "solo/tool#8" }]);
+  assert.deepEqual(w.calls("review.request"), [], "nothing is sent before the answer");
+  let box = w.page.querySelector(".confirm-box");
+  assert.equal(box.getAttribute("role"), "alertdialog");
+  assert.equal(box.getAttribute("aria-label"), "Review solo/tool#8 anyway?");
+  assert.equal(box.querySelector(".confirm-title").textContent, "Review solo/tool#8 anyway?");
+  assert.deepEqual(box.querySelectorAll("li").map((li) => li.textContent),
+    ["Skipped — author dependabot[bot] excluded", "Large PR — 2,140 lines changed (limit 1,500)"]);
+  assert.match(box.querySelector(".confirm-cost").textContent, /stays skipped/);
+
+  w.fire(button(box, "Cancel"), "click");
+  await w.settle();
+  assert.equal(w.page.querySelector(".confirm-box"), null);
+  assert.deepEqual(w.calls("review.request"), []);
+  assert.equal(w.page.querySelector("tr.detail-row .inline-note span").textContent, "Not reviewed.");
+
+  // The ⋯ menu's actions ask too, and keep their options.
+  w.fire(menu(w, "solo/tool#8").item("Review without posting"), "click");
+  await w.settle();
+  box = w.page.querySelector(".confirm-box");
+  w.fire(button(box, "Review anyway"), "click");
+  await w.settle();
+  assert.deepEqual(w.calls("review.request"), [{ target: "solo/tool#8", post: false, confirm: true }]);
+  assert.equal(w.page.querySelector(".confirm-box"), null);
+  assert.equal(w.page.querySelector("tr.detail-row .inline-note span").textContent, "Queued solo/tool#8.");
+});
+
+test("no confirmation without warnings, from an older daemon, or when the review is blocked", async () => {
+  for (const preflight of [null, { key: "acme/api#1", warnings: [] }, Object.assign(X.riskyPreflight("acme/api#1"), { blocked: "review mode is off for acme/api" })]) {
+    const w = await X.open("prs", { "review.preflight": () => preflight });
+    w.fire(row(w, "acme/api#1").querySelector(".row-actions > button.btn"), "click");
+    await w.settle();
+    assert.equal(w.page.querySelector(".confirm-box"), null, JSON.stringify(preflight));
+    assert.deepEqual(w.calls("review.request"), [{ target: "acme/api#1" }], JSON.stringify(preflight));
+  }
+  // A shell without the method (bad_request) sends as before; any other
+  // pre-flight failure is shown and sends nothing.
+  const old = await X.open("prs", { "review.preflight": () => { throw bridgeError("bad_request", "unknown bridge method 'review.preflight'"); } });
+  w0(old);
+  await old.settle();
+  assert.deepEqual(old.calls("review.request"), [{ target: "acme/api#1" }]);
+  const down = await X.open("prs", { "review.preflight": X.failing("no watched repo has an open PR #1") });
+  w0(down);
+  await down.settle();
+  assert.deepEqual(down.calls("review.request"), []);
+  const note = down.page.querySelector("tr.detail-row .inline-note");
+  assert.equal(note.className, "inline-note error");
+  assert.equal(note.querySelector("span").textContent, "no watched repo has an open PR #1");
+
+  function w0(w) { w.fire(row(w, "acme/api#1").querySelector(".row-actions > button.btn"), "click"); }
+});
+
+test("Review PR… asks before a risky target and sends it confirmed", async () => {
+  const w = await X.open("prs", { "review.preflight": (p) => X.riskyPreflight("solo/tool#8") });
+  const input = w.page.querySelector(".review-pr input");
+  input.value = "tool#8";
+  w.fire(input, "input");
+  w.fire(button(w.page.querySelector(".review-pr"), "Review"), "click");
+  await w.settle();
+  assert.deepEqual(w.calls("review.preflight"), [{ target: "tool#8" }]);
+  const box = w.page.querySelector(".confirm-box");
+  assert.equal(box.querySelector(".confirm-title").textContent, "Review solo/tool#8 anyway?");
+  w.fire(button(box, "Review anyway"), "click");
+  await w.settle();
+  assert.deepEqual(w.calls("review.request"), [{ target: "tool#8", confirm: true }]);
+  assert.equal(w.page.querySelector(".review-pr .inline-note").textContent, "Queued tool#8.");
 });

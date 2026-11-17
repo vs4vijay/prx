@@ -19,9 +19,7 @@ use crate::machine::{self, Effect, Event, HistoryEvent, MachineCtx};
 use crate::notify::{CommandNotifier, Notifier, NotifyEvent};
 use crate::paths;
 use crate::prompt;
-use crate::state::{
-    Brief, BriefSource, PrRecord, PrState, SkipReason, StateFile, StateStore, Verdict,
-};
+use crate::state::{Brief, BriefSource, PrRecord, PrState, StateFile, StateStore, Verdict};
 use crate::status;
 use crate::usage::TokenUsage;
 
@@ -263,6 +261,11 @@ pub struct Pipeline<'a, G: Gh, A: AgentAdapter, N: Notifier> {
     /// retained agent session nor replaces it, so the configured engine's
     /// continuity survives a one-off run with another engine.
     pub fresh_session: bool,
+    /// The human confirmed this manual review past the pre-flight warnings
+    /// (`confirm: true`, `prx review --yes`): it runs on a PR skipped as
+    /// `draft` or `config` (which stays skipped afterwards) and past the
+    /// diff-size cap. Automatic runs never set it.
+    pub confirmed: bool,
 }
 
 impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
@@ -285,6 +288,49 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
         key: &str,
         extra_prompt: Option<&str>,
     ) -> Result<ReviewOutcome> {
+        // A confirmed review of a rule-skipped PR runs the normal review
+        // flow from `pending`, then puts the skip back: the human reviewed
+        // it once; the skip rules still hold for automatic reviews.
+        let held = state
+            .prs
+            .get(key)
+            .filter(|rec| {
+                self.confirmed
+                    && rec.state == PrState::Skipped
+                    && crate::preflight::confirmable_skip(rec.skip_reason)
+            })
+            .cloned();
+        let Some(held) = held else {
+            return self.run_unheld(state, key, extra_prompt).await;
+        };
+        if let Some(rec) = state.prs.get_mut(key) {
+            rec.state = PrState::Pending;
+        }
+        let outcome = self.run_unheld(state, key, extra_prompt).await;
+        if let Some(rec) = state.prs.get_mut(key) {
+            if matches!(
+                rec.state,
+                PrState::Pending | PrState::ReviewedApproved | PrState::ReviewedChangesRequested
+            ) {
+                rec.state = PrState::Skipped;
+                rec.skip_reason = held.skip_reason;
+                rec.skip_detail = held.skip_detail.clone();
+                rec.previous_state = held.previous_state;
+                rec.review_anchor_at = held.review_anchor_at;
+            }
+        }
+        if !self.dry_run {
+            self.save(state, key)?;
+        }
+        outcome
+    }
+
+    async fn run_unheld(
+        &self,
+        state: &mut StateFile,
+        key: &str,
+        extra_prompt: Option<&str>,
+    ) -> Result<ReviewOutcome> {
         let now = Utc::now();
         let rec = state
             .prs
@@ -298,16 +344,13 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             PrState::Pending | PrState::ReviewedApproved | PrState::ReviewedChangesRequested => {}
             PrState::InReview => bail!("{key}: a review is already in progress"),
             PrState::Skipped => {
-                let reason = match rec.skip_reason {
-                    Some(SkipReason::Draft) => "draft",
-                    Some(SkipReason::Config) => "config rules",
-                    Some(SkipReason::Snoozed) => "snoozed",
-                    Some(SkipReason::Ignored) => "ignored",
-                    None => "unknown reason",
-                };
+                let reason = rec.skip_text().unwrap_or_else(|| "skipped".into());
+                if crate::preflight::confirmable_skip(rec.skip_reason) {
+                    bail!("{key} is skipped ({reason}); confirm to review it anyway");
+                }
                 bail!(
-                    "{key} is skipped ({reason}) — resolve the skip (mark ready, unignore, \
-                     snooze expiry) before reviewing"
+                    "{key} is skipped ({reason}) — resolve the skip (unsnooze, unignore) \
+                     before reviewing"
                 );
             }
             state => bail!("{key} is {state:?}; nothing to review"),
@@ -320,9 +363,15 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             .await
             .context("failed to fetch PR detail")?;
         let diff_lines = detail.additions.saturating_add(detail.deletions);
-        if detail.files_changed as u64 > self.repo.diff_max_files as u64
-            || diff_lines > self.repo.diff_max_lines as u64
-        {
+        let over_cap = crate::preflight::size_text(
+            detail.files_changed as u64,
+            diff_lines,
+            self.repo.diff_max_files as u64,
+            self.repo.diff_max_lines as u64,
+        );
+        // A confirmed manual review runs past the cap: the human saw the
+        // size in the pre-flight and chose to spend the tokens.
+        if let Some(size) = over_cap.filter(|_| !self.confirmed) {
             if self.dry_run {
                 return Ok(ReviewOutcome::SkippedDiffTooLarge {
                     files_changed: detail.files_changed,
@@ -334,11 +383,12 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             // later run re-checks (the diff may shrink).
             let mut rec = rec;
             rec.diff_too_large = true;
+            rec.skip_detail = Some(size.clone());
             rec.updated_at = now;
             let effects = vec![
                 Effect::Notify(NotifyEvent::Skipped),
                 Effect::HistoryAppend(HistoryEvent::ReviewSkipped {
-                    reason: "diff too large".to_string(),
+                    reason: format!("diff too large \u{2014} {size}"),
                 }),
             ];
             self.execute(
@@ -444,6 +494,9 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
         // The diff fit the caps this time: a stale too-large flag from a
         // previous skip must not survive the review.
         let mut rec = rec;
+        if rec.diff_too_large {
+            rec.skip_detail = None;
+        }
         rec.diff_too_large = false;
 
         // ReviewStart is applied in memory only: the state file is written
@@ -663,7 +716,14 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             rec.review_session = retained_session;
         } else if let Some(session) = &run.session {
             rec.review_session = Some(session.clone());
+            // Review Chat (design C1): remember where the session lives. The
+            // agent runs in this process's working directory.
+            rec.review_session_info = Some(crate::state::ReviewSessionInfo {
+                engine: self.repo.engine.clone(),
+                workdir: std::env::current_dir().ok(),
+            });
         }
+        rec.last_manifest = Some(manifest_path.clone());
         // Design B3: the manifest's brief describes the reviewed SHA. An
         // earlier brief stays (marked stale by status when the head moved)
         // until this review's on-demand brief replaces it; failed/skipped
@@ -1333,6 +1393,60 @@ fn push_finding(out: &mut String, f: &ManifestFinding) {
 
 // ----------------------------------------------------------------- CLI: review
 
+/// What `prx review <pr>` does after its pre-flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Send the review; `confirm` when the human confirmed warnings.
+    Proceed { confirm: bool },
+    /// The human answered no.
+    Declined,
+}
+
+/// [`decide`] on the process's terminal: asks on stderr and reads stdin
+/// when both stdin and stdout are terminals.
+pub fn decide_on_terminal(preflight: &crate::preflight::Preflight) -> Result<Decision> {
+    use std::io::IsTerminal;
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    decide(
+        preflight,
+        tty,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// The CLI's confirmation policy. No warnings (or a `blocked` answer, which
+/// the review request itself declines): proceed unconfirmed. Warnings on a
+/// terminal: list them and ask `Review anyway? [y/N]`. Warnings without a
+/// terminal: refuse, naming the warnings and `--yes`.
+pub fn decide(
+    preflight: &crate::preflight::Preflight,
+    tty: bool,
+    input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<Decision> {
+    if !preflight.needs_confirmation() {
+        return Ok(Decision::Proceed { confirm: false });
+    }
+    let mut listing = format!("{} needs your confirmation before review:\n", preflight.key);
+    for line in preflight.lines() {
+        listing.push_str(&format!("  - {line}\n"));
+    }
+    if !tty {
+        bail!(
+            "{listing}not reviewed: there is no terminal to ask on; rerun with --yes to review it anyway"
+        );
+    }
+    write!(out, "{listing}Review anyway? [y/N] ")?;
+    out.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Decision::Proceed { confirm: true },
+        _ => Decision::Declined,
+    })
+}
+
 /// `prx review [target | --all] [--dry-run]`. A22 semantics: an explicit
 /// target bypasses cooldowns; `--all` reviews only currently-due pending PRs.
 /// `overrides` (per-run options, design D1) apply to a single target only.
@@ -1343,6 +1457,7 @@ pub async fn run_review_cmd(
     all: bool,
     dry_run: bool,
     overrides: &ReviewOverrides,
+    yes: bool,
 ) -> Result<()> {
     let config_path = paths::config_path();
     let config = Config::load(&config_path).context("cannot review without configuration")?;
@@ -1351,7 +1466,7 @@ pub async fn run_review_cmd(
     match (target, all) {
         (Some(_), true) => bail!("specify either a PR target or --all, not both"),
         (None, false) => bail!("specify a PR target (org/repo#123) or --all"),
-        (Some(target), false) => run_review_one(&config, target, dry_run, overrides).await,
+        (Some(target), false) => run_review_one(&config, target, dry_run, overrides, yes).await,
         (None, true) => run_review_all(&config, dry_run).await,
     }
 }
@@ -1361,6 +1476,7 @@ async fn run_review_one(
     target: &str,
     dry_run: bool,
     overrides: &ReviewOverrides,
+    yes: bool,
 ) -> Result<()> {
     let (repo_name, number) = match parse_pr_ref(target)? {
         PrRef::Full(repo, number) => (repo, number),
@@ -1412,6 +1528,24 @@ async fn run_review_one(
         }
     }
 
+    // The pre-flight, as the daemon serves it: ask (or refuse without a
+    // terminal) before a skipped or oversized PR spends tokens.
+    let confirmed = match yes {
+        true => true,
+        false => {
+            let mut input = crate::preflight::PreflightInput::for_repo(&key, &repo);
+            input.record = state.prs.get(&key);
+            input.size = crate::preflight::measure(&gh, &repo_name, number).await;
+            match decide_on_terminal(&crate::preflight::check(&input))? {
+                Decision::Proceed { confirm } => confirm,
+                Decision::Declined => {
+                    println!("{key} was not reviewed");
+                    return Ok(());
+                }
+            }
+        }
+    };
+
     let (repo, fresh_session) = apply_overrides(config, &repo, overrides)?;
     let writer = gh.for_credential(repo.identity.credential.as_deref());
     let pipeline = Pipeline {
@@ -1424,6 +1558,7 @@ async fn run_review_one(
         store: &store,
         dry_run,
         fresh_session,
+        confirmed,
     };
     let outcome = pipeline
         .run_and_brief_with_extra_prompt(&mut state, &key, overrides.extra_prompt.as_deref())
@@ -1502,6 +1637,7 @@ async fn run_review_all(config: &Config, dry_run: bool) -> Result<()> {
             store: &store,
             dry_run,
             fresh_session: false,
+            confirmed: false,
         };
         match pipeline.run_and_brief(&mut state, key).await {
             Ok(outcome) => {
@@ -1738,6 +1874,7 @@ pub async fn run_brief_cmd(target: &str, regenerate: bool) -> Result<()> {
             store: &store,
             dry_run: false,
             fresh_session: true,
+            confirmed: false,
         };
         eprintln!("writing a brief for {key}…");
         let request = BriefRequest::standalone(&rec, Utc::now());
@@ -1764,13 +1901,50 @@ pub async fn run_brief_cmd(target: &str, regenerate: bool) -> Result<()> {
 }
 
 fn print_brief(key: &str, brief: Option<&status::BriefStatus>) -> Result<()> {
+    use std::io::IsTerminal;
     match brief {
         Some(brief) => {
-            println!("{}", format_brief(brief));
+            let text = format_brief(brief);
+            // On a terminal, wrap at word boundaries so the brief reads as a
+            // paragraph; piped output stays exactly as stored.
+            if std::io::stdout().is_terminal() {
+                println!("{}", wrap_text(&text, BRIEF_WRAP_COLUMNS));
+            } else {
+                println!("{text}");
+            }
             Ok(())
         }
         None => bail!("{key} has no brief yet; write one with `prx brief {key} --regenerate`"),
     }
+}
+
+/// The column `prx brief` wraps at on a terminal.
+const BRIEF_WRAP_COLUMNS: usize = 80;
+
+/// `text` with every line wrapped at word boundaries to at most `width`
+/// characters (a longer word stays whole on its own line). Existing line
+/// breaks and blank lines are kept; runs of spaces inside a line collapse.
+pub fn wrap_text(text: &str, width: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut current = String::new();
+        let mut len = 0;
+        for word in line.split_whitespace() {
+            let word_len = word.chars().count();
+            if len > 0 && len + 1 + word_len > width {
+                out.push(std::mem::take(&mut current));
+                len = 0;
+            }
+            if len > 0 {
+                current.push(' ');
+                len += 1;
+            }
+            current.push_str(word);
+            len += word_len;
+        }
+        out.push(current);
+    }
+    out.join("\n")
 }
 
 /// `prx approve org/repo#n` — the ONLY path to a GitHub approval (A1/D2).
@@ -2058,6 +2232,72 @@ pub fn parse_pr_key(target: &str) -> Result<(String, u64)> {
 mod tests {
     use super::*;
     use crate::agent::Severity;
+
+    fn preflight_with(warnings: &[&str]) -> crate::preflight::Preflight {
+        crate::preflight::Preflight {
+            key: "acme/api#7".into(),
+            warnings: warnings
+                .iter()
+                .map(|m| crate::preflight::PreflightWarning {
+                    kind: crate::preflight::WarningKind::Skipped,
+                    message: m.to_string(),
+                })
+                .collect(),
+            blocked: None,
+            size: None,
+        }
+    }
+
+    fn decide_with(
+        preflight: &crate::preflight::Preflight,
+        tty: bool,
+        answer: &str,
+    ) -> (Result<Decision>, String) {
+        let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+        let mut out = Vec::new();
+        let decision = decide(preflight, tty, &mut input, &mut out);
+        (decision, String::from_utf8(out).unwrap())
+    }
+
+    /// `prx review <pr>`: nothing to confirm runs unconfirmed; a terminal
+    /// is asked (only `y`/`yes` confirms); no terminal refuses with --yes.
+    #[test]
+    fn the_cli_asks_before_a_risky_review_and_refuses_without_a_terminal() {
+        let plain = preflight_with(&[]);
+        let (decision, out) = decide_with(&plain, false, "");
+        assert_eq!(decision.unwrap(), Decision::Proceed { confirm: false });
+        assert!(out.is_empty());
+
+        let risky = preflight_with(&["Skipped \u{2014} draft"]);
+        for (answer, expected) in [
+            ("y\n", Decision::Proceed { confirm: true }),
+            ("YES\n", Decision::Proceed { confirm: true }),
+            ("n\n", Decision::Declined),
+            ("\n", Decision::Declined),
+            ("", Decision::Declined),
+        ] {
+            let (decision, out) = decide_with(&risky, true, answer);
+            assert_eq!(decision.unwrap(), expected, "{answer:?}");
+            assert!(out.contains("  - Skipped \u{2014} draft"), "{out}");
+            assert!(out.ends_with("Review anyway? [y/N] "), "{out}");
+        }
+
+        let (decision, out) = decide_with(&risky, false, "y\n");
+        let error = format!("{:#}", decision.unwrap_err());
+        assert!(error.contains("Skipped \u{2014} draft"), "{error}");
+        assert!(error.contains("--yes"), "{error}");
+        assert!(out.is_empty(), "nothing is asked without a terminal");
+
+        // Blocked: the review request declines it; nothing is asked.
+        let blocked = crate::preflight::Preflight {
+            blocked: Some("review mode is off for acme/api".into()),
+            ..risky
+        };
+        assert_eq!(
+            decide_with(&blocked, false, "").0.unwrap(),
+            Decision::Proceed { confirm: false }
+        );
+    }
 
     fn manifest(verdict: Verdict) -> ReviewManifest {
         ReviewManifest {
@@ -2635,6 +2875,33 @@ mod tests {
     }
 
     /// Design B3 / spec "CLI print": text, then the dates, plus "(stale)".
+    #[test]
+    fn wrap_text_breaks_lines_at_words_and_keeps_paragraphs() {
+        assert_eq!(wrap_text("", 10), "");
+        assert_eq!(wrap_text("short", 10), "short");
+        assert_eq!(
+            wrap_text("one two three four five", 9),
+            "one two\nthree\nfour five"
+        );
+        // Exactly the width fits; a longer word stays whole.
+        assert_eq!(wrap_text("abcd efgh", 9), "abcd efgh");
+        assert_eq!(
+            wrap_text("a supercalifragilistic b", 6),
+            "a\nsupercalifragilistic\nb"
+        );
+        // Line breaks and blank lines survive; spaces collapse.
+        assert_eq!(
+            wrap_text("First  para.\n\nSecond para here.", 12),
+            "First para.\n\nSecond para\nhere."
+        );
+        // Width counts characters, not bytes.
+        assert_eq!(wrap_text("café café", 9), "café café");
+        let long = "word ".repeat(50);
+        assert!(wrap_text(&long, BRIEF_WRAP_COLUMNS)
+            .lines()
+            .all(|l| l.chars().count() <= BRIEF_WRAP_COLUMNS));
+    }
+
     #[test]
     fn format_brief_prints_text_dates_and_stale() {
         let utc = chrono::FixedOffset::east_opt(0).unwrap();

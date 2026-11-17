@@ -393,6 +393,7 @@ impl World {
             store: &self.store,
             dry_run,
             fresh_session: false,
+            confirmed: false,
         }
     }
 
@@ -867,12 +868,12 @@ async fn skipped_terminal_and_in_flight_prs_are_never_reviewed() {
         (
             PrState::Skipped,
             Some(SkipReason::Config),
-            "skipped (config rules)",
+            "skipped (skip rule)",
         ),
         (
             PrState::Skipped,
             Some(SkipReason::Snoozed),
-            "skipped (snoozed)",
+            "skipped (snoozed",
         ),
         (
             PrState::Skipped,
