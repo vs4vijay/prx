@@ -101,6 +101,11 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
         include_bytes!("../../settings-ui/pages-prs.js"),
     ),
     (
+        "pages-pr.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("../../settings-ui/pages-pr.js"),
+    ),
+    (
         "pages-history.js",
         "text/javascript; charset=utf-8",
         include_bytes!("../../settings-ui/pages-history.js"),
@@ -153,14 +158,68 @@ fn page_id(page: &str) -> &str {
     }
 }
 
-/// The URL a new window opens on: the app reads `#page=<id>` at start.
-pub fn start_url(page: &str) -> String {
-    format!("{START_URL}#page={}", page_id(page))
+/// The window location prefix that opens the PR details page at a PR
+/// (`pr:acme/api#42`, built by [`pr_page`]).
+const PR_LOCATION: &str = "pr:";
+
+/// The window location for the PR details page at `key` (spec "PR details
+/// page"). Pass it wherever a page id goes (`Settings::open`,
+/// `Msg::OpenWindow`, the instance forward); an invalid key opens the
+/// Dashboard.
+pub fn pr_page(key: &str) -> String {
+    format!("{PR_LOCATION}{key}")
 }
 
-/// The script that switches an already-open window to `page`.
+/// Whether `key` is a PR key as the daemon writes it: `org/repo#n`, each
+/// half of the repo `[A-Za-z0-9._-]+`, `n` digits. Nothing else may reach
+/// the window's URL or a script.
+pub fn is_pr_key(key: &str) -> bool {
+    let name_ok = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let Some((repo, number)) = key.rsplit_once('#') else {
+        return false;
+    };
+    let Some((org, name)) = repo.split_once('/') else {
+        return false;
+    };
+    name_ok(org)
+        && name_ok(name)
+        && !number.is_empty()
+        && number.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The PR key a `pr:<key>` location names, when valid.
+fn pr_key(location: &str) -> Option<&str> {
+    location
+        .strip_prefix(PR_LOCATION)
+        .filter(|key| is_pr_key(key))
+}
+
+/// The URL a new window opens on: the app reads `#page=<id>` at start, and
+/// `#page=pr&pr=<key>` for a `pr:<key>` location (`/` and `#` encoded).
+pub fn start_url(page: &str) -> String {
+    match pr_key(page) {
+        Some(key) => format!(
+            "{START_URL}#page=pr&pr={}",
+            key.replace('/', "%2F").replace('#', "%23")
+        ),
+        None => format!("{START_URL}#page={}", page_id(page)),
+    }
+}
+
+/// The script that switches an already-open window to `page` (or, for a
+/// `pr:<key>` location, to that PR's details page).
 pub fn go_script(page: &str) -> String {
-    format!("window.prxApp && window.prxApp.go(\"{}\");", page_id(page))
+    match pr_key(page) {
+        // The key is validated (no quote, backslash or `<`), so it is a
+        // plain JS string literal.
+        Some(key) => format!("window.prxApp && window.prxApp.openPr(\"{key}\");"),
+        None => format!("window.prxApp && window.prxApp.go(\"{}\");", page_id(page)),
+    }
 }
 
 #[cfg(test)]
@@ -242,12 +301,22 @@ mod tests {
         let sources =
             prx::config::Config::default().effective_sources(&prx::config::RepoConfig::default());
         assert!(!sources.is_empty());
+        // Event tiers and event sounds are generated from the EVENTS table,
+        // so a path is covered by its event's row there (plus, for sounds,
+        // the generated `notifications.sounds.` field).
+        let listed = |event: &str| schema.contains(&format!("[\"{event}\","));
         for path in sources.keys() {
-            let event = path.strip_prefix("notifications.");
-            let covered =
-                has_key(path) || event.is_some_and(|e| schema.contains(&format!("[\"{e}\",")));
+            let covered = has_key(path)
+                || match path.strip_prefix("notifications.sounds.") {
+                    Some(event) => {
+                        listed(event) && schema.contains("key: \"notifications.sounds.\" + e[0]")
+                    }
+                    None => path.strip_prefix("notifications.").is_some_and(listed),
+                };
             assert!(covered, "schema.js has no field for `{path}`");
         }
+        // Global, so not among the override sources.
+        assert!(has_key("notifications.menubar_bell"));
         let defaults = serde_json::to_value(prx::config::Defaults::default()).unwrap();
         for key in defaults.as_object().unwrap().keys() {
             assert!(
@@ -324,6 +393,41 @@ mod tests {
         }
         let app = asset_text("app.js");
         assert!(app.contains("pageFromHash") && app.contains("go: show"));
+    }
+
+    /// Spec "PR details page": `pr:<key>` opens the window at a PR; a key
+    /// that is not `org/repo#n` never reaches the URL or a script.
+    #[test]
+    fn pr_locations_open_the_details_page_at_a_valid_key() {
+        assert_eq!(pr_page("acme/api#42"), "pr:acme/api#42");
+        assert_eq!(
+            start_url(&pr_page("acme/api#42")),
+            "prx://localhost/index.html#page=pr&pr=acme%2Fapi%2342"
+        );
+        assert_eq!(
+            go_script(&pr_page("a.b_c-d/x.y#7")),
+            "window.prxApp && window.prxApp.openPr(\"a.b_c-d/x.y#7\");"
+        );
+        for bad in [
+            "acme/api",
+            "acme/api#",
+            "acme/api#x",
+            "acme#1",
+            "a/b/c#1",
+            "/api#1",
+            "acme/#1",
+            "a/b#1\");alert(1)//",
+            "a/b#1</script>",
+            "a b/c#1",
+        ] {
+            assert!(!is_pr_key(bad), "{bad}");
+            assert_eq!(start_url(&pr_page(bad)), start_url("dashboard"), "{bad}");
+            assert_eq!(go_script(&pr_page(bad)), go_script("dashboard"), "{bad}");
+        }
+        // The page knows the entry points.
+        let app = asset_text("app.js");
+        assert!(app.contains("openPr: openPr") && app.contains("prFromHash"));
+        assert!(lookup("/pages-pr.js").is_some());
     }
 
     #[test]

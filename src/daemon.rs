@@ -27,8 +27,9 @@ use crate::browser::{self, Opener, SystemOpener};
 use crate::config::{self, Config, ConfigError, EffectiveRepo, ReviewMode};
 use crate::effects::EffectsDeps;
 use crate::github::GhCli;
+use crate::health::{self, HealthThresholds, RepoPollHealth};
 use crate::history;
-use crate::ipc::ConfigErrorInfo;
+use crate::ipc::{ConfigErrorInfo, ConfigRevision};
 use crate::machine;
 use crate::notify::{CommandNotifier, Notifier, NotifyError, TierBehavior, TierTable};
 use crate::paths;
@@ -50,7 +51,7 @@ const MENUBAR_LIVENESS_WINDOW: Duration = Duration::from_secs(90);
 // ------------------------------------------------- banner dedup (D3)
 
 /// The client-liveness cell (D3): when an authenticated IPC request last
-/// carried `X-Prx-Client`. `Shared` records into it (auth middleware); the
+/// carried `X-Prx-Client: menubar/…`. `Shared` records into it (auth middleware); the
 /// daemon's suppressing notifier reads it before delegating a banner — hence
 /// the `Arc`, shared by both owners.
 #[derive(Debug, Default)]
@@ -193,6 +194,9 @@ pub struct ReloadSummary {
     pub removed: Vec<String>,
     /// Queued (not yet running) review keys discarded with removed repos.
     pub discarded: Vec<String>,
+    /// The applied config differs from the one it replaced, so the config
+    /// revision went up. `false` for a re-apply of identical content.
+    pub config_changed: bool,
 }
 
 impl ReloadSummary {
@@ -208,6 +212,49 @@ impl ReloadSummary {
 enum ConfigFingerprint {
     Content(u64),
     Unreadable,
+}
+
+/// What one look at the config file did (`POST /config/reload`, the
+/// watcher, review-now).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCheck {
+    /// The daemon runs without a config file (tests / embedded use).
+    NoFile,
+    /// The content is the one already processed and it is running.
+    Unchanged,
+    /// New content was validated and applied.
+    Applied(ReloadSummary),
+    /// The file fails to read, parse, or validate (now or since its last
+    /// change): the last-good config keeps running. The message is the
+    /// error, as in `config_error`.
+    Rejected(String),
+}
+
+/// The review concurrency cap `live` asks for: the largest
+/// `max_concurrent_reviews` among defaults and every watched repo, at
+/// least 1. Sized once at daemon start (the semaphore cannot shrink).
+fn concurrency_cap(live: &LiveConfig) -> usize {
+    live.config
+        .defaults
+        .max_concurrent_reviews
+        .max(
+            live.repos
+                .iter()
+                .map(|r| r.max_concurrent_reviews)
+                .max()
+                .unwrap_or(1),
+        )
+        .max(1) as usize
+}
+
+/// Config keys whose new value in `live` applies only after a daemon
+/// restart, given the cap the daemon started with.
+fn restart_required_for(live: &LiveConfig, running_cap: usize) -> Vec<String> {
+    if concurrency_cap(live) != running_cap {
+        vec!["max_concurrent_reviews".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Change detection only (not security): exact for any edit, independent of
@@ -248,6 +295,10 @@ pub struct Job {
     /// They live in the in-memory queue alone — never in state, history, or
     /// config — so they are ephemeral by construction.
     pub overrides: ReviewOverrides,
+    /// The human confirmed this single-PR review past its pre-flight
+    /// warnings (`POST /review` with `confirm: true`): it may run on a
+    /// `draft` / `config`-skipped PR and past the diff cap.
+    pub confirmed: bool,
 }
 
 #[derive(Debug, Default)]
@@ -261,6 +312,8 @@ struct Runtime {
     /// D11: next review-enqueue tick per repo with an effective `schedule`
     /// (repos on the interval cadence have no entry).
     next_review_tick: BTreeMap<String, DateTime<Utc>>,
+    /// Poll successes and failures per repo (`/status` `poll_health`).
+    poll_health: BTreeMap<String, RepoPollHealth>,
 }
 
 /// Tunables for the scheduler loop. `Default` is the production shape; tests
@@ -283,6 +336,9 @@ pub struct SchedulerOptions {
     /// D11 schedule ticks). Test hook: shift it to reach a cron tick
     /// without waiting for wall time.
     pub clock: fn() -> DateTime<Utc>,
+    /// When failing polls become a warning and a restart is recommended.
+    /// Test hook: shrink the restart periods.
+    pub health: HealthThresholds,
 }
 
 impl Default for SchedulerOptions {
@@ -294,6 +350,7 @@ impl Default for SchedulerOptions {
             interval_scale: 1.0,
             config_check: Duration::from_secs(1),
             clock: Utc::now,
+            health: HealthThresholds::default(),
         }
     }
 }
@@ -332,6 +389,10 @@ pub struct Shared {
     /// Wakes the scheduler after a reload so added repos are polled now
     /// rather than on the next tick.
     config_applied: Notify,
+    /// The config revision (starts at 1, +1 per applied config that differs
+    /// from the running one) and when that config was applied. Clients
+    /// compare revisions to notice a change they did not make.
+    config_revision: std::sync::Mutex<(u64, DateTime<Utc>)>,
     /// D9/D12: gh-authenticated logins resolved by Block/Unblock, keyed by
     /// the identity's credential reference (`None` = gh's own account).
     /// Fills in the status payload's identity login when config sets none.
@@ -345,6 +406,10 @@ pub struct Shared {
     /// Design B4: on-demand brief runs share these slots — apart from the
     /// review slots — so a burst of Regenerate clicks cannot fan out agents.
     pub brief_semaphore: Arc<Semaphore>,
+    /// Set once poll health recommends a restart ([`health::restart_recommended`]);
+    /// `run_foreground` waits on [`Shared::restart_requested`] when supervised.
+    restart_flag: std::sync::atomic::AtomicBool,
+    restart_requested: Notify,
 }
 
 /// Concurrent on-demand brief runs (design B4).
@@ -371,19 +436,9 @@ impl Shared {
         // announcements: one liveness cell, two owners.
         let menubar_liveness = deps.notifier.liveness.clone();
         // The concurrency cap is sized once at startup; a reload that
-        // changes max_concurrent_reviews applies on the next daemon start.
-        let cap = live
-            .config
-            .defaults
-            .max_concurrent_reviews
-            .max(
-                live.repos
-                    .iter()
-                    .map(|r| r.max_concurrent_reviews)
-                    .max()
-                    .unwrap_or(1),
-            )
-            .max(1) as usize;
+        // changes max_concurrent_reviews applies on the next daemon start
+        // (reported as `restart_required` until then).
+        let cap = concurrency_cap(&live);
         Ok(Shared {
             semaphore: Arc::new(Semaphore::new(cap)),
             max_concurrent: cap,
@@ -404,10 +459,13 @@ impl Shared {
             // (a no-op reconcile when it still matches the startup config).
             config_seen: tokio::sync::Mutex::new(None),
             config_applied: Notify::new(),
+            config_revision: std::sync::Mutex::new((1, Utc::now())),
             gh_logins: std::sync::Mutex::new(BTreeMap::new()),
             briefs_in_flight: std::sync::Mutex::new(HashSet::new()),
             brief_errors: std::sync::Mutex::new(BTreeMap::new()),
             brief_semaphore: Arc::new(Semaphore::new(BRIEF_CONCURRENCY)),
+            restart_flag: std::sync::atomic::AtomicBool::new(false),
+            restart_requested: Notify::new(),
         })
     }
 
@@ -520,6 +578,21 @@ impl Shared {
             .clone()
     }
 
+    /// The running config's revision, when it was applied, and the keys
+    /// that wait for a daemon restart (the payload fields of `/status`,
+    /// `/config`, and config writes).
+    pub fn config_revision(&self) -> ConfigRevision {
+        let (revision, loaded_at) = *self
+            .config_revision
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ConfigRevision {
+            config_revision: Some(revision),
+            config_loaded_at: Some(loaded_at),
+            restart_required: restart_required_for(&self.live(), self.max_concurrent),
+        }
+    }
+
     fn set_config_error(&self, error: Option<ConfigErrorInfo>) {
         *self
             .config_error
@@ -535,8 +608,9 @@ impl Shared {
     /// yet, so the next scheduler pass polls them; the scheduler is woken
     /// for that); removed repos leave the rotation, their queued reviews are
     /// discarded (in-flight ones finish), and their state records stay in
-    /// `state.json` but drop out of status; a changed poll interval
-    /// reschedules the repo from the next pass.
+    /// `state.json` but drop out of status; a changed poll interval, and a
+    /// switch from mode `off` back to an active mode, poll the repo now.
+    /// A config that differs from the running one bumps the revision.
     pub async fn apply_config(&self, config: Config) -> Result<ReloadSummary, ConfigError> {
         self.swap_config(config, true).await
     }
@@ -563,6 +637,7 @@ impl Shared {
     ) -> Result<ReloadSummary, ConfigError> {
         let next = Arc::new(LiveConfig::from_config(config)?);
         let mut summary = ReloadSummary::default();
+        let now = Utc::now();
         {
             // Swap under the runtime lock: anything that checks the live
             // repo set while holding it sees either the old set with the
@@ -579,7 +654,7 @@ impl Shared {
                 match prev.repo(&repo.name) {
                     None => summary.added.push(repo.name.clone()),
                     Some(old) => {
-                        if old.poll_interval_minutes != repo.poll_interval_minutes {
+                        if reschedules_now(old, repo) {
                             rt.next_poll.remove(&repo.name);
                         }
                         // D11: a changed schedule re-derives its next tick.
@@ -608,6 +683,14 @@ impl Shared {
                 }
                 keep
             });
+            if prev.config != next.config {
+                summary.config_changed = true;
+                let mut revision = self
+                    .config_revision
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *revision = (revision.0 + 1, now);
+            }
         }
         if clear_error {
             self.set_config_error(None);
@@ -618,10 +701,12 @@ impl Shared {
 
     /// D1/D2: re-read the config file if its content changed since the last
     /// check and apply it; a failed read/parse/validate keeps the last-good
-    /// config running and records `config_error` until a good read.
-    pub async fn check_config_file(&self) {
+    /// config running and records `config_error` until a good read. The
+    /// watcher runs this every second; `POST /config/reload` runs it on
+    /// demand and reports the outcome.
+    pub async fn check_config_file(&self) -> ConfigCheck {
         let Some(path) = self.deps.config_path.as_deref() else {
-            return;
+            return ConfigCheck::NoFile;
         };
         let mut seen = self.config_seen.lock().await;
         let read = std::fs::read(path);
@@ -630,7 +715,11 @@ impl Shared {
             Err(_) => ConfigFingerprint::Unreadable,
         };
         if *seen == Some(fingerprint) {
-            return;
+            // Already processed: still broken if it was rejected then.
+            return match self.config_error() {
+                Some(error) => ConfigCheck::Rejected(error.message),
+                None => ConfigCheck::Unchanged,
+            };
         }
         *seen = Some(fingerprint);
 
@@ -654,19 +743,34 @@ impl Shared {
             Err(e) => Err(e),
         };
         match applied {
-            Ok(summary) if summary.is_noop() => tracing::debug!("config re-read; no repo changes"),
-            Ok(summary) => tracing::info!(
-                "config reloaded: added {:?}, removed {:?}, discarded {} queued review(s)",
-                summary.added,
-                summary.removed,
-                summary.discarded.len()
-            ),
+            Ok(summary) => {
+                if summary.is_noop() {
+                    tracing::debug!(
+                        "config re-read (changed: {}); no repo changes",
+                        summary.config_changed
+                    );
+                } else {
+                    tracing::info!(
+                        "config reloaded: added {:?}, removed {:?}, discarded {} queued review(s)",
+                        summary.added,
+                        summary.removed,
+                        summary.discarded.len()
+                    );
+                }
+                if summary.config_changed {
+                    ConfigCheck::Applied(summary)
+                } else {
+                    ConfigCheck::Unchanged
+                }
+            }
             Err(e) => {
                 tracing::warn!("config reload failed; keeping the last-good config: {e}");
+                let message = e.to_string();
                 self.set_config_error(Some(ConfigErrorInfo {
-                    message: e.to_string(),
+                    message: message.clone(),
                     at: Utc::now(),
                 }));
+                ConfigCheck::Rejected(message)
             }
         }
     }
@@ -805,6 +909,12 @@ impl Shared {
                     existing.overrides = job.overrides;
                     upgraded = true;
                 }
+                // A confirmation upgrades a queued unconfirmed run of the
+                // same PR.
+                if job.confirmed && !existing.confirmed {
+                    existing.confirmed = true;
+                    upgraded = true;
+                }
                 if upgraded {
                     enqueued.push(job.key);
                 }
@@ -865,14 +975,74 @@ impl Shared {
         self.runtime.lock().await.last_poll.clone()
     }
 
+    /// Poll health per repo (`/status` `poll_health`), limited to the repos
+    /// the running config polls: a removed repo or one in mode `off` keeps
+    /// no warning alive.
+    pub async fn poll_health(&self) -> BTreeMap<String, RepoPollHealth> {
+        let live = self.live();
+        let rt = self.runtime.lock().await;
+        rt.poll_health
+            .iter()
+            .filter(|(name, _)| {
+                live.repo(name)
+                    .is_some_and(|repo| repo.review_mode != ReviewMode::Off)
+            })
+            .map(|(name, h)| (name.clone(), h.clone()))
+            .collect()
+    }
+
+    /// Whether a fresh daemon process is likely to fix the failing polls
+    /// (`/status` `restart_recommended`; see [`health::restart_recommended`]).
+    pub async fn restart_recommended(&self) -> bool {
+        health::restart_recommended(
+            &self.poll_health().await,
+            self.started_at.elapsed(),
+            (self.options.clock)(),
+            &self.options.health,
+        )
+    }
+
+    /// Resolves once poll health has recommended a restart (immediately if
+    /// it already has).
+    pub async fn restart_requested(&self) {
+        use std::sync::atomic::Ordering;
+        loop {
+            let notified = self.restart_requested.notified();
+            if self.restart_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// After a poll pass: raise the restart request once it is recommended.
+    async fn check_restart(&self) {
+        use std::sync::atomic::Ordering;
+        if self.restart_flag.load(Ordering::SeqCst) || !self.restart_recommended().await {
+            return;
+        }
+        let health = self.poll_health().await;
+        if let Some(warning) = health::sync_warning(&health, &self.options.health) {
+            tracing::warn!(
+                "every poll has failed for {} ({} in a row, environment errors): {}; \
+                 a fresh daemon process is recommended",
+                warning.repos_label(),
+                warning.failures,
+                warning.error
+            );
+        }
+        self.restart_flag.store(true, Ordering::SeqCst);
+        self.restart_requested.notify_waiters();
+    }
+
     /// The soonest scheduled repo poll (`/status` `next_poll`, the menu's
     /// "next check"); `None` before any poll is planned.
     pub async fn next_poll_at(&self) -> Option<DateTime<Utc>> {
         self.runtime.lock().await.next_poll.values().min().copied()
     }
 
-    /// Record a client announcement: the IPC auth middleware calls this when
-    /// an authenticated request carries `X-Prx-Client` (D3).
+    /// Record a menubar sighting: the IPC auth middleware calls this when
+    /// an authenticated request carries `X-Prx-Client: menubar/…` (D3).
     pub fn note_menubar_seen(&self) {
         self.menubar_liveness.note_seen();
     }
@@ -931,14 +1101,13 @@ impl PidGuard {
                     return Ok(PidGuard { path, pid });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    match read_pid(&path) {
-                        // Our own leftover file (crash without drop): steal it.
-                        Some(pid) if pid == std::process::id() => {}
+                    match pid_file_owner(&path) {
                         // Another live process owns it: single instance (A16).
-                        Some(pid) if process_alive(pid) => {
+                        Some(pid) if pid != std::process::id() => {
                             return Err(PidError::AlreadyRunning(pid));
                         }
-                        // Stale or unreadable: reclaim.
+                        // Our own leftover file (crash without drop), or a
+                        // stale, reused, or unreadable one: reclaim.
                         _ => {}
                     }
                     let _ = std::fs::remove_file(&path);
@@ -965,17 +1134,130 @@ impl Drop for PidGuard {
     }
 }
 
-/// Read the pid recorded in a pid file, if it parses.
+/// Read the pid recorded in a pid file, if it parses and can name one
+/// process (see [`signalable_pid`]); anything else reads as no pid at all,
+/// so a damaged file is reclaimed like any other stale one.
 pub fn read_pid(path: &Path) -> Option<u32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    let pid = std::fs::read_to_string(path).ok()?.trim().parse().ok()?;
+    signalable_pid(pid).map(|_| pid)
+}
+
+/// How much later than its pid file a process may appear to have started
+/// and still count as the file's writer: process start times and file
+/// mtimes come from different clocks and granularities (whole-second boot
+/// time on Linux).
+const PID_FILE_START_SLACK: Duration = Duration::from_secs(2);
+
+/// The pid a pid file names, while that process is still the one that
+/// wrote it: alive, and started no later than the file was written. After
+/// a reboot or a crash the recorded pid can be handed to an unrelated
+/// process; that one started after the file, so the file reads as stale
+/// instead of as a running daemon that nothing can start over or that
+/// `prx daemon stop` would signal. When the start time cannot be read the
+/// live process is trusted, as before.
+pub fn pid_file_owner(path: &Path) -> Option<u32> {
+    let pid = read_pid(path)?;
+    if !process_alive(pid) {
+        return None;
+    }
+    let written = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    match (written, process_start_time(pid)) {
+        (Some(written), Some(started)) if started > written + PID_FILE_START_SLACK => None,
+        _ => Some(pid),
+    }
+}
+
+/// When the process `pid` started, from `sysctl(KERN_PROC_PID)`, which
+/// (unlike `proc_pidinfo`) also answers for other users' processes.
+#[cfg(target_os = "macos")]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let pid = signalable_pid(pid)?;
+    // libc has no `kinfo_proc` for Apple targets. The struct is 648 bytes,
+    // and its first field, `kp_proc.p_starttime`, is a `struct timeval`
+    // (i64 seconds, then i32 microseconds) on both arm64 and x86_64.
+    let mut info = [0u8; 648];
+    let mut len = info.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    // SAFETY: `mib` names a 4-level sysctl and `info`/`len` describe a
+    // writable buffer of `len` bytes; nothing is written (`newp` is null).
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            info.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    // No such process answers rc 0 with nothing written.
+    if rc != 0 || len < 12 {
+        return None;
+    }
+    let secs = i64::from_ne_bytes(info[0..8].try_into().ok()?);
+    let micros = i32::from_ne_bytes(info[8..12].try_into().ok()?);
+    let since_epoch = Duration::from_secs(u64::try_from(secs).ok()?)
+        + Duration::from_micros(u64::try_from(micros).ok()?);
+    std::time::UNIX_EPOCH.checked_add(since_epoch)
+}
+
+/// When the process `pid` started: `/proc/<pid>/stat` field 22 (clock ticks
+/// since boot) plus the boot time from `/proc/stat`.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Fields are counted after the parenthesised command name, which may
+    // itself hold spaces or parentheses; field 3 is the first one after it.
+    let ticks: u64 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    let boot: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf only reads a configuration value.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = u64::try_from(hz).ok().filter(|hz| *hz > 0)?;
+    let since_boot = Duration::from_millis(ticks.checked_mul(1000)? / hz);
+    std::time::UNIX_EPOCH.checked_add(Duration::from_secs(boot) + since_boot)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_start_time(_pid: u32) -> Option<std::time::SystemTime> {
+    None
+}
+
+/// `pid` as kill(2) takes it, when it names exactly one process. Zero and
+/// values past `i32::MAX` (negative once cast) address the caller's process
+/// group or every process the user owns instead, so they must never reach
+/// kill(2): a pid file holding one would otherwise read as a running daemon,
+/// and `prx daemon stop` would signal far more than a daemon.
+#[cfg(unix)]
+fn signalable_pid(pid: u32) -> Option<libc::pid_t> {
+    libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)
+}
+
+#[cfg(not(unix))]
+fn signalable_pid(pid: u32) -> Option<u32> {
+    (pid > 0).then_some(pid)
 }
 
 /// True when a process with this pid exists. `kill(pid, 0)` sends no signal;
 /// EPERM means the process is alive but owned by another user.
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
+    let Some(pid) = signalable_pid(pid) else {
+        return false;
+    };
     // SAFETY: kill(2) with signal 0 performs only the permission check.
-    let rc = unsafe { libc::kill(pid as i32, 0) };
+    let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
@@ -995,15 +1277,39 @@ pub async fn run_foreground() -> Result<()> {
     let deps = Deps::production(config_path, paths::data_dir());
 
     let pid_guard = PidGuard::acquire(&deps.data_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // A daemon runs again: the last `prx daemon stop` no longer applies.
+    let _ = std::fs::remove_file(paths::daemon_stop_marker());
     let handle = spawn_core(deps, config, SchedulerOptions::default(), Some(pid_guard)).await?;
+    let supervised = supervised_for_restart();
     tracing::info!(
-        "prx daemon started (pid {}): watching {} repo(s), IPC on 127.0.0.1:{}",
+        "prx daemon started (pid {}): watching {} repo(s), IPC on 127.0.0.1:{}{}",
         handle.shared.pid,
         handle.shared.live().repos.len(),
-        handle.port
+        handle.port,
+        if supervised { ", supervised" } else { "" }
     );
 
-    wait_for_shutdown_signal().await;
+    // A supervised daemon whose polls keep failing in a way a fresh process
+    // can fix (see `health::restart_recommended`) exits for a restart; an
+    // unsupervised one keeps running and reports the failures in `/status`.
+    let restart = async {
+        if supervised {
+            handle.shared.restart_requested().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    let restarting = tokio::select! {
+        _ = wait_for_shutdown_signal() => false,
+        _ = restart => true,
+    };
+    if restarting {
+        tracing::warn!(
+            "exiting with code {RESTART_EXIT_CODE} so the supervisor starts a fresh daemon"
+        );
+        handle.shutdown().await;
+        return Err(anyhow::Error::new(RestartRequested));
+    }
     // Graceful shutdown choice (documented): stop scheduling, let the current
     // tick finish, persist state, and exit. In-flight reviews are abandoned —
     // the pipeline persists state only at completion, so state.json stays
@@ -1013,6 +1319,44 @@ pub async fn run_foreground() -> Result<()> {
     tracing::info!("shutdown signal received; finishing up");
     handle.shutdown().await;
     Ok(())
+}
+
+/// Exit code of a daemon that stopped so its supervisor starts a fresh one
+/// (`EX_TEMPFAIL`). launchd's `KeepAlive { SuccessfulExit = false }`,
+/// systemd's `Restart=on-failure`, and PRX.app all restart a non-zero exit.
+pub const RESTART_EXIT_CODE: i32 = 75;
+
+/// The error `run_foreground` returns when it stopped for a restart; `main`
+/// turns it into [`RESTART_EXIT_CODE`].
+#[derive(Debug, Error)]
+#[error("the daemon stopped so its supervisor starts a fresh one")]
+pub struct RestartRequested;
+
+/// Whether something will start this daemon again if it exits non-zero:
+/// launchd running it as the `prx daemon install` job, or a supervisor that
+/// set `PRX_SUPERVISED` (PRX.app, the systemd unit) and is still its parent.
+/// A daemon orphaned by an app that has exited (reparented to pid 1) is not
+/// supervised: it keeps running, and the next PRX.app replaces it.
+pub fn supervised_for_restart() -> bool {
+    let launchd =
+        std::env::var("XPC_SERVICE_NAME").is_ok_and(|name| name == crate::autostart::LAUNCHD_LABEL);
+    let flagged = std::env::var_os(SUPERVISED_ENV).is_some_and(|v| !v.is_empty());
+    launchd || (flagged && parent_alive())
+}
+
+/// Set by a supervisor that restarts the daemon when it exits non-zero.
+pub const SUPERVISED_ENV: &str = "PRX_SUPERVISED";
+
+#[cfg(unix)]
+fn parent_alive() -> bool {
+    // SAFETY: getppid(2) cannot fail.
+    let parent = unsafe { libc::getppid() };
+    parent != 1
+}
+
+#[cfg(not(unix))]
+fn parent_alive() -> bool {
+    false
 }
 
 /// Resolve the shutdown future: SIGTERM and SIGINT (unix).
@@ -1105,39 +1449,87 @@ pub async fn spawn_core(
 /// `prx daemon start` (detached): re-exec this binary in the background.
 /// The child survives the parent via `process_group(0)` and nulled stdio.
 pub fn start_detached() -> Result<()> {
-    if let Some(pid) = read_pid(&paths::daemon_pid_file()) {
-        if process_alive(pid) {
-            // A16: starting twice is idempotent.
-            println!("daemon already running (pid {pid})");
-            return Ok(());
-        }
+    if let Some(pid) = pid_file_owner(&paths::daemon_pid_file()) {
+        // A16: starting twice is idempotent.
+        println!("daemon already running (pid {pid})");
+        return Ok(());
     }
+    // A token file still here was left by a daemon that was killed. The new
+    // daemon writes a fresh token last, once its IPC API is bound, so a
+    // token that differs from this one is the readiness signal below.
+    let stale_token = std::fs::read(paths::daemon_token_file()).ok();
+
+    // The child's stderr goes to the file PRX.app uses for the daemons it
+    // spawns, so an error that ends the start (bad config, corrupt state) is
+    // kept and can be reported here rather than lost with a nulled stderr.
+    let stderr_log = paths::logs_dir().join("daemon-stderr.log");
+    let _ = std::fs::create_dir_all(paths::logs_dir());
+    let stderr_start = std::fs::metadata(&stderr_log).map_or(0, |m| m.len());
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null());
+
     let exe = std::env::current_exe().context("cannot locate the prx binary")?;
     let mut cmd = std::process::Command::new(exe);
     cmd.args(["daemon", "start", "--foreground"])
         .env("PRX_DAEMON_CHILD", "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let child = cmd.spawn().context("failed to spawn the daemon process")?;
+    let mut child = cmd.spawn().context("failed to spawn the daemon process")?;
     let pid = child.id();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Started means ready: the pid file is claimed and the IPC API is
+    // published, so a command run right after this one reaches the daemon
+    // instead of falling back to in-process execution beside it (A4).
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
     while Instant::now() < deadline {
-        if read_pid(&paths::daemon_pid_file()) == Some(pid) {
+        let published = std::fs::read(paths::daemon_token_file())
+            .ok()
+            .filter(|token| !token.is_empty() && Some(token) != stale_token.as_ref());
+        if read_pid(&paths::daemon_pid_file()) == Some(pid) && published.is_some() {
             println!("daemon started (pid {pid})");
             return Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            match startup_error(&stderr_log, stderr_start) {
+                Some(reason) => bail!("daemon did not start: {reason}"),
+                None => bail!(
+                    "daemon (pid {pid}) exited during startup ({status}) — \
+                     check `prx daemon logs`"
+                ),
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     bail!(
-        "daemon (pid {pid}) did not claim its pid file within 5s — \
-         check `prx daemon logs`"
+        "daemon (pid {pid}) did not become ready within {}s — \
+         check `prx daemon logs`",
+        STARTUP_TIMEOUT.as_secs()
     );
+}
+
+/// How long `prx daemon start` waits for the detached daemon to be ready.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The error a daemon child printed before it exited: the last non-empty
+/// line it added to `stderr_log` past byte `from`, without the CLI's
+/// `error: ` prefix.
+fn startup_error(stderr_log: &Path, from: u64) -> Option<String> {
+    let bytes = std::fs::read(stderr_log).ok()?;
+    let added = bytes.get(usize::try_from(from).ok()?..)?;
+    String::from_utf8_lossy(added)
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(|line| line.strip_prefix("error: ").unwrap_or(line).to_string())
 }
 
 /// `prx daemon stop`: SIGTERM, wait for exit, SIGKILL only as last resort.
@@ -1152,6 +1544,15 @@ pub async fn run_stop() -> Result<()> {
         let _ = std::fs::remove_file(&pid_path);
         return Ok(());
     }
+    if pid_file_owner(&pid_path) != Some(pid) {
+        // The pid was reused (after a reboot, say): never signal that process.
+        println!("stale pid file (pid {pid} now belongs to another process); removed");
+        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
+    }
+    // Tell PRX.app this stop is deliberate, so it does not start a new
+    // daemon on its own; the next daemon start removes the marker.
+    let _ = std::fs::write(paths::daemon_stop_marker(), format!("{pid}\n"));
     send_signal(pid, libc::SIGTERM);
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
@@ -1177,8 +1578,11 @@ pub async fn run_stop() -> Result<()> {
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) {
+    let Some(pid) = signalable_pid(pid) else {
+        return;
+    };
     // SAFETY: plain kill(2) with a constant signal number.
-    let _ = unsafe { libc::kill(pid as i32, signal) };
+    let _ = unsafe { libc::kill(pid, signal) };
 }
 
 #[cfg(not(unix))]
@@ -1186,11 +1590,12 @@ fn send_signal(_pid: u32, _signal: i32) {}
 
 /// `prx daemon status`: pid file + process liveness (A16).
 pub fn run_status_cmd() {
-    let Some(pid) = read_pid(&paths::daemon_pid_file()) else {
+    let pid_path = paths::daemon_pid_file();
+    let Some(pid) = read_pid(&pid_path) else {
         println!("daemon not running");
         return;
     };
-    if !process_alive(pid) {
+    if pid_file_owner(&pid_path) != Some(pid) {
         println!("daemon not running (stale pid file: pid {pid})");
         return;
     }
@@ -1261,7 +1666,7 @@ async fn scheduler_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>
             _ = shared.poll_requested.notified() => {
                 // D1: review-now (menu "Refresh now") implies a reload check,
                 // run first so the poll already covers newly added repos.
-                shared.check_config_file().await;
+                let _ = shared.check_config_file().await;
                 poll_repos(&shared, PollMode::All).await;
             }
             // Added repos have no next_poll yet, so a Due pass polls them.
@@ -1281,7 +1686,9 @@ async fn config_reload_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<b
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
-            _ = ticker.tick() => shared.check_config_file().await,
+            _ = ticker.tick() => {
+                let _ = shared.check_config_file().await;
+            }
         }
     }
 }
@@ -1316,7 +1723,7 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
             continue;
         }
         let deps = EffectsDeps::for_repo(&shared.deps.notifier, &live.tiers, repo);
-        let synced = {
+        let outcome = {
             let mut state = shared.lock_state().await;
             match status::sync_repo(&shared.deps.gh, repo, &mut state, now, &deps).await {
                 Ok(()) => {
@@ -1340,19 +1747,21 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
                                     due: now,
                                     force: false,
                                     overrides: ReviewOverrides::default(),
+                                    confirmed: false,
                                 });
                             }
                         }
                     }
                     shared.publish(&state);
-                    true
+                    Ok(())
                 }
                 Err(e) => {
                     tracing::warn!("poll of {} failed: {e}", repo.name);
-                    false
+                    Err(e.to_string())
                 }
             }
         };
+        let synced = outcome.is_ok();
         let mut rt = shared.runtime.lock().await;
         if shared.live().repo(&repo.name).is_none() {
             // Removed by a reload while this pass ran: leave it unscheduled.
@@ -1360,6 +1769,12 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
         }
         if synced {
             rt.last_poll.insert(repo.name.clone(), now);
+        }
+        let record = rt.poll_health.entry(repo.name.clone()).or_default();
+        record.poll_interval_minutes = repo.poll_interval_minutes;
+        match &outcome {
+            Ok(()) => record.record_success(now),
+            Err(error) => record.record_failure(now, error),
         }
         // Failed polls retry after the plain interval (no jitter) rather than
         // hammering gh every tick.
@@ -1384,6 +1799,16 @@ async fn poll_repos(shared: &Arc<Shared>, mode: PollMode) {
     if !due_jobs.is_empty() {
         shared.enqueue(due_jobs).await;
     }
+    shared.check_restart().await;
+}
+
+/// Whether a reload that turns `old` into `new` (same repo) should poll the
+/// repo now instead of keeping its planned `next_poll`: its interval
+/// changed, or it was switched from `off` (not polled, so its plan is
+/// stale) to an active mode.
+fn reschedules_now(old: &EffectiveRepo, new: &EffectiveRepo) -> bool {
+    old.poll_interval_minutes != new.poll_interval_minutes
+        || (old.review_mode == ReviewMode::Off && new.review_mode != ReviewMode::Off)
 }
 
 /// When a repo's due-scan may enqueue reviews (D11).
@@ -1515,7 +1940,9 @@ async fn drain_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
         if let Some(job) = job {
             match shared.semaphore.clone().acquire_owned().await {
                 Ok(permit) => {
-                    tokio::spawn(execute_job(shared.clone(), job, permit));
+                    let key = job.key.clone();
+                    let run = execute_job(shared.clone(), job, permit);
+                    tokio::spawn(supervise_job(shared.clone(), key, run));
                 }
                 Err(_) => break, // semaphore closed: shutting down
             }
@@ -1528,12 +1955,28 @@ async fn drain_loop(shared: Arc<Shared>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
+/// Run a job as its own task and clean up if it does not reach
+/// [`finish_job`]. A panic inside the job unwinds only that task: the
+/// concurrency slot comes back with the dropped permit, but the key would
+/// stay in the in-flight set until restart, so the PR could never be queued
+/// again and a graceful stop would wait for it.
+async fn supervise_job<F>(shared: Arc<Shared>, key: String, run: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(e) = tokio::spawn(run).await {
+        tracing::error!("{key}: review job ended abnormally: {e}");
+        shared.runtime.lock().await.in_flight.remove(&key);
+        shared.work_available.notify_one();
+    }
+}
+
 /// Run one queued review. The state lock is held for the whole pipeline run:
 /// all state writes flow through this single owner (A4), which is what makes
 /// a restart unable to duplicate a review. A failed review never stops the
 /// queue — the pipeline already ran the on_failure effects; we log and move
 /// on (DEV-PLAN §9).
-async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedSemaphorePermit) {
+async fn execute_job(shared: Arc<Shared>, job: Job, permit: tokio::sync::OwnedSemaphorePermit) {
     // The config in force when the job starts governs the whole run.
     let live = shared.live();
     let Some(repo) = live.repo(&job.repo).cloned() else {
@@ -1541,13 +1984,13 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
             "{}: repo no longer configured; dropping queued review",
             job.key
         );
-        finish_job(&shared, &job).await;
+        finish_job(&shared, &job, permit).await;
         return;
     };
     // D3: the mode may have turned `off` between dequeue and here.
     if repo.review_mode == ReviewMode::Off {
         tracing::info!("{}: review mode is off; dropping queued review", job.key);
-        finish_job(&shared, &job).await;
+        finish_job(&shared, &job, permit).await;
         return;
     }
 
@@ -1565,7 +2008,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
         };
         if !due {
             tracing::debug!("{}: no longer due; dropping queued review", job.key);
-            finish_job(&shared, &job).await;
+            finish_job(&shared, &job, permit).await;
             return;
         }
     }
@@ -1600,6 +2043,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
         store: &shared.deps.store,
         dry_run: false,
         fresh_session,
+        confirmed: job.confirmed,
     };
     if let Some(reason) = unusable {
         let outcome = {
@@ -1612,7 +2056,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
             Ok(outcome) => tracing::warn!("{}: {:?}", job.key, outcome),
             Err(e) => tracing::warn!("{}: review failed: {e:#}", job.key),
         }
-        finish_job(&shared, &job).await;
+        finish_job(&shared, &job, permit).await;
         return;
     }
     // The review proper — through its state transition, history, and
@@ -1662,7 +2106,7 @@ async fn execute_job(shared: Arc<Shared>, job: Job, _permit: tokio::sync::OwnedS
         Ok(other) => tracing::info!("{}: {:?}", job.key, other),
         Err(e) => tracing::warn!("{}: review failed: {e:#}", job.key),
     }
-    finish_job(&shared, &job).await;
+    finish_job(&shared, &job, permit).await;
 }
 
 /// Verdict-triggered auto-open (design D9; spec prx/browser-open): after a
@@ -1719,6 +2163,7 @@ async fn run_brief(
         store: &shared.deps.store,
         dry_run: false,
         fresh_session: true,
+        confirmed: false,
     };
     tracing::info!("{}: writing brief", request.key);
     let run = pipeline.generate_brief(request).await;
@@ -1741,11 +2186,17 @@ async fn run_brief(
     }
 }
 
-async fn finish_job(shared: &Arc<Shared>, job: &Job) {
+/// End a job: leave the in-flight set, free the concurrency slot, and only
+/// then wake the drainer. The order matters: the drainer starts the next job
+/// only when it sees a free slot, and goes back to sleep otherwise — woken
+/// before the slot is free, it would leave queued jobs waiting for some
+/// later, unrelated wake-up.
+async fn finish_job(shared: &Arc<Shared>, job: &Job, permit: tokio::sync::OwnedSemaphorePermit) {
     {
         let mut rt = shared.runtime.lock().await;
         rt.in_flight.remove(&job.key);
     }
+    drop(permit);
     shared.work_available.notify_one();
 }
 
@@ -2055,6 +2506,50 @@ mod tests {
         drop(guard);
     }
 
+    /// Backdate a pid file, as if it was written before its pid was reused.
+    fn backdate(path: &Path, by: Duration) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - by)
+            .unwrap();
+    }
+
+    #[test]
+    fn process_start_time_reads_this_process() {
+        let started = process_start_time(std::process::id()).expect("start time");
+        let now = std::time::SystemTime::now();
+        assert!(
+            started <= now + PID_FILE_START_SLACK,
+            "{started:?} > {now:?}"
+        );
+        assert!(now.duration_since(started).unwrap() < Duration::from_secs(24 * 3600));
+        assert_eq!(process_start_time(dead_pid()), None);
+    }
+
+    /// After a reboot the pid in a leftover file can belong to an unrelated
+    /// process that started later. That file names no daemon: it must not
+    /// block a start (or be signalled by `daemon stop`), and is reclaimed.
+    #[test]
+    fn pid_file_whose_pid_was_reused_is_reclaimed() {
+        let d = dir("reused");
+        let path = d.join("daemon.pid");
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = sleeper.id();
+        std::fs::write(&path, format!("{pid}\n")).unwrap();
+        assert_eq!(pid_file_owner(&path), Some(pid), "a fresh file names it");
+
+        backdate(&path, Duration::from_secs(600));
+        assert_eq!(pid_file_owner(&path), None, "written before it started");
+        let guard = PidGuard::acquire(&d).unwrap();
+        assert_eq!(read_pid(&path), Some(std::process::id()));
+        drop(guard);
+
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+    }
+
     #[test]
     fn unreadable_pid_file_is_reclaimed() {
         let d = dir("junk");
@@ -2078,6 +2573,519 @@ mod tests {
         assert_eq!(read_pid(&d.join("daemon.pid")), Some(sleeper.id()));
         sleeper.kill().unwrap();
         sleeper.wait().unwrap();
+    }
+
+    /// A pid file can only ever name one process. Zero and values that go
+    /// negative as a `pid_t` mean "my process group" / "every process" to
+    /// kill(2); read as a pid they would look like a running daemon (so
+    /// none could start) and `daemon stop` would signal all of those.
+    #[test]
+    fn pid_file_values_that_name_no_single_process_read_as_no_pid() {
+        let d = dir("badpid");
+        let path = d.join("daemon.pid");
+        for junk in ["0", "4294967295", "2147483648", "-1", "", "12 34"] {
+            std::fs::write(&path, format!("{junk}\n")).unwrap();
+            assert_eq!(read_pid(&path), None, "{junk:?}");
+        }
+        std::fs::write(&path, "2147483647\n").unwrap();
+        assert_eq!(read_pid(&path), Some(i32::MAX as u32));
+        std::fs::write(&path, "  77 \n").unwrap();
+        assert_eq!(read_pid(&path), Some(77));
+
+        // The liveness probe itself refuses them too, whatever the caller.
+        assert!(process_alive(std::process::id()));
+        assert!(!process_alive(0));
+        assert!(!process_alive(u32::MAX));
+        assert!(!process_alive(i32::MAX as u32 + 1));
+    }
+
+    #[test]
+    fn pid_file_naming_no_single_process_is_reclaimed() {
+        for (tag, junk) in [("zero", "0"), ("minus-one", "4294967295")] {
+            let d = dir(tag);
+            std::fs::write(d.join("daemon.pid"), format!("{junk}\n")).unwrap();
+            let guard = PidGuard::acquire(&d).unwrap();
+            assert_eq!(read_pid(&d.join("daemon.pid")), Some(std::process::id()));
+            drop(guard);
+            assert!(!d.join("daemon.pid").exists());
+        }
+    }
+
+    /// `prx daemon start` reports why its daemon child died: the last line
+    /// the child printed in this start, not what earlier starts left in the
+    /// shared stderr log.
+    #[test]
+    fn startup_error_is_the_last_line_this_start_printed() {
+        let d = dir("stderr");
+        let log = d.join("daemon-stderr.log");
+        let earlier = "error: an older failure\n";
+        std::fs::write(&log, earlier).unwrap();
+        let from = earlier.len() as u64;
+        assert_eq!(startup_error(&log, from), None, "nothing printed yet");
+
+        std::fs::write(
+            &log,
+            format!("{earlier}warning: something minor\nerror: failed to load PR state\n\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            startup_error(&log, from).as_deref(),
+            Some("failed to load PR state")
+        );
+        assert_eq!(
+            startup_error(&log, 0).as_deref(),
+            Some("failed to load PR state")
+        );
+        // A log that shrank (rotated away) or is gone has nothing to report.
+        assert_eq!(startup_error(&log, 10_000), None);
+        assert_eq!(startup_error(&d.join("missing.log"), 0), None);
+    }
+
+    // ---------------------------------------- queue (D6)
+
+    /// A `Shared` over a scratch data dir watching `org/one`, with nothing
+    /// tracked and no usable gh or agent (the queue tests need neither).
+    fn queue_shared(tag: &str, max_concurrent: u32) -> Arc<Shared> {
+        let d = dir(tag);
+        let config = Config::parse(
+            &format!(
+                "defaults:\n  max_concurrent_reviews: {max_concurrent}\nrepos:\n  - name: org/one\n"
+            ),
+            &d.join("config.yml"),
+        )
+        .unwrap();
+        let deps = Deps {
+            gh: GhCli::with_binary("/nonexistent/gh"),
+            adapter: EngineAdapter::default(),
+            notifier: MenubarDeferringNotifier::wrapping(CommandNotifier),
+            config_path: None,
+            store: StateStore::new(d.join("state.json")),
+            history_path: d.join("history.jsonl"),
+            data_dir: d,
+            opener: Arc::new(SystemOpener),
+        };
+        Arc::new(Shared::new(deps, config, "token".into(), SchedulerOptions::default()).unwrap())
+    }
+
+    fn job(number: u64, due: DateTime<Utc>) -> Job {
+        Job {
+            key: format!("org/one#{number}"),
+            repo: "org/one".into(),
+            due,
+            force: false,
+            overrides: ReviewOverrides::default(),
+            confirmed: false,
+        }
+    }
+
+    /// Enqueue dedups by PR key: a second plain request for a queued PR
+    /// adds nothing, a forced one upgrades the queued job in place, and a
+    /// repo this daemon does not watch never enters the queue.
+    #[tokio::test]
+    async fn enqueue_dedups_by_key_and_drops_unwatched_repos() {
+        let shared = queue_shared("enqueue", 1);
+        let now = Utc::now();
+        let later = now + chrono::Duration::seconds(60);
+
+        assert_eq!(shared.enqueue(vec![job(1, now)]).await, ["org/one#1"]);
+        assert!(shared.enqueue(vec![job(1, later)]).await.is_empty());
+        assert_eq!(shared.queue_stats().await, (1, 0));
+
+        let forced = Job {
+            force: true,
+            ..job(1, later)
+        };
+        assert_eq!(shared.enqueue(vec![forced.clone()]).await, ["org/one#1"]);
+        assert!(shared.enqueue(vec![forced]).await.is_empty());
+        assert_eq!(shared.queue_stats().await, (1, 0));
+
+        let unwatched = Job {
+            key: "org/other#1".into(),
+            repo: "org/other".into(),
+            ..job(1, now)
+        };
+        assert!(shared.enqueue(vec![unwatched]).await.is_empty());
+        assert_eq!(shared.queued_keys().await, ["org/one#1"]);
+    }
+
+    /// The queue reports oldest-due first, whatever the insertion order.
+    #[tokio::test]
+    async fn queued_keys_are_ordered_oldest_due_first() {
+        let shared = queue_shared("order", 1);
+        let now = Utc::now();
+        let at = |secs| now + chrono::Duration::seconds(secs);
+        shared
+            .enqueue(vec![job(3, at(30)), job(1, at(10)), job(2, at(20))])
+            .await;
+        assert_eq!(
+            shared.queued_keys().await,
+            ["org/one#1", "org/one#2", "org/one#3"]
+        );
+    }
+
+    /// The concurrency cap is the largest `max_concurrent_reviews` in the
+    /// config at start, and never below one.
+    #[tokio::test]
+    async fn concurrency_cap_is_sized_from_the_startup_config() {
+        assert_eq!(queue_shared("cap1", 1).max_concurrent, 1);
+        let three = queue_shared("cap3", 3);
+        assert_eq!(three.max_concurrent, 3);
+        assert_eq!(three.semaphore.available_permits(), 3);
+    }
+
+    fn parsed(yaml: &str) -> Config {
+        Config::parse(yaml, Path::new("config.yml")).unwrap()
+    }
+
+    /// The revision starts at 1, goes up once per applied config that
+    /// differs from the running one, and stays put for an identical one.
+    #[tokio::test]
+    async fn config_revision_bumps_only_on_a_different_config() {
+        let shared = queue_shared("revision", 1);
+        let start = shared.config_revision();
+        assert_eq!(start.config_revision, Some(1));
+        assert!(start.restart_required.is_empty());
+
+        let same = shared.live().config.clone();
+        let summary = shared.apply_config(same).await.unwrap();
+        assert!(!summary.config_changed);
+        assert_eq!(shared.config_revision().config_revision, Some(1));
+
+        let summary = shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 7\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert!(summary.config_changed);
+        let next = shared.config_revision();
+        assert_eq!(next.config_revision, Some(2));
+        assert!(next.config_loaded_at >= start.config_loaded_at);
+
+        // A rejected config changes nothing.
+        assert!(shared
+            .apply_config(parsed(
+                "defaults:\n  poll_interval_minutes: 0\nrepos:\n  - name: org/one\n"
+            ))
+            .await
+            .is_err());
+        assert_eq!(shared.config_revision().config_revision, Some(2));
+    }
+
+    /// A new `max_concurrent_reviews` cannot resize the running semaphore:
+    /// it is reported as waiting for a restart until the config matches the
+    /// running cap again.
+    #[tokio::test]
+    async fn concurrency_change_is_reported_as_restart_required() {
+        let shared = queue_shared("restart", 1);
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 3\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            shared.config_revision().restart_required,
+            ["max_concurrent_reviews"]
+        );
+        assert_eq!(shared.max_concurrent, 1);
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert!(shared.config_revision().restart_required.is_empty());
+    }
+
+    /// A reload polls a repo now when its interval changed or it came back
+    /// from `off`; other edits keep its planned poll.
+    #[tokio::test]
+    async fn reload_reschedules_changed_interval_and_reactivated_repos() {
+        let shared = queue_shared("reschedule", 1);
+        let later = Utc::now() + chrono::Duration::minutes(30);
+        async fn plan(shared: &Shared, at: DateTime<Utc>) {
+            shared
+                .runtime
+                .lock()
+                .await
+                .next_poll
+                .insert("org/one".into(), at);
+        }
+        async fn planned(shared: &Shared) -> Option<DateTime<Utc>> {
+            shared
+                .runtime
+                .lock()
+                .await
+                .next_poll
+                .get("org/one")
+                .copied()
+        }
+
+        // A notification edit keeps the plan.
+        plan(&shared, later).await;
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  notifications:\n    enabled: false\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, Some(later));
+
+        // A new interval drops it: the next pass polls now.
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 2\nrepos:\n  - name: org/one\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, None);
+
+        // Off keeps the stale plan (an off repo is not polled) …
+        plan(&shared, later).await;
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 2\nrepos:\n  - name: org/one\n    review_mode: \"off\"\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, Some(later));
+        // … and switching back on drops it.
+        shared
+            .apply_config(parsed(
+                "defaults:\n  max_concurrent_reviews: 1\n  poll_interval_minutes: 2\nrepos:\n  - name: org/one\n    review_mode: monitor\n",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(planned(&shared).await, None);
+    }
+
+    /// `check_config_file` reports what it did: applied for new valid
+    /// content, unchanged for content already running, rejected (again)
+    /// for a broken file, and no file when the daemon watches none.
+    #[tokio::test]
+    async fn check_config_file_reports_its_outcome() {
+        assert_eq!(
+            queue_shared("nofile", 1).check_config_file().await,
+            ConfigCheck::NoFile
+        );
+        let d = dir("check");
+        let path = d.join("config.yml");
+        let base = "defaults:\n  max_concurrent_reviews: 1\nrepos:\n  - name: org/one\n";
+        std::fs::write(&path, base).unwrap();
+        let deps = Deps {
+            gh: GhCli::with_binary("/nonexistent/gh"),
+            adapter: EngineAdapter::default(),
+            notifier: MenubarDeferringNotifier::wrapping(CommandNotifier),
+            config_path: Some(path.clone()),
+            store: StateStore::new(d.join("state.json")),
+            history_path: d.join("history.jsonl"),
+            data_dir: d,
+            opener: Arc::new(SystemOpener),
+        };
+        let shared = Arc::new(
+            Shared::new(deps, parsed(base), "t".into(), SchedulerOptions::default()).unwrap(),
+        );
+        // First look: same content as the startup config.
+        assert_eq!(shared.check_config_file().await, ConfigCheck::Unchanged);
+
+        std::fs::write(&path, format!("{base}  - name: org/two\n")).unwrap();
+        match shared.check_config_file().await {
+            ConfigCheck::Applied(summary) => assert_eq!(summary.added, ["org/two"]),
+            other => panic!("expected applied, got {other:?}"),
+        }
+        assert_eq!(shared.config_revision().config_revision, Some(2));
+        assert_eq!(shared.check_config_file().await, ConfigCheck::Unchanged);
+
+        std::fs::write(&path, "defaults: [broken\n").unwrap();
+        assert!(matches!(
+            shared.check_config_file().await,
+            ConfigCheck::Rejected(_)
+        ));
+        // Still broken on the next look, without re-parsing.
+        assert!(matches!(
+            shared.check_config_file().await,
+            ConfigCheck::Rejected(_)
+        ));
+        assert_eq!(shared.config_revision().config_revision, Some(2));
+    }
+
+    /// A finished job gives its concurrency slot back before the drainer is
+    /// woken, and leaves the in-flight set.
+    #[tokio::test]
+    async fn finishing_a_job_frees_its_slot_before_waking_the_drainer() {
+        let shared = queue_shared("finish", 1);
+        let job = job(1, Utc::now());
+        let permit = shared.semaphore.clone().try_acquire_owned().unwrap();
+        shared
+            .runtime
+            .lock()
+            .await
+            .in_flight
+            .insert(job.key.clone());
+        assert_eq!(shared.semaphore.available_permits(), 0);
+
+        finish_job(&shared, &job, permit).await;
+
+        assert_eq!(shared.semaphore.available_permits(), 1);
+        assert!(!shared.is_in_flight(&job.key).await);
+        tokio::time::timeout(Duration::from_secs(1), shared.work_available.notified())
+            .await
+            .expect("the drainer must be woken");
+    }
+
+    /// A job that panics still leaves the in-flight set and frees its slot,
+    /// and the drainer is woken: the PR can be queued again without a
+    /// daemon restart.
+    #[tokio::test]
+    async fn a_panicking_job_leaves_the_in_flight_set() {
+        let shared = queue_shared("panic", 1);
+        let job = job(1, Utc::now());
+        let permit = shared.semaphore.clone().try_acquire_owned().unwrap();
+        shared
+            .runtime
+            .lock()
+            .await
+            .in_flight
+            .insert(job.key.clone());
+        assert!(shared.enqueue(vec![job.clone()]).await.is_empty());
+
+        let run = async move {
+            let _permit = permit;
+            panic!("review job panicked (expected by this test)");
+        };
+        supervise_job(shared.clone(), job.key.clone(), run).await;
+
+        assert_eq!(shared.semaphore.available_permits(), 1);
+        assert!(!shared.is_in_flight(&job.key).await);
+        tokio::time::timeout(Duration::from_secs(1), shared.work_available.notified())
+            .await
+            .expect("the drainer must be woken");
+        assert_eq!(shared.enqueue(vec![job.clone()]).await, [job.key]);
+    }
+
+    /// With a cap of one, the drainer works through a long queue without
+    /// ever stalling: each finished job hands its slot to the next. The
+    /// jobs are for untracked PRs, so each ends at once ("no longer due").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn drainer_empties_a_long_queue_through_a_single_slot() {
+        let shared = queue_shared("drain", 1);
+        let now = Utc::now();
+        let jobs: Vec<Job> = (1..=400).map(|n| job(n, now)).collect();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let drainer = tokio::spawn(drain_loop(shared.clone(), shutdown_rx));
+        assert_eq!(shared.enqueue(jobs).await.len(), 400);
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while shared.queue_stats().await != (0, 0) {
+            assert!(
+                Instant::now() < deadline,
+                "the queue stalled at {:?} (queued, in flight)",
+                shared.queue_stats().await
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(shared.semaphore.available_permits(), 1);
+        shutdown_tx.send(true).unwrap();
+        drainer.await.unwrap();
+    }
+
+    // ---------------------------------------- poll cadence (A7, D11)
+
+    /// The one watched repo of a config with these `defaults:` lines.
+    fn repo_with(defaults: &str) -> EffectiveRepo {
+        let config = Config::parse(
+            &format!("defaults:\n{defaults}repos:\n  - name: org/one\n"),
+            Path::new("config.yml"),
+        )
+        .unwrap();
+        LiveConfig::from_config(config).unwrap().repos.remove(0)
+    }
+
+    /// A successful poll schedules the next one a configured interval
+    /// away, give or take 10 %; a failed poll retries after the plain
+    /// interval; and no interval is ever shorter than a second.
+    #[test]
+    fn next_poll_is_one_interval_away_with_at_most_ten_percent_jitter() {
+        let repo = repo_with("  poll_interval_minutes: 10\n");
+        let now = Utc::now();
+        let options = SchedulerOptions::default();
+        let gaps: Vec<i64> = (0..500)
+            .map(|_| (next_poll_after(&repo, now, options, true) - now).num_milliseconds())
+            .collect();
+        let (min, max) = (*gaps.iter().min().unwrap(), *gaps.iter().max().unwrap());
+        assert!(min >= 540_000 && max <= 660_000, "{min}..{max} ms");
+        assert!(
+            max - min > 10_000,
+            "the interval must be jittered: {min}..{max} ms"
+        );
+
+        // After a failed poll, and with jitter off: exactly the interval.
+        let plain = chrono::Duration::minutes(10);
+        assert_eq!(next_poll_after(&repo, now, options, false) - now, plain);
+        let steady = SchedulerOptions {
+            jitter: false,
+            ..options
+        };
+        assert_eq!(next_poll_after(&repo, now, steady, true) - now, plain);
+
+        let scaled_to_nothing = SchedulerOptions {
+            interval_scale: 0.000_001,
+            ..steady
+        };
+        assert_eq!(
+            next_poll_after(&repo, now, scaled_to_nothing, true) - now,
+            chrono::Duration::seconds(1)
+        );
+    }
+
+    /// D11: a repo without a schedule enqueues on every poll. A scheduled
+    /// repo never enqueues on sight: it is given its next tick and waits,
+    /// fires once the tick has come, and — its schedule removed — goes
+    /// back to the interval cadence with the tick forgotten.
+    #[test]
+    fn a_scheduled_repo_waits_for_its_tick_and_an_unscheduled_one_never_does() {
+        let mut ticks = BTreeMap::new();
+        let now = utc_at(2026, 6, 1, 12, 0);
+        let plain = repo_with("");
+        assert_eq!(
+            review_cadence(&mut ticks, &plain, now),
+            ReviewCadence::Interval
+        );
+        assert!(ticks.is_empty());
+
+        let hourly = repo_with("  schedule: \"0 * * * *\"\n");
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, now),
+            ReviewCadence::Waiting
+        );
+        let tick = ticks["org/one"];
+        // The top of the next local hour, whatever this machine's zone is.
+        assert!(
+            tick > now && tick <= now + chrono::Duration::hours(1),
+            "{tick}"
+        );
+        let just_before = tick - chrono::Duration::seconds(1);
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, just_before),
+            ReviewCadence::Waiting
+        );
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, tick),
+            ReviewCadence::Tick
+        );
+        // The caller consumes the tick; until then a later pass still fires.
+        let later = tick + chrono::Duration::minutes(5);
+        assert_eq!(
+            review_cadence(&mut ticks, &hourly, later),
+            ReviewCadence::Tick
+        );
+
+        assert_eq!(
+            review_cadence(&mut ticks, &plain, later),
+            ReviewCadence::Interval
+        );
+        assert!(ticks.is_empty(), "a removed schedule forgets its tick");
     }
 
     #[test]

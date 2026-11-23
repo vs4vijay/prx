@@ -4,32 +4,43 @@ The daemon serves a JSON API on `127.0.0.1:<ephemeral>` — this is the backend 
 client and the menu bar shell. Every request must carry `Authorization: Bearer <token>` with the
 token from `daemon.token`; anything else gets `401`. Discover the port from `daemon.port`.
 
+PRX.app also sends `X-Prx-Client: menubar/<version>` on every request. The daemon reads an
+authenticated request whose `X-Prx-Client` is `menubar` or `menubar/<anything>` as "a menu bar app is
+running" and leaves desktop banners to it for the next 90 s
+(see [Notifications](../guides/notifications.md)). The CLI does not send the header; any other
+value is ignored. A client that does not show banners itself must not send it.
+
 | Endpoint | Body / query | Response |
 |----------|--------------|----------|
-| `GET /status` | — | `{version, pid, uptime_seconds, in_flight, queue_depth, last_poll: {repo: ts}, last_state_poll, review_mode, paused_until?, config_error?, engines, menu, prs: [StatusEntry]}` — served from a read cache, stays responsive during reviews. `review_mode` is the global mode; `paused_until` is present only while a pause is in effect; `config_error` (`{message, at}`) is present while the daemon runs on a last-good config. `engines` lists the resolved engine names (sorted); `menu` is the effective `{sort, group_by}`. |
-| `POST /review` | `{key: target \| "all", force: bool, extra_prompt?: string, engine?: string, post?: bool}` | `{enqueued: [keys], note?}` — `key` is any [target form](cli.md) (`org/repo#42`, a PR URL, `repo#42`, `42`, `#42`), resolved against the watched repos; an untracked open PR is tracked on demand first. `force` (an explicit target) bypasses cooldowns but never skip/terminal legality; `--all` enqueues only currently-due PRs. `extra_prompt` / `engine` / `post` shape that run only, never persisted (`post: false` = no GitHub writes). A request with options replaces the options of the PR's queued job; a plain one leaves them. Nothing is enqueued for a repo in mode `off`. Errors: `400` unknown engine (lists the engines) or malformed target (lists the forms), `404` unwatched repo / no such PR, `409` merged or closed PR / ambiguous short target (lists the candidates), `502` gh failure. |
+| `GET /status` | — | `{version, pid, uptime_seconds, in_flight, queue_depth, last_poll: {repo: ts}, last_state_poll, review_mode, paused_until?, config_error?, engines, menu, prs: [StatusEntry]}` — served from a read cache, stays responsive during reviews. `review_mode` is the global mode; `paused_until` is present only while a pause is in effect; `config_error` (`{message, at}`) is present while the daemon runs on a last-good config. `engines` lists the resolved engine names (sorted); `menu` is the effective `{sort, group_by}`. `config_revision` (starts at 1, goes up each time a different config is applied, by any route) and `config_loaded_at` say which config runs; a client that sees the revision change re-reads what it derives from the config. `restart_required` (present when not empty) lists config keys whose new value waits for a daemon restart (`max_concurrent_reviews`). `poll_health` (present once a repo has been polled) maps each polled repo to `{consecutive_failures, last_error?, last_error_at?, failing_since?, last_success?, poll_interval_minutes}`; a repo is failing after 3 consecutive failed polls. `restart_recommended` is present (and `true`) when every polled repo is failing with a TLS, network, or timeout error, for at least 30 minutes, in a daemon that has run for at least 30 minutes; see [Troubleshooting](../troubleshooting.md#prx-shows-github-sync-failing). |
+| `POST /review` | `{key: target \| "all", force: bool, extra_prompt?: string, engine?: string, post?: bool, confirm?: bool}` | `{enqueued: [keys], note?}` — `key` is any [target form](cli.md) (`org/repo#42`, a PR URL, `repo#42`, `42`, `#42`), resolved against the watched repos; an untracked open PR is tracked on demand first. `force` (an explicit target) bypasses cooldowns but never skip/terminal legality; `confirm: true` (the human confirmed the [pre-flight](#review-pre-flight) warnings) lets a single-PR review run on a PR skipped as `draft` or `config`, which stays skipped afterwards, and past the diff-size cap; `--all` enqueues only currently-due PRs. `extra_prompt` / `engine` / `post` shape that run only, never persisted (`post: false` = no GitHub writes). A request with options replaces the options of the PR's queued job; a plain one leaves them. Nothing is enqueued for a repo in mode `off`. Errors: `400` unknown engine (lists the engines) or malformed target (lists the forms), `404` unwatched repo / no such PR, `409` merged or closed PR / ambiguous short target (lists the candidates), `502` gh failure. |
 | `POST /brief` | `{key: target}` | `202 {accepted: true, key}` — generate (or regenerate) the PR's [brief](../guides/briefs.md) in the background; `/status` shows `brief_pending` until it lands, or `brief_error` if it fails (the previous brief is kept). Never writes to GitHub. `key` takes the `/review` target forms. Errors: `404` unknown PR / unwatched repo, `409` a brief for that PR is already being written (only one engine run happens), `422` the repo's mode is `off` or `brief.enabled` is false. |
 | `POST /approve` | `{key}` | `{ok, changed, note?}` — the human-only approve path. |
 | `POST /block` | `{key}` | `{ok, changed, note?}` — post a request-changes review with the effective `block_message`. |
 | `POST /unblock` | `{key}` | `{ok, changed, note?}` — dismiss prx's latest request-changes review; the PR returns to pending. |
-| `POST /snooze` | `{key, hours? \| until_push?}` | `{ok, changed, note?}` — one of `hours` or `until_push` is required. |
+| `POST /snooze` | `{key, hours? \| until_push?}` | `{ok, changed, note?}` — one of `hours` or `until_push` is required; `hours` must be above 0 and at most 87600 (about 10 years), else `400`. |
 | `POST /unsnooze` | `{key}` | `{ok, changed, note?}` |
 | `POST /ignore` | `{key}` | `{ok, changed, note?}` |
 | `POST /unignore` | `{key}` | `{ok, changed, note?}` |
 | `POST /pause` | `{hours: number} \| {until: RFC 3339}` | `{ok, changed, note?, paused_until}` — exactly one field, ending in the future (else `400`); persisted in `state.json`. |
 | `POST /resume` | `{}` | `{ok, changed, paused_until: null, note?}` — lifts the pause (`changed: false` when none was in effect). |
+| `POST /review/preflight` | `{key: target}` | `{key, warnings: [{kind, message}], blocked?, size?}` — read-only: what a manual review of one PR needs confirmed first. See [Review pre-flight](#review-pre-flight). Errors as for `POST /review` (`all` is a `400`). |
 | `POST /review-now` | — | `{ok, changed, note}` — config reload check, then wakes the scheduler for an immediate poll + due-scan. |
-| `GET /config` | — | `{path, yaml, raw, effective: {defaults, orgs, repos}, config_error?, shipped_review_prompt, review_contract, shipped_templates}` — the file text, the running config, and per-org/per-repo merged values with each value's source. `shipped_review_prompt` is the built-in guidance; `review_contract` is the output contract always appended to it (with a sample manifest path). |
-| `PUT /config` | `{config}` (structured) **or** `{yaml}` (raw text) | `{ok, added, removed, discarded}` — validated in full, written atomically (`0600`), hot-applied. Invalid → `422 {error, field?}` and nothing is written. A structured write re-serializes the YAML (comments dropped); a raw write is saved verbatim. |
+| `GET /config` | — | `{path, yaml, raw, effective: {defaults, orgs, repos}, config_error?, config_revision, config_loaded_at, restart_required?, shipped_review_prompt, review_contract, shipped_templates}` — the file text, the running config, and per-org/per-repo merged values with each value's source. `shipped_review_prompt` is the built-in guidance; `review_contract` is the output contract always appended to it (with a sample manifest path). |
+| `PUT /config` | `{config}` (structured) **or** `{yaml}` (raw text) | `{ok, added, removed, discarded, config_revision, config_loaded_at, restart_required?}` — validated in full, written atomically (`0600`), and applied before the answer (the revision in the answer is the one now running). Invalid → `422 {error, field?}` and nothing is written. A structured write re-serializes the YAML (comments dropped); a raw write is saved verbatim. |
+| `POST /config/reload` | `{}` | `{outcome, error?, added, removed, config_revision, config_loaded_at, restart_required?}` — re-reads `config.yml` now instead of waiting for the watcher's next look. `outcome` is `applied` (new content is running), `unchanged` (the file is what already runs), or `rejected` (the file is broken; `error` says why and the last good config keeps running). `409` when the daemon runs without a config file. `prx config set` / `edit` and `prx repos add` / `remove` call it after writing the file, and PRX.app calls it when it sees the file change. |
 | `GET /discover/agents` | — | `{agents: [{name, label, command, args, model_args, models, builtin, path?, on_path}], configured, llm_apis: [{name, provider, model, api_key_env, key_present}]}` — the agent CLIs prx knows and where the daemon found each one, plus the configured `llm_api` engines and whether each key variable is set in the daemon's environment (never the value). |
 | `GET /discover/repos` | — | `{repos: [{name, private}]}` — non-archived repositories the gh account can see (most recently pushed first, up to 500). |
 | `POST /review-mode` | `{mode: "off" \| "monitor" \| "review comment"}` | `{ok, changed, persisted, note?}` — sets `defaults.review_mode`; `persisted: false` when the file is broken (applied in memory only). |
-| `GET /history` | `?repo=org/repo&limit=N&before=RFC3339` | `{entries: [HistoryEntry]}` — newest first; corrupt lines skipped. `before` pages back: only entries strictly older than that timestamp (invalid → `400`). |
+| `GET /history` | `?repo=org/repo&limit=N&before=RFC3339` | `{entries: [HistoryEntry]}` — newest first; corrupt lines skipped. Each entry carries an `event` tag (`new_pr`, `review_started`, `review_completed`, …); a client must skip a tag it does not know, as prx's own `HistoryEntry` does (it decodes as `unknown`). `before` pages back: only entries strictly older than that timestamp (invalid → `400`). |
 | `GET /usage` | `?bucket=day\|week\|month&window=7d\|30d\|90d\|all&group=none\|engine\|repo\|pr\|session&repo=org/repo` | `{bucket, window, group, series: [{group, points: [{bucket_start, totals}]}], groups: [{group, totals}], overall, runs_without_usage}` — [token usage](../guides/token-usage.md) aggregated from history (defaults `day` / `30d` / `none`; invalid values → `400` listing the allowed ones). Local-date buckets (`week` = ISO, Monday start); points cover every bucket in the window. `totals` = the four token fields, `cost_usd` (reported costs only), `runs` (runs **with** usage), `runs_with_cost`, and the `review` / `summary` split; groups appear only when they have usage, and `runs_without_usage` counts the rest. |
 | `GET /insights` | `?repo=org/repo&days=N` | The [`Insights`](../guides/insights.md) payload itself, self-describing (no envelope). |
 
 `StatusEntry` carries the key (`org/repo#n`), title, author, head branch, lifecycle state, state
-icon, skip reason, the repo's effective `engine`, one-line verdict summary, blocking/nit counts, last review time and its age, the
+icon, skip reason, `skip_detail` (why prx is not reviewing the PR, in a few words: `draft`,
+`author dependabot[bot] excluded`, `label wip excluded`, `branch release/1.2 matches release/*`,
+`snoozed until …`, `ignored`, or the size against the cap, `2,140 lines changed (limit 1,500)`;
+absent when nothing holds the PR back), the repo's effective `engine`, one-line verdict summary, blocking/nit counts, last review time and its age, the
 PR's GitHub creation time (`created_at`), prx's identity login when known (`identity_login`), the
 PR's [brief](../guides/briefs.md) (`brief`: `{text, created_at, updated_at, head_sha, source, engine, stale}`,
 when one exists and briefs are on), `brief_pending` while a brief is being written, `brief_error`
@@ -67,3 +78,37 @@ act as thin clients against this API when the daemon is up and fall back to in-p
 `window_days` is omitted when analyzing all time. Aggregates are deterministic (alphabetical
 authors/repos, count-then-text issue ordering), so the same history slice always serializes
 identically — usable as data by the menu bar client.
+
+## Review pre-flight
+
+A manual review can spend many engine tokens. Before sending `POST /review` for one PR, a client
+asks `POST /review/preflight {key}` and shows the answer to the human:
+
+```json
+{
+  "key": "acme/api#42",
+  "warnings": [
+    {"kind": "skipped", "message": "Skipped — author dependabot[bot] excluded"},
+    {"kind": "too_large", "message": "Large PR — 2,140 lines changed (limit 1,500)"}
+  ],
+  "size": {"files_changed": 3, "lines": 2140, "max_files": 50, "max_lines": 1500}
+}
+```
+
+- `warnings` — `skipped` for a PR skipped as `draft` or `config` (or an untracked PR the skip rules
+  would skip), `too_large` for a diff over `diff_max_files` or `diff_max_lines`. A client that does
+  not know a `kind` shows its `message` like any other.
+- `blocked` — set instead of warnings when no confirmation can make the review run: mode `off`,
+  snoozed, ignored, a review already running, merged, closed. Clients do not ask; they send the
+  review and show the daemon's own answer.
+- `size` — files and lines changed with the limits, from one `gh pr view`; absent when gh fails.
+
+The pre-flight changes no state and does not track an untracked PR. With warnings, the client asks
+and sends `POST /review` with `confirm: true` only when the human agrees.
+
+**Older clients.** A client that never sends `confirm` gets the behaviour from before the
+pre-flight existed: a skipped PR is not enqueued (the note names the skip and says a confirmed
+review can run it), and an oversized PR is enqueued but the pipeline holds it back at the cap with
+no engine run, recording `review_skipped` and the size in `skip_detail`. So an older client never
+starts a skipped or oversized review. **Older daemons** answer the route with a bare `404`; the
+CLI and PRX.app then send the review without `confirm`, which such a daemon handles as above.

@@ -146,18 +146,36 @@
     return which + " " + when + ".";
   }
 
+  // The most days each month ever has (February in a leap year).
+  const MONTH_DAYS = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+  // Whether some calendar date has one of the days of month in one of the
+  // months (parsed field sets): false for "31 2" or "31 4,6,9,11", which no
+  // year ever reaches.
+  function dateExists(days, months) {
+    return Array.from(months).some(function (month) {
+      return Array.from(days).some(function (day) { return day <= MONTH_DAYS[month - 1]; });
+    });
+  }
+
   // The next `count` local times the schedule fires after `from`. Empty when
   // the expression restricts both day fields (cron dialects disagree on
-  // whether those combine with AND or OR) or cannot be parsed.
+  // whether those combine with AND or OR), cannot be parsed, or names a
+  // date that never comes.
   function nextRuns(expr, from, count) {
     const parsed = parse(expr);
     if (!parsed.ok || (!parsed.any[2] && !parsed.any[4])) return [];
     const f = parsed.fields;
+    // Decided from the fields alone, so the walk below is never spent on a
+    // schedule with nothing to find (this runs on every keystroke).
+    if (!dateExists(f[2], f[3])) return [];
     const runs = [];
     const at = new Date(from.getTime());
     at.setSeconds(0, 0);
     at.setMinutes(at.getMinutes() + 1);
-    // One year of minutes, skipping whole days/hours that cannot match.
+    // Skips whole days and hours that cannot match. Every schedule that
+    // gets here fires within eight years (a leap day across a century), so
+    // the guard only stops a very large `count`.
     for (let guard = 0; guard < 600000 && runs.length < count; guard++) {
       if (!f[3].has(at.getMonth() + 1) || !f[2].has(at.getDate()) || !f[4].has(at.getDay())) {
         at.setDate(at.getDate() + 1);
@@ -174,7 +192,7 @@
     return runs;
   }
 
-  const api = { PRESETS: PRESETS, normalize: normalize, parse: parse, presetFor: presetFor, describe: describe, nextRuns: nextRuns };
+  const api = { PRESETS: PRESETS, normalize: normalize, parse: parse, presetFor: presetFor, describe: describe, dateExists: dateExists, nextRuns: nextRuns };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.prxCron = Object.freeze(api);
 })(this);

@@ -131,7 +131,22 @@ pub fn install_fake_gh(dir: &Path) -> PathBuf {
     let dest = dir.join("gh");
     fs::copy(&src, &dest).unwrap();
     fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+    install_quiet_notifiers(dir);
     dest
+}
+
+/// Put do-nothing `osascript` / `notify-send` stand-ins in `dir`, so a prx
+/// run with `dir` first on PATH never raises a real desktop banner on the
+/// machine running the tests. Existing files are kept, and a test that wants
+/// to observe banners installs its own recording fakes over these.
+pub fn install_quiet_notifiers(dir: &Path) {
+    for name in ["osascript", "notify-send"] {
+        let dest = dir.join(name);
+        if !dest.exists() {
+            fs::write(&dest, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&dest, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
 }
 
 /// Copy the fake agent fixture into `dir` (executable); the returned path is

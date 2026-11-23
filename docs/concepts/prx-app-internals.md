@@ -38,12 +38,26 @@ none answers does it start `Contents/Helpers/prx daemon start --foreground` itse
 the default config when no config file exists, through the same library call as `prx init`; an
 existing file, valid or not, is left alone), with your
 login shell's `PATH` (so `gh` and agent CLIs resolve like in Terminal), logging to the usual daemon
-logs plus `logs/daemon-stderr.log` for start-up errors. A daemon the app started is supervised:
-if it exits non-zero (a crash, `kill -9`) it is restarted after 1 s, 2 s, 4 s, … (capped at 60 s)
-while the menu reads *Daemon restarting · …*; after 5 failures within 10 minutes the app stops retrying and
-the menu shows *Daemon stopped* with *Start daemon* and *Show daemon log* (the newest daemon log in
-Console). A clean exit — `prx daemon stop` — is respected: no restart. The app never starts a
-second daemon while one runs (the daemon's pid-file guard settles any race).
+logs plus `logs/daemon-stderr.log` for start-up errors. The menu reads *Starting the daemon…*
+until the new daemon has claimed its pid file and published its IPC token; then the app polls at
+once. Every 5 s the app probes the daemon, the one it started or the one it attached to. A
+daemon that goes away (its own exits, or an attached one is gone on two probes in a row) is
+restarted after 1 s, 2 s, 4 s, … (capped at 60 s) while the menu reads *Daemon restarting · …*;
+after 5 failures within 10 minutes the app stops retrying and the menu shows *Daemon stopped*
+with *Start daemon* and *Show daemon log* (the newest daemon log in Console). `prx daemon stop`
+is respected: it leaves `daemon.stop-requested` in the data directory, the app shows *Daemon
+stopped* and does not restart, and the next daemon start removes the file. A daemon started
+from the CLI meanwhile is attached to. The app never starts a second daemon while one runs (the
+daemon's pid-file guard settles any race).
+
+The probe also reads `/status`. When the daemon reports `restart_recommended` (every repo's polls
+have failed with TLS, network, or timeout errors for 30 minutes), the app sends it SIGTERM and
+starts a fresh one, at most once every 30 minutes, then 1, 2, and 4 hours while the daemon never
+syncs in between. This recovers a daemon orphaned by an earlier app in a stale macOS session,
+which no longer reaches GitHub. A daemon the app started (with `PRX_SUPERVISED=1`, while the app
+is its parent) or that launchd runs as `com.prx.daemon` exits with code 75 on its own instead;
+an unsupervised daemon keeps running and only reports. The *Sync failing … — Restart daemon*
+header line restarts the daemon on demand.
 
 ## Single instance
 

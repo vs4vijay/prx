@@ -19,9 +19,7 @@ use crate::machine::{self, Effect, Event, HistoryEvent, MachineCtx};
 use crate::notify::{CommandNotifier, Notifier, NotifyEvent};
 use crate::paths;
 use crate::prompt;
-use crate::state::{
-    Brief, BriefSource, PrRecord, PrState, SkipReason, StateFile, StateStore, Verdict,
-};
+use crate::state::{Brief, BriefSource, PrRecord, PrState, StateFile, StateStore, Verdict};
 use crate::status;
 use crate::usage::TokenUsage;
 
@@ -263,6 +261,11 @@ pub struct Pipeline<'a, G: Gh, A: AgentAdapter, N: Notifier> {
     /// retained agent session nor replaces it, so the configured engine's
     /// continuity survives a one-off run with another engine.
     pub fresh_session: bool,
+    /// The human confirmed this manual review past the pre-flight warnings
+    /// (`confirm: true`, `prx review --yes`): it runs on a PR skipped as
+    /// `draft` or `config` (which stays skipped afterwards) and past the
+    /// diff-size cap. Automatic runs never set it.
+    pub confirmed: bool,
 }
 
 impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
@@ -285,6 +288,49 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
         key: &str,
         extra_prompt: Option<&str>,
     ) -> Result<ReviewOutcome> {
+        // A confirmed review of a rule-skipped PR runs the normal review
+        // flow from `pending`, then puts the skip back: the human reviewed
+        // it once; the skip rules still hold for automatic reviews.
+        let held = state
+            .prs
+            .get(key)
+            .filter(|rec| {
+                self.confirmed
+                    && rec.state == PrState::Skipped
+                    && crate::preflight::confirmable_skip(rec.skip_reason)
+            })
+            .cloned();
+        let Some(held) = held else {
+            return self.run_unheld(state, key, extra_prompt).await;
+        };
+        if let Some(rec) = state.prs.get_mut(key) {
+            rec.state = PrState::Pending;
+        }
+        let outcome = self.run_unheld(state, key, extra_prompt).await;
+        if let Some(rec) = state.prs.get_mut(key) {
+            if matches!(
+                rec.state,
+                PrState::Pending | PrState::ReviewedApproved | PrState::ReviewedChangesRequested
+            ) {
+                rec.state = PrState::Skipped;
+                rec.skip_reason = held.skip_reason;
+                rec.skip_detail = held.skip_detail.clone();
+                rec.previous_state = held.previous_state;
+                rec.review_anchor_at = held.review_anchor_at;
+            }
+        }
+        if !self.dry_run {
+            self.save(state, key)?;
+        }
+        outcome
+    }
+
+    async fn run_unheld(
+        &self,
+        state: &mut StateFile,
+        key: &str,
+        extra_prompt: Option<&str>,
+    ) -> Result<ReviewOutcome> {
         let now = Utc::now();
         let rec = state
             .prs
@@ -298,16 +344,13 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             PrState::Pending | PrState::ReviewedApproved | PrState::ReviewedChangesRequested => {}
             PrState::InReview => bail!("{key}: a review is already in progress"),
             PrState::Skipped => {
-                let reason = match rec.skip_reason {
-                    Some(SkipReason::Draft) => "draft",
-                    Some(SkipReason::Config) => "config rules",
-                    Some(SkipReason::Snoozed) => "snoozed",
-                    Some(SkipReason::Ignored) => "ignored",
-                    None => "unknown reason",
-                };
+                let reason = rec.skip_text().unwrap_or_else(|| "skipped".into());
+                if crate::preflight::confirmable_skip(rec.skip_reason) {
+                    bail!("{key} is skipped ({reason}); confirm to review it anyway");
+                }
                 bail!(
-                    "{key} is skipped ({reason}) — resolve the skip (mark ready, unignore, \
-                     snooze expiry) before reviewing"
+                    "{key} is skipped ({reason}) — resolve the skip (unsnooze, unignore) \
+                     before reviewing"
                 );
             }
             state => bail!("{key} is {state:?}; nothing to review"),
@@ -320,9 +363,15 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             .await
             .context("failed to fetch PR detail")?;
         let diff_lines = detail.additions.saturating_add(detail.deletions);
-        if detail.files_changed as u64 > self.repo.diff_max_files as u64
-            || diff_lines > self.repo.diff_max_lines as u64
-        {
+        let over_cap = crate::preflight::size_text(
+            detail.files_changed as u64,
+            diff_lines,
+            self.repo.diff_max_files as u64,
+            self.repo.diff_max_lines as u64,
+        );
+        // A confirmed manual review runs past the cap: the human saw the
+        // size in the pre-flight and chose to spend the tokens.
+        if let Some(size) = over_cap.filter(|_| !self.confirmed) {
             if self.dry_run {
                 return Ok(ReviewOutcome::SkippedDiffTooLarge {
                     files_changed: detail.files_changed,
@@ -334,11 +383,12 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             // later run re-checks (the diff may shrink).
             let mut rec = rec;
             rec.diff_too_large = true;
+            rec.skip_detail = Some(size.clone());
             rec.updated_at = now;
             let effects = vec![
                 Effect::Notify(NotifyEvent::Skipped),
                 Effect::HistoryAppend(HistoryEvent::ReviewSkipped {
-                    reason: "diff too large".to_string(),
+                    reason: format!("diff too large \u{2014} {size}"),
                 }),
             ];
             self.execute(
@@ -444,6 +494,9 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
         // The diff fit the caps this time: a stale too-large flag from a
         // previous skip must not survive the review.
         let mut rec = rec;
+        if rec.diff_too_large {
+            rec.skip_detail = None;
+        }
         rec.diff_too_large = false;
 
         // ReviewStart is applied in memory only: the state file is written
@@ -663,7 +716,14 @@ impl<G: Gh, A: AgentAdapter, N: Notifier> Pipeline<'_, G, A, N> {
             rec.review_session = retained_session;
         } else if let Some(session) = &run.session {
             rec.review_session = Some(session.clone());
+            // Review Chat (design C1): remember where the session lives. The
+            // agent runs in this process's working directory.
+            rec.review_session_info = Some(crate::state::ReviewSessionInfo {
+                engine: self.repo.engine.clone(),
+                workdir: std::env::current_dir().ok(),
+            });
         }
+        rec.last_manifest = Some(manifest_path.clone());
         // Design B3: the manifest's brief describes the reviewed SHA. An
         // earlier brief stays (marked stale by status when the head moved)
         // until this review's on-demand brief replaces it; failed/skipped
@@ -1333,6 +1393,60 @@ fn push_finding(out: &mut String, f: &ManifestFinding) {
 
 // ----------------------------------------------------------------- CLI: review
 
+/// What `prx review <pr>` does after its pre-flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Send the review; `confirm` when the human confirmed warnings.
+    Proceed { confirm: bool },
+    /// The human answered no.
+    Declined,
+}
+
+/// [`decide`] on the process's terminal: asks on stderr and reads stdin
+/// when both stdin and stdout are terminals.
+pub fn decide_on_terminal(preflight: &crate::preflight::Preflight) -> Result<Decision> {
+    use std::io::IsTerminal;
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    decide(
+        preflight,
+        tty,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stderr(),
+    )
+}
+
+/// The CLI's confirmation policy. No warnings (or a `blocked` answer, which
+/// the review request itself declines): proceed unconfirmed. Warnings on a
+/// terminal: list them and ask `Review anyway? [y/N]`. Warnings without a
+/// terminal: refuse, naming the warnings and `--yes`.
+pub fn decide(
+    preflight: &crate::preflight::Preflight,
+    tty: bool,
+    input: &mut dyn std::io::BufRead,
+    out: &mut dyn std::io::Write,
+) -> Result<Decision> {
+    if !preflight.needs_confirmation() {
+        return Ok(Decision::Proceed { confirm: false });
+    }
+    let mut listing = format!("{} needs your confirmation before review:\n", preflight.key);
+    for line in preflight.lines() {
+        listing.push_str(&format!("  - {line}\n"));
+    }
+    if !tty {
+        bail!(
+            "{listing}not reviewed: there is no terminal to ask on; rerun with --yes to review it anyway"
+        );
+    }
+    write!(out, "{listing}Review anyway? [y/N] ")?;
+    out.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Decision::Proceed { confirm: true },
+        _ => Decision::Declined,
+    })
+}
+
 /// `prx review [target | --all] [--dry-run]`. A22 semantics: an explicit
 /// target bypasses cooldowns; `--all` reviews only currently-due pending PRs.
 /// `overrides` (per-run options, design D1) apply to a single target only.
@@ -1343,6 +1457,7 @@ pub async fn run_review_cmd(
     all: bool,
     dry_run: bool,
     overrides: &ReviewOverrides,
+    yes: bool,
 ) -> Result<()> {
     let config_path = paths::config_path();
     let config = Config::load(&config_path).context("cannot review without configuration")?;
@@ -1351,7 +1466,7 @@ pub async fn run_review_cmd(
     match (target, all) {
         (Some(_), true) => bail!("specify either a PR target or --all, not both"),
         (None, false) => bail!("specify a PR target (org/repo#123) or --all"),
-        (Some(target), false) => run_review_one(&config, target, dry_run, overrides).await,
+        (Some(target), false) => run_review_one(&config, target, dry_run, overrides, yes).await,
         (None, true) => run_review_all(&config, dry_run).await,
     }
 }
@@ -1361,6 +1476,7 @@ async fn run_review_one(
     target: &str,
     dry_run: bool,
     overrides: &ReviewOverrides,
+    yes: bool,
 ) -> Result<()> {
     let (repo_name, number) = match parse_pr_ref(target)? {
         PrRef::Full(repo, number) => (repo, number),
@@ -1380,6 +1496,12 @@ async fn run_review_one(
         .ok_or_else(|| {
             anyhow!("repo '{repo_name}' is not configured; add it with `prx repos add {repo_name}`")
         })?;
+    // `off` is a stop switch: no polling and no reviews, forced or not. The
+    // daemon declines such a review; so does this daemon-less path.
+    if repo.review_mode == ReviewMode::Off {
+        println!("review mode is off for {repo_name}; {key} was not reviewed");
+        return Ok(());
+    }
 
     let gh = GhCli::new();
     let adapter: EngineAdapter = EngineAdapter::default();
@@ -1406,6 +1528,24 @@ async fn run_review_one(
         }
     }
 
+    // The pre-flight, as the daemon serves it: ask (or refuse without a
+    // terminal) before a skipped or oversized PR spends tokens.
+    let confirmed = match yes {
+        true => true,
+        false => {
+            let mut input = crate::preflight::PreflightInput::for_repo(&key, &repo);
+            input.record = state.prs.get(&key);
+            input.size = crate::preflight::measure(&gh, &repo_name, number).await;
+            match decide_on_terminal(&crate::preflight::check(&input))? {
+                Decision::Proceed { confirm } => confirm,
+                Decision::Declined => {
+                    println!("{key} was not reviewed");
+                    return Ok(());
+                }
+            }
+        }
+    };
+
     let (repo, fresh_session) = apply_overrides(config, &repo, overrides)?;
     let writer = gh.for_credential(repo.identity.credential.as_deref());
     let pipeline = Pipeline {
@@ -1418,6 +1558,7 @@ async fn run_review_one(
         store: &store,
         dry_run,
         fresh_session,
+        confirmed,
     };
     let outcome = pipeline
         .run_and_brief_with_extra_prompt(&mut state, &key, overrides.extra_prompt.as_deref())
@@ -1435,6 +1576,13 @@ async fn run_review_all(config: &Config, dry_run: bool) -> Result<()> {
         .context("configuration is invalid")?;
     if repos.is_empty() {
         bail!("no repositories configured; add one with `prx repos add <org/repo>`");
+    }
+    // `off` repos are neither polled nor reviewed (see `run_review_one`).
+    let (repos, off): (Vec<EffectiveRepo>, Vec<EffectiveRepo>) = repos
+        .into_iter()
+        .partition(|repo| repo.review_mode != ReviewMode::Off);
+    for repo in &off {
+        println!("review mode is off for {}; not reviewed", repo.name);
     }
 
     let gh = GhCli::new();
@@ -1489,6 +1637,7 @@ async fn run_review_all(config: &Config, dry_run: bool) -> Result<()> {
             store: &store,
             dry_run,
             fresh_session: false,
+            confirmed: false,
         };
         match pipeline.run_and_brief(&mut state, key).await {
             Ok(outcome) => {
@@ -1725,6 +1874,7 @@ pub async fn run_brief_cmd(target: &str, regenerate: bool) -> Result<()> {
             store: &store,
             dry_run: false,
             fresh_session: true,
+            confirmed: false,
         };
         eprintln!("writing a brief for {key}…");
         let request = BriefRequest::standalone(&rec, Utc::now());
@@ -1751,13 +1901,50 @@ pub async fn run_brief_cmd(target: &str, regenerate: bool) -> Result<()> {
 }
 
 fn print_brief(key: &str, brief: Option<&status::BriefStatus>) -> Result<()> {
+    use std::io::IsTerminal;
     match brief {
         Some(brief) => {
-            println!("{}", format_brief(brief));
+            let text = format_brief(brief);
+            // On a terminal, wrap at word boundaries so the brief reads as a
+            // paragraph; piped output stays exactly as stored.
+            if std::io::stdout().is_terminal() {
+                println!("{}", wrap_text(&text, BRIEF_WRAP_COLUMNS));
+            } else {
+                println!("{text}");
+            }
             Ok(())
         }
         None => bail!("{key} has no brief yet; write one with `prx brief {key} --regenerate`"),
     }
+}
+
+/// The column `prx brief` wraps at on a terminal.
+const BRIEF_WRAP_COLUMNS: usize = 80;
+
+/// `text` with every line wrapped at word boundaries to at most `width`
+/// characters (a longer word stays whole on its own line). Existing line
+/// breaks and blank lines are kept; runs of spaces inside a line collapse.
+pub fn wrap_text(text: &str, width: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut current = String::new();
+        let mut len = 0;
+        for word in line.split_whitespace() {
+            let word_len = word.chars().count();
+            if len > 0 && len + 1 + word_len > width {
+                out.push(std::mem::take(&mut current));
+                len = 0;
+            }
+            if len > 0 {
+                current.push(' ');
+                len += 1;
+            }
+            current.push_str(word);
+            len += word_len;
+        }
+        out.push(current);
+    }
+    out.join("\n")
 }
 
 /// `prx approve org/repo#n` — the ONLY path to a GitHub approval (A1/D2).
@@ -1954,30 +2141,45 @@ pub enum PrRef {
 pub const PR_REF_FORMS: &str =
     "org/repo#N, a GitHub PR URL (https://github.com/org/repo/pull/N), repo#N, N, or #N";
 
-/// Parse a PR reference (design D5): `org/repo#N`, a GitHub PR URL (any
-/// trailing path, query, or fragment), `repo#N`, `N`, or `#N`. Surrounding
-/// whitespace is ignored; `N` must be a positive integer.
+/// Parse a PR reference (design D5): `org/repo#N`, a GitHub PR URL (with or
+/// without `http(s)://` and `www.`; any trailing path such as `/files`, a
+/// query, a fragment, or a trailing slash), `repo#N`, `N`, or `#N`.
+/// Surrounding whitespace is ignored; `N` must be a positive integer. A URL
+/// on another host, or a github.com URL that is not a pull request (an
+/// issue, say), is rejected with the reason.
 pub fn parse_pr_ref(input: &str) -> Result<PrRef> {
     let text = input.trim();
     let invalid = || anyhow!("invalid PR target '{text}': expected {PR_REF_FORMS}");
+    let invalid_because =
+        |why: &str| anyhow!("invalid PR target '{text}': {why}; expected {PR_REF_FORMS}");
     let number = |n: &str| -> Result<u64> {
         if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
             return Err(invalid());
         }
         n.parse::<u64>().ok().filter(|n| *n > 0).ok_or_else(invalid)
     };
-    let url_path = ["https://", "http://", ""].iter().find_map(|scheme| {
-        let rest = text.strip_prefix(scheme)?;
-        rest.strip_prefix("github.com/")
-            .or_else(|| rest.strip_prefix("www.github.com/"))
-    });
+    // The scheme and host are case-insensitive; the path is kept as typed.
+    let after_scheme = ["https://", "http://"]
+        .iter()
+        .find_map(|scheme| strip_prefix_ci(text, scheme));
+    let rest = after_scheme.unwrap_or(text);
+    let url_path = ["github.com/", "www.github.com/"]
+        .iter()
+        .find_map(|host| strip_prefix_ci(rest, host));
+    if url_path.is_none() && after_scheme.is_some() {
+        return Err(invalid_because(
+            "only github.com pull request URLs are supported",
+        ));
+    }
     if let Some(path) = url_path {
         let path = path.split(['?', '#']).next().unwrap_or_default();
         let mut parts = path.split('/');
-        let (Some(org), Some(name), Some("pull"), Some(n)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return Err(invalid());
+        let (org, name, kind, n) = (parts.next(), parts.next(), parts.next(), parts.next());
+        if kind == Some("issues") {
+            return Err(invalid_because("that is an issue URL, not a pull request"));
+        }
+        let (Some(org), Some(name), Some("pull"), Some(n)) = (org, name, kind, n) else {
+            return Err(invalid_because("not a GitHub pull request URL"));
         };
         let repo = format!("{org}/{name}");
         crate::config::validate_repo_name(&repo).map_err(|_| invalid())?;
@@ -2002,12 +2204,27 @@ pub fn parse_pr_ref(input: &str) -> Result<PrRef> {
     }
 }
 
-/// Parse `org/repo#123` into (repo, number).
+/// `text` without `prefix`, compared ASCII case-insensitively.
+fn strip_prefix_ci<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = text.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &text[prefix.len()..])
+}
+
+/// Parse `org/repo#123` into (repo, number). As in [`parse_pr_ref`], the
+/// number is decimal digits only and positive: no sign, no `#0`.
 pub fn parse_pr_key(target: &str) -> Result<(String, u64)> {
     let invalid = || anyhow!("invalid PR target '{target}': expected org/repo#123");
     let (repo, number) = target.rsplit_once('#').ok_or_else(invalid)?;
     crate::config::validate_repo_name(repo).map_err(|_| invalid())?;
-    let number: u64 = number.parse().map_err(|_| invalid())?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(invalid)?;
     Ok((repo.to_string(), number))
 }
 
@@ -2015,6 +2232,72 @@ pub fn parse_pr_key(target: &str) -> Result<(String, u64)> {
 mod tests {
     use super::*;
     use crate::agent::Severity;
+
+    fn preflight_with(warnings: &[&str]) -> crate::preflight::Preflight {
+        crate::preflight::Preflight {
+            key: "acme/api#7".into(),
+            warnings: warnings
+                .iter()
+                .map(|m| crate::preflight::PreflightWarning {
+                    kind: crate::preflight::WarningKind::Skipped,
+                    message: m.to_string(),
+                })
+                .collect(),
+            blocked: None,
+            size: None,
+        }
+    }
+
+    fn decide_with(
+        preflight: &crate::preflight::Preflight,
+        tty: bool,
+        answer: &str,
+    ) -> (Result<Decision>, String) {
+        let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
+        let mut out = Vec::new();
+        let decision = decide(preflight, tty, &mut input, &mut out);
+        (decision, String::from_utf8(out).unwrap())
+    }
+
+    /// `prx review <pr>`: nothing to confirm runs unconfirmed; a terminal
+    /// is asked (only `y`/`yes` confirms); no terminal refuses with --yes.
+    #[test]
+    fn the_cli_asks_before_a_risky_review_and_refuses_without_a_terminal() {
+        let plain = preflight_with(&[]);
+        let (decision, out) = decide_with(&plain, false, "");
+        assert_eq!(decision.unwrap(), Decision::Proceed { confirm: false });
+        assert!(out.is_empty());
+
+        let risky = preflight_with(&["Skipped \u{2014} draft"]);
+        for (answer, expected) in [
+            ("y\n", Decision::Proceed { confirm: true }),
+            ("YES\n", Decision::Proceed { confirm: true }),
+            ("n\n", Decision::Declined),
+            ("\n", Decision::Declined),
+            ("", Decision::Declined),
+        ] {
+            let (decision, out) = decide_with(&risky, true, answer);
+            assert_eq!(decision.unwrap(), expected, "{answer:?}");
+            assert!(out.contains("  - Skipped \u{2014} draft"), "{out}");
+            assert!(out.ends_with("Review anyway? [y/N] "), "{out}");
+        }
+
+        let (decision, out) = decide_with(&risky, false, "y\n");
+        let error = format!("{:#}", decision.unwrap_err());
+        assert!(error.contains("Skipped \u{2014} draft"), "{error}");
+        assert!(error.contains("--yes"), "{error}");
+        assert!(out.is_empty(), "nothing is asked without a terminal");
+
+        // Blocked: the review request declines it; nothing is asked.
+        let blocked = crate::preflight::Preflight {
+            blocked: Some("review mode is off for acme/api".into()),
+            ..risky
+        };
+        assert_eq!(
+            decide_with(&blocked, false, "").0.unwrap(),
+            Decision::Proceed { confirm: false }
+        );
+    }
 
     fn manifest(verdict: Verdict) -> ReviewManifest {
         ReviewManifest {
@@ -2593,6 +2876,33 @@ mod tests {
 
     /// Design B3 / spec "CLI print": text, then the dates, plus "(stale)".
     #[test]
+    fn wrap_text_breaks_lines_at_words_and_keeps_paragraphs() {
+        assert_eq!(wrap_text("", 10), "");
+        assert_eq!(wrap_text("short", 10), "short");
+        assert_eq!(
+            wrap_text("one two three four five", 9),
+            "one two\nthree\nfour five"
+        );
+        // Exactly the width fits; a longer word stays whole.
+        assert_eq!(wrap_text("abcd efgh", 9), "abcd efgh");
+        assert_eq!(
+            wrap_text("a supercalifragilistic b", 6),
+            "a\nsupercalifragilistic\nb"
+        );
+        // Line breaks and blank lines survive; spaces collapse.
+        assert_eq!(
+            wrap_text("First  para.\n\nSecond para here.", 12),
+            "First para.\n\nSecond para\nhere."
+        );
+        // Width counts characters, not bytes.
+        assert_eq!(wrap_text("café café", 9), "café café");
+        let long = "word ".repeat(50);
+        assert!(wrap_text(&long, BRIEF_WRAP_COLUMNS)
+            .lines()
+            .all(|l| l.chars().count() <= BRIEF_WRAP_COLUMNS));
+    }
+
+    #[test]
     fn format_brief_prints_text_dates_and_stale() {
         let utc = chrono::FixedOffset::east_opt(0).unwrap();
         let mut brief = status::BriefStatus {
@@ -2690,6 +3000,29 @@ mod tests {
             ),
             ("http://www.github.com/acme/api/pull/7", full("acme/api", 7)),
             ("github.com/acme/api/pull/7", full("acme/api", 7)),
+            ("www.github.com/acme/api/pull/7", full("acme/api", 7)),
+            (
+                "https://github.com/ren3-ai/ren3/pull/1063",
+                full("ren3-ai/ren3", 1063),
+            ),
+            (
+                "https://github.com/acme/api/pull/42/commits",
+                full("acme/api", 42),
+            ),
+            (
+                "https://github.com/acme/api/pull/42/changes",
+                full("acme/api", 42),
+            ),
+            ("https://github.com/acme/api/pull/42/", full("acme/api", 42)),
+            (
+                "https://github.com/acme/api/pull/42?w=1",
+                full("acme/api", 42),
+            ),
+            (
+                "\t https://github.com/my-org/my.repo_x/pull/3 \n",
+                full("my-org/my.repo_x", 3),
+            ),
+            ("HTTPS://GitHub.com/acme/api/pull/5", full("acme/api", 5)),
             ("api#42", PrRef::Short("api".into(), 42)),
             ("my.repo-x_1#3", PrRef::Short("my.repo-x_1".into(), 3)),
             ("42", PrRef::Bare(42)),
@@ -2716,9 +3049,44 @@ mod tests {
             "https://github.com/acme/api/pull/",
             "https://github.com/acme/api/pull/x",
             "https://gitlab.com/acme/api/pull/1",
+            "https://github.com/acme/api/pull/0",
+            "https://github.com/acme/api/pull/42abc",
+            "https://github.com/acme/api",
+            "https://github.com/acme/api/pulls/42",
+            "https://github.com/-acme/api/pull/42",
+            "https://github.com/acme/../pull/42",
+            "https://github.com.evil.com/acme/api/pull/1",
+            "https://notgithub.com/acme/api/pull/1",
+            "ftp://github.com/acme/api/pull/1",
         ] {
             let err = parse_pr_ref(bad).unwrap_err().to_string();
             assert!(err.contains(PR_REF_FORMS), "{bad:?}: {err}");
+        }
+        // URL mistakes name the reason, not only the accepted forms.
+        for (bad, why) in [
+            (
+                "https://gitlab.com/acme/api/pull/1",
+                "only github.com pull request URLs",
+            ),
+            (
+                "http://example.com/acme/api/pull/1",
+                "only github.com pull request URLs",
+            ),
+            (
+                "https://github.com/acme/api/issues/42",
+                "an issue URL, not a pull request",
+            ),
+            (
+                "github.com/acme/api/issues/42",
+                "an issue URL, not a pull request",
+            ),
+            (
+                "https://github.com/acme/api/tree/main",
+                "not a GitHub pull request URL",
+            ),
+        ] {
+            let err = parse_pr_ref(bad).unwrap_err().to_string();
+            assert!(err.contains(why), "{bad:?}: {err}");
         }
     }
 
@@ -2809,5 +3177,151 @@ mod tests {
         .normalized();
         assert_eq!(o.engine.as_deref(), Some("codex"));
         assert_eq!(o.extra_prompt.as_deref(), Some("focus"));
+    }
+
+    /// Manifest text is rendered once and never treated as template: a
+    /// summary or finding made of placeholders stays literal, in the
+    /// default body and in a custom template.
+    #[test]
+    fn manifest_text_is_never_expanded_as_a_template() {
+        let hostile = "{{IDENTITY}} {{PR}} {{VERDICT}} {{FINDINGS_NITS}} {{BLOCKING_COUNT}}";
+        let m = ReviewManifest {
+            summary: hostile.to_string(),
+            findings: vec![finding(
+                Some("{{PR_KEY}}.rs"),
+                Some(1),
+                Severity::Nit,
+                hostile,
+            )],
+            ..manifest(Verdict::Approved)
+        };
+        let default = body_with(&m, "org/a#7", None, None);
+        assert_eq!(
+            default,
+            format!(
+                "## prx review of `org/a#7` \u{2014} approved \u{2014} no blocking issues\n\n{hostile}\n\n\
+                 ### Nits (1)\n- `{{{{PR_KEY}}}}.rs:1` \u{2014} {hostile}\n\n\u{2014} automated review by prx\n"
+            )
+        );
+        let custom = render(
+            &m,
+            "{{SUMMARY}}\n{{FINDINGS_NITS}}\n{{BRIEF}}",
+            None,
+            Some(hostile),
+        );
+        assert_eq!(
+            custom,
+            format!(
+                "{hostile}\n### Nits (1)\n- `{{{{PR_KEY}}}}.rs:1` \u{2014} {hostile}\n{hostile}"
+            )
+        );
+    }
+
+    /// The three verdicts read differently in the posted heading, and
+    /// "approved" always carries its qualifier: the body never says a bare
+    /// "approved" that could be taken for a GitHub approval.
+    #[test]
+    fn verdict_labels_in_the_posted_heading() {
+        let heading = |v| {
+            let body = body_with(&manifest(v), "org/a#7", None, None);
+            body.lines().next().unwrap().to_string()
+        };
+        assert_eq!(
+            heading(Verdict::Approved),
+            "## prx review of `org/a#7` \u{2014} approved \u{2014} no blocking issues"
+        );
+        assert_eq!(
+            heading(Verdict::ChangesRequested),
+            "## prx review of `org/a#7` \u{2014} changes requested"
+        );
+        assert_eq!(
+            heading(Verdict::CommentOnly),
+            "## prx review of `org/a#7` \u{2014} comment-only review"
+        );
+    }
+
+    /// `prx approve` takes exactly `org/repo#N`: nothing looser reaches the
+    /// one command that approves on GitHub.
+    #[test]
+    fn approve_target_must_be_a_full_reference() {
+        assert_eq!(
+            parse_pr_key("acme/api#42").unwrap(),
+            ("acme/api".to_string(), 42)
+        );
+        for bad in [
+            "",
+            "42",
+            "#42",
+            "api#42",
+            "acme/api",
+            "acme/api#",
+            "acme/api#x",
+            "acme/api#-1",
+            "acme/api#+5",
+            "acme/api#0",
+            "acme/api#00",
+            "acme/api#1.5",
+            "acme/api# 1",
+            "acme/api#1 --approve",
+            "acme/a pi#1",
+            "https://github.com/acme/api/pull/42",
+        ] {
+            let err = parse_pr_key(bad).unwrap_err().to_string();
+            assert!(err.contains("expected org/repo#123"), "{bad:?}: {err}");
+        }
+    }
+
+    /// The brief prompt bounds the PR description as well as the diff, on
+    /// a character boundary, and says so.
+    #[test]
+    fn brief_prompt_bounds_a_long_description() {
+        let mut view = brief_view();
+        view.body = format!("  {}TAIL  ", "\u{e9}".repeat(BRIEF_BODY_MAX_CHARS));
+        let prompt = brief_prompt("org/a#7", &view, "");
+        let start = prompt.find("-----BEGIN PR DESCRIPTION-----\n").unwrap();
+        let end = prompt.find("\n-----END PR DESCRIPTION-----").unwrap();
+        let shown = &prompt[start + "-----BEGIN PR DESCRIPTION-----\n".len()..end];
+        assert_eq!(
+            shown,
+            format!(
+                "{}\n[description truncated]",
+                "\u{e9}".repeat(BRIEF_BODY_MAX_CHARS)
+            )
+        );
+        assert!(!prompt.contains("TAIL"));
+
+        // At the bound nothing is cut and nothing is claimed.
+        view.body = "d".repeat(BRIEF_BODY_MAX_CHARS);
+        assert!(!brief_prompt("org/a#7", &view, "").contains("[description truncated]"));
+    }
+
+    /// A diff with no `diff --git` header (or text before the first one)
+    /// is still bounded, and counts no files it cannot see.
+    #[test]
+    fn brief_diff_without_file_headers_is_still_bounded() {
+        let raw = "\u{1F600} line\n".repeat(50);
+        let t = truncate_diff_for_brief(&raw, 20);
+        assert!(t.truncated);
+        assert!(t.text.chars().count() <= 20 && !t.text.is_empty());
+        assert_eq!((t.files_shown, t.files_total), (0, 0));
+
+        let with_preamble = format!("warning: something\n{}", file_diff("a.rs", 3));
+        let whole = truncate_diff_for_brief(&with_preamble, usize::MAX);
+        assert_eq!(
+            (whole.truncated, whole.files_shown, whole.files_total),
+            (false, 1, 1)
+        );
+        // "diff --git" inside a changed line is content, not a new file.
+        let quoted = format!(
+            "{}+see diff --git a/x b/x for details\n",
+            file_diff("a.rs", 1)
+        );
+        assert_eq!(truncate_diff_for_brief(&quoted, usize::MAX).files_total, 1);
+
+        let empty = truncate_diff_for_brief("", 10);
+        assert_eq!(
+            (empty.text.as_str(), empty.truncated, empty.files_total),
+            ("", false, 0)
+        );
     }
 }

@@ -129,10 +129,10 @@ async fn notify<N: Notifier>(deps: &EffectsDeps<'_, N>, rec: &PrRecord, event: N
         );
         return;
     }
-    let tier = deps.notifications.tier_for(event);
-    let behavior = deps.tiers.behavior(tier);
+    // Tier banner + sound, with the event's own sound when it has one.
+    let behavior = deps.notifications.behavior_for(event, deps.tiers);
     let (title, body) = notification_text(rec, event);
-    if let Err(e) = deps.notifier.notify(&title, &body, behavior).await {
+    if let Err(e) = deps.notifier.notify(&title, &body, &behavior).await {
         tracing::debug!("notification for {} not delivered: {e}", rec.key());
     }
 }
@@ -154,9 +154,11 @@ fn notification_text(rec: &PrRecord, event: NotifyEvent) -> (String, String) {
         NotifyEvent::Merged => format!("{key} merged"),
         NotifyEvent::Closed => format!("{key} closed"),
         NotifyEvent::Failure => format!("{key}: review failed — check agent and logs"),
-        NotifyEvent::Skipped => match rec.diff_too_large {
-            true => format!("{key}: review skipped — diff too large"),
-            false => format!("{key}: review skipped"),
+        // The skip's own words: `draft`, the matched rule, or the size
+        // against the cap.
+        NotifyEvent::Skipped => match rec.skip_text() {
+            Some(why) => format!("{key}: review skipped — {why}"),
+            None => format!("{key}: review skipped"),
         },
     };
     (title, body)
@@ -167,7 +169,7 @@ mod tests {
     use super::*;
     use crate::config::{Config, OrgConfig, PartialNotifications, PartialOverrides, RepoConfig};
     use crate::notify::{NotifyError, Tier, TierBehavior};
-    use crate::state::PrState;
+    use crate::state::{PrState, SkipReason};
 
     /// Records the tier behavior each notification was delivered with.
     #[derive(Default)]
@@ -208,8 +210,11 @@ mod tests {
             blocking_count: 0,
             nit_count: 0,
             review_session: None,
+            review_session_info: None,
+            last_manifest: None,
             review_attempts: 0,
             diff_too_large: false,
+            skip_detail: None,
             human_approved_at: None,
             exec_summary: None,
             brief: None,
@@ -250,6 +255,44 @@ mod tests {
             };
             execute_poll_effects(&deps, &rec("o/r"), &effects).await;
             assert_eq!(notifier.0.into_inner().unwrap().len(), expected);
+        }
+    }
+
+    /// Ready and blocked are told apart by ear: approved plays `Glass` out
+    /// of the box, blocked the urgent tier's `Basso`, and a repo's
+    /// `notifications.sounds` entry replaces either.
+    #[tokio::test]
+    async fn ready_and_blocked_reviews_play_their_own_sounds() {
+        let tiers = TierTable::builtin();
+        let effects = [
+            Effect::Notify(NotifyEvent::ReviewCompleteApproved),
+            Effect::Notify(NotifyEvent::ReviewCompleteBlocking),
+        ];
+        let mut custom = Notifications::default();
+        custom.sounds.on_review_complete_approved = Some("none".into());
+        custom.sounds.on_review_complete_blocking = Some("Sosumi".into());
+        for (notifications, expected) in [
+            (
+                Notifications::default(),
+                [Some("Glass".to_string()), Some("Basso".to_string())],
+            ),
+            (custom, [None, Some("Sosumi".to_string())]),
+        ] {
+            let notifier = Recording::default();
+            let deps = EffectsDeps {
+                notifier: &notifier,
+                tiers: &tiers,
+                notifications: &notifications,
+            };
+            execute_poll_effects(&deps, &rec("o/r"), &effects).await;
+            let sounds: Vec<Option<String>> = notifier
+                .0
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .map(|b| b.sound)
+                .collect();
+            assert_eq!(sounds, expected);
         }
     }
 
@@ -294,6 +337,110 @@ mod tests {
             behavior("other/repo"),
             tiers.silent,
             "defaults: merged is silent"
+        );
+    }
+
+    /// Notifications are best-effort: a notifier that fails does not stop
+    /// the effects after it.
+    #[tokio::test]
+    async fn a_failing_notifier_does_not_stop_later_effects() {
+        struct Failing(std::sync::Mutex<Vec<String>>);
+        impl Notifier for Failing {
+            async fn notify(
+                &self,
+                _title: &str,
+                body: &str,
+                _behavior: &TierBehavior,
+            ) -> Result<(), NotifyError> {
+                self.0.lock().unwrap().push(body.to_string());
+                Err(NotifyError::Io(std::io::Error::other("no notifier")))
+            }
+        }
+        let tiers = TierTable::builtin();
+        let notifications = Notifications::default();
+        let notifier = Failing(Default::default());
+        let deps = EffectsDeps {
+            notifier: &notifier,
+            tiers: &tiers,
+            notifications: &notifications,
+        };
+        let effects = [
+            Effect::Notify(NotifyEvent::Failure),
+            Effect::Notify(NotifyEvent::Merged),
+        ];
+        execute_poll_effects(&deps, &rec("o/r"), &effects).await;
+        assert_eq!(
+            notifier.0.into_inner().unwrap(),
+            [
+                "o/r#7: review failed \u{2014} check agent and logs",
+                "o/r#7 merged"
+            ]
+        );
+    }
+
+    /// Spec §3.6: what each event says. An approved verdict is worded as a
+    /// passed review, never as an approval; PR titles appear as text only
+    /// where the event is about a new PR.
+    #[test]
+    fn notification_text_per_event() {
+        let mut pr = rec("o/r");
+        pr.title = "Fix `$(id)` \"quoted\"".into();
+        let body = |pr: &PrRecord, event| {
+            let (title, body) = notification_text(pr, event);
+            assert_eq!(title, "PRX");
+            body
+        };
+        assert_eq!(
+            body(&pr, NotifyEvent::NewPr),
+            "new PR o/r#7: Fix `$(id)` \"quoted\""
+        );
+        assert_eq!(
+            body(&pr, NotifyEvent::ReviewStarted),
+            "o/r#7: review started"
+        );
+        assert_eq!(
+            body(&pr, NotifyEvent::ReviewCompleteApproved),
+            "o/r#7 review passed: no blocking issues"
+        );
+        assert_eq!(body(&pr, NotifyEvent::Closed), "o/r#7 closed");
+        assert_eq!(
+            body(&pr, NotifyEvent::NewCommits),
+            "o/r#7: new commits \u{2014} re-review pending"
+        );
+        assert_eq!(
+            body(&pr, NotifyEvent::ReReviewTriggered),
+            "o/r#7: re-review triggered"
+        );
+        // A blocking verdict with no blocking finding recorded (a bare
+        // `changes_requested`) still reads as one issue, never "0 issues".
+        assert_eq!(
+            body(&pr, NotifyEvent::ReviewCompleteBlocking),
+            "o/r#7 review: 1 blocking issue(s) found"
+        );
+        pr.blocking_count = 4;
+        assert_eq!(
+            body(&pr, NotifyEvent::ReviewCompleteBlocking),
+            "o/r#7 review: 4 blocking issue(s) found"
+        );
+        assert_eq!(body(&pr, NotifyEvent::Skipped), "o/r#7: review skipped");
+        pr.state = PrState::Pending;
+        pr.diff_too_large = true;
+        assert_eq!(
+            body(&pr, NotifyEvent::Skipped),
+            "o/r#7: review skipped \u{2014} diff too large"
+        );
+        pr.skip_detail = Some("2,140 lines changed (limit 1,500)".into());
+        assert_eq!(
+            body(&pr, NotifyEvent::Skipped),
+            "o/r#7: review skipped \u{2014} 2,140 lines changed (limit 1,500)"
+        );
+        pr.diff_too_large = false;
+        pr.state = PrState::Skipped;
+        pr.skip_reason = Some(SkipReason::Config);
+        pr.skip_detail = Some("author bot excluded".into());
+        assert_eq!(
+            body(&pr, NotifyEvent::Skipped),
+            "o/r#7: review skipped \u{2014} author bot excluded"
         );
     }
 }

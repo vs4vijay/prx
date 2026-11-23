@@ -44,6 +44,8 @@ use anyhow::{bail, Context, Result};
 
 /// launchd label and plist file stem (macOS).
 const LABEL: &str = "com.prx.daemon";
+/// The daemon's launchd label: launchd sets `XPC_SERVICE_NAME` to it.
+pub const LAUNCHD_LABEL: &str = LABEL;
 /// launchd label and plist file stem for the menubar agent (macOS).
 const MENUBAR_LABEL: &str = "com.prx.menubar";
 /// The menubar binary's file name, resolved next to the daemon binary.
@@ -725,19 +727,35 @@ fn unit_path(home: &Path) -> PathBuf {
 /// the foreground daemon (not the detached start). `WantedBy` lives under
 /// `[Install]` — that is where `systemctl enable` reads it from.
 fn unit_contents(exe: &Path) -> String {
-    let exe = exe.display();
+    let exe = unit_exec_word(exe);
     format!(
         r#"[Unit]
 Description=prx daemon (local-first PR review lifecycle manager)
 
 [Service]
 ExecStart={exe} daemon start --foreground
+Environment=PRX_SUPERVISED=1
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 "#
     )
+}
+
+/// `exe` as the first word of an `ExecStart=` line. systemd splits the line
+/// on whitespace and expands `%` specifiers, so `%` is doubled and a path
+/// with whitespace, quotes, or a backslash is written double-quoted with
+/// C-style escapes; a plain path is written as it is.
+fn unit_exec_word(exe: &Path) -> String {
+    let raw = exe.display().to_string().replace('%', "%%");
+    let plain = !raw
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\'));
+    if plain {
+        return raw;
+    }
+    format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn write_unit(exe: &Path, home: &Path) -> Result<PathBuf> {
@@ -816,15 +834,30 @@ fn systemctl(args: &[&str]) -> Result<()> {
     }
 }
 
-/// Extract the registered binary from our own unit: the first token of the
-/// `ExecStart=` line (written as an unquoted absolute path by `install`).
+/// Extract the registered binary from our own unit: the first word of the
+/// `ExecStart=` line, as [`unit_exec_word`] wrote it (a plain absolute path,
+/// or a double-quoted one).
 fn unit_binary(contents: &str) -> Option<PathBuf> {
-    contents
+    let line = contents
         .lines()
         .find_map(|line| line.trim().strip_prefix("ExecStart="))?
-        .split_whitespace()
-        .next()
-        .map(PathBuf::from)
+        .trim_start();
+    let word = match line.strip_prefix('"') {
+        Some(quoted) => {
+            let mut word = String::new();
+            let mut chars = quoted.chars();
+            loop {
+                match chars.next()? {
+                    '"' => break,
+                    '\\' => word.push(chars.next()?),
+                    c => word.push(c),
+                }
+            }
+            word
+        }
+        None => line.split_whitespace().next()?.to_string(),
+    };
+    Some(PathBuf::from(word.replace("%%", "%")))
 }
 
 // --------------------------------------------------------------- unit tests
@@ -1086,6 +1119,277 @@ mod tests {
         assert!(
             msg.contains(&cargo_bin.join("prx-menubar").display().to_string()),
             "{msg}"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    // ------------------------------------------------ registration file text
+
+    fn exec_start(contents: &str) -> &str {
+        contents
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("unit has an ExecStart line")
+    }
+
+    /// Regression: the binary path was written into `ExecStart=` as it is.
+    /// systemd splits that line on whitespace, so a prx under a directory
+    /// with a space in its name got a unit that could not start, and `prx
+    /// doctor` read the first fragment back and called the install stale.
+    #[test]
+    fn unit_quotes_a_binary_path_systemd_would_otherwise_split() {
+        let spaced = Path::new("/home/maya/My Tools/bin/prx");
+        let contents = unit_contents(spaced);
+        assert_eq!(
+            exec_start(&contents),
+            r#"ExecStart="/home/maya/My Tools/bin/prx" daemon start --foreground"#
+        );
+        assert_eq!(unit_binary(&contents), Some(spaced.to_path_buf()));
+
+        // Quotes and backslashes are escaped inside the quoted word, and a
+        // `%` is doubled so systemd does not read it as a specifier.
+        for odd in [
+            "/opt/a \"b\"/prx",
+            "/opt/it's/prx",
+            "/opt/back\\slash/prx",
+            "/opt/100%/prx",
+            "/opt/tab\there/50% off/prx",
+        ] {
+            let contents = unit_contents(Path::new(odd));
+            assert_eq!(unit_binary(&contents), Some(PathBuf::from(odd)), "{odd}");
+            let line = exec_start(&contents);
+            assert!(line.ends_with(" daemon start --foreground"), "{line}");
+            assert_eq!(line.matches('%').count() % 2, 0, "{line}");
+        }
+        assert_eq!(
+            exec_start(&unit_contents(Path::new("/opt/100%/prx"))),
+            "ExecStart=/opt/100%%/prx daemon start --foreground"
+        );
+        // An ordinary path is written exactly as before: no quotes.
+        assert_eq!(
+            exec_start(&unit_contents(Path::new("/usr/local/bin/prx"))),
+            "ExecStart=/usr/local/bin/prx daemon start --foreground"
+        );
+    }
+
+    /// `prx doctor` reads the binary back from whatever unit is on disk:
+    /// indentation is fine, and a unit without a usable `ExecStart=` reads
+    /// as "could not be parsed" (`None`), never a panic.
+    #[test]
+    fn unit_binary_reads_plain_and_quoted_words_and_rejects_the_rest() {
+        let parse = |line: &str| unit_binary(&format!("[Service]\n{line}\nRestart=on-failure\n"));
+        assert_eq!(
+            parse("  ExecStart=  /usr/bin/prx daemon start"),
+            Some(PathBuf::from("/usr/bin/prx"))
+        );
+        assert_eq!(
+            parse("ExecStart=/usr/bin/prx"),
+            Some(PathBuf::from("/usr/bin/prx"))
+        );
+        assert_eq!(
+            parse(r#"ExecStart="/a b/prx" daemon"#),
+            Some(PathBuf::from("/a b/prx"))
+        );
+        assert_eq!(parse("ExecStart="), None);
+        assert_eq!(parse("ExecStart=   "), None);
+        assert_eq!(parse(r#"ExecStart="/never closed"#), None);
+        assert_eq!(parse(r#"ExecStart="/ends in an escape\"#), None);
+        assert_eq!(parse("ExecStartPre=/bin/true"), None);
+        // The first ExecStart line is the registered command.
+        assert_eq!(
+            unit_binary("ExecStart=/first/prx\nExecStart=/second/prx\n"),
+            Some(PathBuf::from("/first/prx"))
+        );
+    }
+
+    /// launchd starts agents with a bare `PATH`, so every plist prx writes
+    /// carries the installing environment's `PATH` (XML-escaped) for `gh`
+    /// and the engines to resolve at login.
+    #[test]
+    fn every_plist_snapshots_the_installing_path() {
+        let path = std::env::var("PATH").expect("tests run with a PATH");
+        let snapshot = format!(
+            "<key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        \
+             <string>{}</string>\n    </dict>",
+            xml_escape(&path)
+        );
+        for (name, contents) in [
+            ("daemon", plist_contents(Path::new("/opt/prx/bin/prx"))),
+            (
+                "menubar",
+                menubar_plist_contents(Path::new("/opt/prx/bin/prx-menubar")),
+            ),
+            (
+                "app",
+                app_plist_contents(Path::new("/Applications/PRX.app")),
+            ),
+        ] {
+            assert!(contents.contains(&snapshot), "{name}: {contents}");
+        }
+    }
+
+    /// The PRX.app login item (A4): its own label, the bundle's UI
+    /// executable with `--background` and nothing else, the same
+    /// crash-only `KeepAlive`, and a path `prx doctor` can turn back into
+    /// the bundle.
+    #[test]
+    fn app_plist_launches_the_bundle_executable_in_the_background() {
+        let bundle = Path::new("/Applications/Dev & Test/PRX.app");
+        let contents = app_plist_contents(bundle);
+        assert!(contents.contains("<string>com.prx.app</string>"));
+        assert!(contents.contains("<key>RunAtLoad</key>\n    <true/>"));
+        assert!(contents.contains(
+            "<key>KeepAlive</key>\n    <dict>\n        <key>SuccessfulExit</key>\n        <false/>"
+        ));
+        let args = contents
+            .split_once("<key>ProgramArguments</key>")
+            .unwrap()
+            .1
+            .split_once("</array>")
+            .unwrap()
+            .0;
+        let strings: Vec<&str> = args
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("<string>"))
+            .collect();
+        assert_eq!(
+            strings,
+            [
+                "<string>/Applications/Dev &amp; Test/PRX.app/Contents/MacOS/PRX</string>",
+                "<string>--background</string>",
+            ]
+        );
+        let binary = plist_binary(&contents).expect("our own plist parses");
+        assert_eq!(binary, bundle.join("Contents/MacOS/PRX"));
+        assert_eq!(bundle_of_executable(&binary), Some(bundle.to_path_buf()));
+        // Too shallow to sit inside a bundle.
+        assert_eq!(bundle_of_executable(Path::new("/PRX")), None);
+        assert_eq!(bundle_of_executable(Path::new("MacOS/PRX")), None);
+    }
+
+    /// Paths are escaped on the way into a plist and unescaped on the way
+    /// out, entity look-alikes included; a plist that is not shaped like
+    /// ours yields no binary.
+    #[test]
+    fn plist_paths_round_trip_and_foreign_plists_yield_no_binary() {
+        for odd in [
+            "/opt/a&b/prx",
+            "/opt/&amp;/prx",
+            "/opt/&lt;tag&gt;/prx",
+            "/opt/<a>&<b>/prx",
+            "/opt/with space/prx",
+        ] {
+            assert_eq!(xml_unescape(&xml_escape(odd)), odd);
+            assert_eq!(
+                plist_binary(&plist_contents(Path::new(odd))),
+                Some(PathBuf::from(odd)),
+                "{odd}"
+            );
+        }
+        for foreign in [
+            "",
+            "<plist/>",
+            "<key>ProgramArguments</key>",
+            "<key>ProgramArguments</key><array></array>",
+            "<key>ProgramArguments</key><array><string>/never/closed",
+            "<array><string>/no/key</string></array>",
+        ] {
+            assert_eq!(plist_binary(foreign), None, "{foreign:?}");
+        }
+        // Whitespace around the value is not part of the path.
+        assert_eq!(
+            plist_binary(
+                "<key>ProgramArguments</key>\n<array>\n<string>\n  /opt/prx\n</string>\n</array>"
+            ),
+            Some(PathBuf::from("/opt/prx"))
+        );
+    }
+
+    /// What counts as a PRX bundle, and which binaries count as inside one:
+    /// `Contents/MacOS/*` and `Contents/Helpers/*` of a `.app` directory
+    /// that holds `Contents/MacOS/PRX`, also when reached through a symlink.
+    #[test]
+    fn bundle_detection_needs_the_app_shape_and_the_ui_executable() {
+        let home = temp_home("bundle-shape");
+        let bundle = home.join("Apps").join("PRX.app");
+        let ui = bundle.join("Contents/MacOS/PRX");
+        let cli = bundle.join(APP_CLI);
+        touch(&cli);
+        // The helper alone does not make a bundle.
+        assert!(!is_app_bundle(&bundle));
+        assert_eq!(enclosing_bundle(&cli), None);
+        touch(&ui);
+        assert!(is_app_bundle(&bundle));
+        assert_eq!(enclosing_bundle(&ui), Some(bundle.clone()));
+        assert_eq!(enclosing_bundle(&cli), Some(bundle.clone()));
+
+        // Other places inside the bundle, and a look-alike that is not .app.
+        let resource = bundle.join("Contents/Resources/prx");
+        touch(&resource);
+        assert_eq!(enclosing_bundle(&resource), None);
+        let plain = home.join("PRX/Contents/MacOS/PRX");
+        touch(&plain);
+        assert!(is_app_bundle(&home.join("PRX")));
+        assert_eq!(enclosing_bundle(&plain), None);
+        // `Contents/MacOS/PRX` being a directory is not an executable.
+        let hollow = home.join("Hollow.app");
+        std::fs::create_dir_all(hollow.join("Contents/MacOS/PRX")).unwrap();
+        assert!(!is_app_bundle(&hollow));
+
+        // `~/bin/prx` symlinked to the bundled CLI still finds the bundle.
+        let link = home.join("bin").join("prx");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&cli, &link).unwrap();
+        let found = enclosing_bundle(&link).expect("symlink resolves into the bundle");
+        assert_eq!(
+            std::fs::canonicalize(found).unwrap(),
+            std::fs::canonicalize(&bundle).unwrap()
+        );
+        assert_eq!(enclosing_bundle(&home.join("bin/absent")), None);
+
+        // An explicit bundle must be absolute as well as real.
+        let err = find_app_bundle(Some(Path::new("Apps/PRX.app")), &cli, &[]).unwrap_err();
+        assert!(err.to_string().contains("must be absolute"), "{err}");
+        let err = install_app_with(Path::new("Apps/PRX.app"), &home).unwrap_err();
+        assert!(err.to_string().contains("must be absolute"), "{err}");
+        assert!(!app_plist_path(&home).exists(), "nothing written on error");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A registration file prx cannot make sense of (hand-edited, or from
+    /// another tool) is reported as installed with no parseable binary:
+    /// `prx doctor` warns about it instead of failing or crashing.
+    #[test]
+    fn unparseable_registration_reads_as_installed_without_a_binary() {
+        let home = temp_home("garbage-registration");
+        let file = if cfg!(target_os = "macos") {
+            plist_path(&home)
+        } else {
+            unit_path(&home)
+        };
+        touch(&file);
+        let st = status_with(&home);
+        assert!(st.installed);
+        assert_eq!(st.path.as_deref(), Some(file.as_path()));
+        assert_eq!(st.binary, None);
+
+        // Registration paths are fixed names under the given home only.
+        assert_eq!(
+            plist_path(&home),
+            home.join("Library/LaunchAgents/com.prx.daemon.plist")
+        );
+        assert_eq!(
+            menubar_plist_path(&home),
+            home.join("Library/LaunchAgents/com.prx.menubar.plist")
+        );
+        assert_eq!(
+            app_plist_path(&home),
+            home.join("Library/LaunchAgents/com.prx.app.plist")
+        );
+        assert_eq!(
+            unit_path(&home),
+            home.join(".config/systemd/user/prx-daemon.service")
         );
         std::fs::remove_dir_all(&home).unwrap();
     }

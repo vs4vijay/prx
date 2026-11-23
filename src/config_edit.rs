@@ -9,10 +9,14 @@
 //! existing index replaces in place, and a gapped index is rejected. Values
 //! are parsed as YAML scalars (`true`, `30`, `"some repo"` quoted for strings
 //! that look like other types) — except prx's own `{{TEMPLATE}}` syntax,
-//! which is always taken as a literal string. Legacy key paths (`agents.…`,
+//! which is always taken as a literal string, as is a cron expression or
+//! `@daily`-style shorthand that YAML cannot read unquoted (`*/15 * * * *`).
+//! `null` clears an optional key: a repo override, or a default that may be
+//! unset such as `defaults.schedule`. Legacy key paths (`agents.…`,
 //! `defaults.agent`, `repos.<org/repo>.agent`) are rewritten to their
 //! `engines`/`engine` form (design D1), and a fresh `engines.<name>` entry
-//! starts as `type: agent`.
+//! starts as `type: agent`. A configured repo is matched by its whole name, so
+//! `repos.acme/next.js.engine` addresses `acme/next.js`.
 //!
 //! After every set the result is round-tripped through the typed config and
 //! the assignment is re-verified on the re-serialized value, so an update
@@ -36,16 +40,36 @@ struct Segment {
 /// `config` in memory. The caller validates and saves afterwards, so an
 /// invalid resulting configuration never reaches disk. Repo overrides use
 /// `repos.<org/repo>.<key>` and the repo entry is created on demand
-/// (mirroring `prx repos add`).
+/// (mirroring `prx repos add`). On any error `config` is left as it was.
 pub fn set_value(config: &mut Config, key: &str, raw_value: &str) -> Result<(), String> {
     let value = parse_value(raw_value)?;
     if key.trim().is_empty() {
         return Err("key must be a dotted path, e.g. defaults.engine".to_string());
     }
-    let mut segments: Vec<Segment> = key
-        .split('.')
-        .map(parse_segment)
-        .collect::<Result<_, _>>()?;
+    let mut segments = match split_configured_repo_key(config, key) {
+        // The repo name is taken whole (it may contain dots); only the
+        // rest of the path is split.
+        Some((repo_name, rest)) => {
+            let mut segments = vec![
+                Segment {
+                    key: "repos".to_string(),
+                    indices: Vec::new(),
+                },
+                Segment {
+                    key: repo_name.to_string(),
+                    indices: Vec::new(),
+                },
+            ];
+            for part in rest.split('.') {
+                segments.push(parse_segment(part)?);
+            }
+            segments
+        }
+        None => key
+            .split('.')
+            .map(parse_segment)
+            .collect::<Result<Vec<Segment>, _>>()?,
+    };
     if segments.len() < 2 {
         return Err(format!(
             "key '{key}' needs at least two segments, e.g. defaults.engine or repos.org/repo.engine"
@@ -64,6 +88,12 @@ pub fn set_value(config: &mut Config, key: &str, raw_value: &str) -> Result<(), 
             );
         }
         let repo_name = segments[1].key.clone();
+        // Clearing must not start watching a repo as a side effect.
+        if value.is_null() && !config.has_repo(&repo_name) {
+            return Err(format!(
+                "repo '{repo_name}' is not configured; there is nothing to clear"
+            ));
+        }
         set_in_repo(&mut root, &repo_name, &segments[2..], &value)?;
     } else {
         if segments[0].key == "engines" && segments.len() > 2 && segments[1].indices.is_empty() {
@@ -72,9 +102,28 @@ pub fn set_value(config: &mut Config, key: &str, raw_value: &str) -> Result<(), 
         set_in_maps(&mut root, &segments, &value)?;
     }
 
-    *config = serde_yaml::from_value(root)
+    let updated: Config = serde_yaml::from_value(root)
         .map_err(|e| format!("resulting configuration does not round-trip: {e}"))?;
-    verify_applied(config, key, &segments, &value)
+    verify_applied(&updated, key, &segments, &value)?;
+    *config = updated;
+    Ok(())
+}
+
+/// `repos.<name>.<rest>` where `<name>` is a repo already in the config,
+/// matched whole. GitHub repo names may contain dots (`acme/next.js`), so
+/// splitting the key on every `.` would address a different, shorter name.
+/// The longest configured name wins; `None` leaves the plain split, which
+/// is right for every name without a dot.
+fn split_configured_repo_key<'a>(config: &Config, key: &'a str) -> Option<(&'a str, &'a str)> {
+    let after = key.strip_prefix("repos.")?;
+    config
+        .repos
+        .iter()
+        .filter_map(|repo| {
+            let rest = after.strip_prefix(repo.name.as_str())?.strip_prefix('.')?;
+            Some((&after[..repo.name.len()], rest))
+        })
+        .max_by_key(|(name, _)| name.len())
 }
 
 /// Rewrite legacy key paths to the engines form (design D1): `agents.<name>…`
@@ -134,12 +183,35 @@ fn seed_engine_entry(root: &mut Value, name: &str) {
 /// (`{{PROMPT}}`, `{{MANIFEST_PATH}}`, …), which is never meaningful YAML
 /// (it would parse as a flow mapping) and is taken as a literal string. A
 /// well-formed `{{…}}` pair anywhere in the value opts in; anything else
-/// must be valid YAML.
+/// must be valid YAML, with two exceptions that keep ordinary values from
+/// needing shell-and-YAML double quoting:
+///
+/// - a value YAML rejects because it starts with `*` or `@` is a literal
+///   string: that is every `*/15 * * * *` cron expression and `@daily`
+///   shorthand a `schedule` takes;
+/// - a value that parses to nothing (empty, or `#…`, which YAML reads as a
+///   comment) is an error rather than a silent `null`. Only a literal
+///   `null` (or `~`) is null, and that clears the key.
 fn parse_value(raw_value: &str) -> Result<Value, String> {
     if raw_value.contains("{{") && raw_value.contains("}}") {
         return Ok(Value::String(raw_value.to_string()));
     }
-    serde_yaml::from_str(raw_value).map_err(|e| format!("invalid value '{raw_value}': {e}"))
+    match serde_yaml::from_str::<Value>(raw_value) {
+        Ok(Value::Null) if !is_null_literal(raw_value) => Err(format!(
+            "value '{raw_value}' is empty to YAML (a leading '#' starts a comment); quote it \
+             to store it as text, e.g. '\"{raw_value}\"', or use `null` to clear the key"
+        )),
+        Ok(value) => Ok(value),
+        Err(_) if raw_value.trim_start().starts_with(['*', '@']) => {
+            Ok(Value::String(raw_value.trim().to_string()))
+        }
+        Err(e) => Err(format!("invalid value '{raw_value}': {e}")),
+    }
+}
+
+/// The spellings YAML reads as an explicit null.
+fn is_null_literal(raw_value: &str) -> bool {
+    matches!(raw_value.trim(), "null" | "Null" | "NULL" | "~")
 }
 
 fn parse_segment(raw: &str) -> Result<Segment, String> {
@@ -369,15 +441,22 @@ fn verify_applied(
             })?;
         start = 2;
     }
-    for segment in &segments[start..] {
-        cursor = cursor
-            .get(Value::String(segment.key.clone()))
-            .ok_or_else(|| {
-                format!(
+    for (offset, segment) in segments[start..].iter().enumerate() {
+        let is_leaf = start + offset + 1 == segments.len();
+        let Some(next) = cursor.get(Value::String(segment.key.clone())) else {
+            // `null` clears an optional key, and the schema omits unset
+            // optional keys on save: the leaf being gone IS the request.
+            // So is a parent that clearing its last key emptied and the
+            // schema then omitted (`notifications.sounds`).
+            if value.is_null() && segment.indices.is_empty() && (is_leaf || cursor.is_mapping()) {
+                return Ok(());
+            }
+            return Err(format!(
                 "setting '{key}' did not take effect: '{}' was dropped by the configuration schema",
                 segment.key
-            )
-            })?;
+            ));
+        };
+        cursor = next;
         for &index in &segment.indices {
             cursor = cursor
                 .as_sequence()
@@ -608,6 +687,295 @@ mod tests {
         let mut cfg = config("defaults:\n  agent: pi\n");
         let err = set_value(&mut cfg, "notification_tiers.bogus.banner", "true").unwrap_err();
         assert!(err.contains("did not take effect"), "{err}");
+    }
+
+    /// A repo already in the config is addressed by its whole name, dots
+    /// included. Splitting on every dot used to create and start watching a
+    /// repo with the truncated name, carrying the override as a junk key.
+    #[test]
+    fn dotted_repo_names_are_addressed_whole() {
+        let mut cfg = config(
+            "defaults:\n  agent: pi\nrepos:\n  - name: acme/next\n  - name: acme/next.js\n  - name: acme/site.github.io\n",
+        );
+        set_value(&mut cfg, "repos.acme/next.js.engine", "claude").unwrap();
+        set_value(
+            &mut cfg,
+            "repos.acme/site.github.io.cooldown.between_re_reviews_minutes",
+            "5",
+        )
+        .unwrap();
+        set_value(&mut cfg, "repos.acme/site.github.io.skip.labels[0]", "hold").unwrap();
+        set_value(&mut cfg, "repos.acme/next.poll_interval_minutes", "7").unwrap();
+
+        assert_eq!(cfg.repos.len(), 3, "{:?}", cfg.repos);
+        let by_name = |name: &str| {
+            cfg.repos
+                .iter()
+                .find(|r| r.name == name)
+                .unwrap()
+                .overrides
+                .clone()
+        };
+        assert_eq!(by_name("acme/next.js").engine.as_deref(), Some("claude"));
+        assert_eq!(by_name("acme/next").engine, None);
+        assert_eq!(by_name("acme/next").poll_interval_minutes, Some(7));
+        let site = by_name("acme/site.github.io");
+        assert_eq!(site.cooldown.unwrap().between_re_reviews_minutes, Some(5));
+        assert_eq!(site.skip.unwrap().labels, Some(vec!["hold".to_string()]));
+        // No override landed in a pass-through map under a truncated name.
+        assert!(cfg.repos.iter().all(|r| r.overrides.extra.is_empty()));
+        cfg.validate().unwrap();
+    }
+
+    /// Cron expressions, `@` shorthands and leading-`*` globs are not valid
+    /// unquoted YAML; they are taken as the strings they obviously are.
+    #[test]
+    fn set_takes_cron_and_glob_values_as_strings() {
+        let mut cfg = config("defaults:\n  agent: pi\nrepos:\n  - name: org/one\n");
+        set_value(&mut cfg, "defaults.schedule", "*/15 * * * *").unwrap();
+        assert_eq!(cfg.defaults.schedule.as_deref(), Some("*/15 * * * *"));
+        set_value(&mut cfg, "repos.org/one.schedule", " @daily ").unwrap();
+        assert_eq!(cfg.repos[0].overrides.schedule.as_deref(), Some("@daily"));
+        set_value(&mut cfg, "defaults.skip.branches[0]", "*-wip").unwrap();
+        assert_eq!(cfg.defaults.skip.branches, vec!["*-wip".to_string()]);
+        cfg.validate().unwrap();
+        // Values YAML does read keep their YAML meaning.
+        set_value(&mut cfg, "defaults.schedule", "0 */2 * * *").unwrap();
+        assert_eq!(cfg.defaults.schedule.as_deref(), Some("0 */2 * * *"));
+        set_value(&mut cfg, "defaults.skip.labels", "[hold, \"do not merge\"]").unwrap();
+        assert_eq!(cfg.defaults.skip.labels, ["hold", "do not merge"]);
+    }
+
+    /// `null` removes an optional key: a repo's override falls back to the
+    /// level below, and an unset-able default is unset. It never adds a
+    /// repo, and it cannot blank a key that must have a value.
+    #[test]
+    fn null_clears_optional_keys_and_overrides() {
+        let mut cfg = config(
+            "defaults:\n  agent: pi\n  schedule: \"@daily\"\n  extra_prompt: Be kind.\nrepos:\n  - name: org/one\n    agent: claude\n    poll_interval_minutes: 5\n    cooldown:\n      between_re_reviews_minutes: 9\n",
+        );
+        set_value(&mut cfg, "defaults.schedule", "null").unwrap();
+        set_value(&mut cfg, "defaults.extra_prompt", "~").unwrap();
+        set_value(&mut cfg, "repos.org/one.agent", "null").unwrap();
+        set_value(&mut cfg, "repos.org/one.cooldown", "null").unwrap();
+        assert_eq!(cfg.defaults.schedule, None);
+        assert_eq!(cfg.defaults.extra_prompt, None);
+        let one = &cfg.repos[0].overrides;
+        assert_eq!(one.engine, None);
+        assert_eq!(one.cooldown, None);
+        assert_eq!(one.poll_interval_minutes, Some(5)); // untouched
+        let eff = cfg.effective_repos().unwrap();
+        assert_eq!(eff[0].engine, "pi");
+        assert_eq!(eff[0].cooldown.between_re_reviews_minutes, 30);
+        let saved = serde_yaml::to_string(&cfg).unwrap();
+        assert!(!saved.contains("schedule"), "{saved}");
+        assert!(!saved.contains("claude"), "{saved}");
+
+        let before = cfg.clone();
+        // Clearing an override of a repo that is not configured must not
+        // start watching it.
+        let err = set_value(&mut cfg, "repos.org/ghost.engine", "null").unwrap_err();
+        assert!(err.contains("'org/ghost' is not configured"), "{err}");
+        // A key that must hold a value cannot be cleared.
+        set_value(&mut cfg, "defaults.poll_interval_minutes", "null").unwrap_err();
+        set_value(&mut cfg, "defaults.engine", "null").unwrap_err();
+        assert_eq!(cfg, before);
+    }
+
+    /// Per-event sounds are set and cleared by key path at every level;
+    /// clearing a default restores the built-in sound, clearing a repo's
+    /// falls back to the level below.
+    #[test]
+    fn event_sounds_set_and_clear_by_key_path() {
+        use crate::notify::{NotifyEvent, TierTable};
+        let mut cfg = config("defaults:\n  agent: pi\nrepos:\n  - name: org/one\n");
+        let tiers = TierTable::builtin();
+        let ready = |cfg: &Config, repo: &str| {
+            cfg.notifications_for(repo)
+                .behavior_for(NotifyEvent::ReviewCompleteApproved, &tiers)
+                .sound
+        };
+        set_value(
+            &mut cfg,
+            "defaults.notifications.sounds.on_review_complete_approved",
+            "Hero",
+        )
+        .unwrap();
+        set_value(
+            &mut cfg,
+            "repos.org/one.notifications.sounds.on_review_complete_approved",
+            "none",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(ready(&cfg, "org/two").as_deref(), Some("Hero"));
+        assert_eq!(ready(&cfg, "org/one"), None);
+
+        set_value(
+            &mut cfg,
+            "repos.org/one.notifications.sounds.on_review_complete_approved",
+            "null",
+        )
+        .unwrap();
+        assert_eq!(ready(&cfg, "org/one").as_deref(), Some("Hero"));
+        set_value(
+            &mut cfg,
+            "defaults.notifications.sounds.on_review_complete_approved",
+            "null",
+        )
+        .unwrap();
+        assert_eq!(ready(&cfg, "org/one").as_deref(), Some("Glass"));
+        let saved = serde_yaml::to_string(&cfg).unwrap();
+        assert!(!saved.contains("sounds"), "{saved}");
+
+        set_value(&mut cfg, "defaults.notifications.menubar_bell", "false").unwrap();
+        assert!(!cfg.defaults.notifications.menubar_bell);
+    }
+
+    /// A value YAML reads as nothing (empty, blank, or a `#` comment) is
+    /// refused with a hint instead of being stored as null.
+    #[test]
+    fn empty_and_comment_values_are_refused_with_a_hint() {
+        let mut cfg = config("defaults:\n  agent: pi\n  review_heading: Old\nrepos: []\n");
+        let before = cfg.clone();
+        for raw in ["", "   ", "# prx review", "#"] {
+            let err = set_value(&mut cfg, "defaults.review_heading", raw).unwrap_err();
+            assert!(err.contains("is empty to YAML"), "{raw:?}: {err}");
+            assert!(err.contains("`null` to clear"), "{raw:?}: {err}");
+        }
+        assert_eq!(cfg, before);
+        // Quoted, the same text is stored.
+        set_value(&mut cfg, "defaults.review_heading", "\"# prx review\"").unwrap();
+        assert_eq!(cfg.defaults.review_heading.as_deref(), Some("# prx review"));
+    }
+
+    /// Every way a set can fail leaves the in-memory config exactly as it
+    /// was, so a caller that keeps using it never sees a half-applied edit.
+    #[test]
+    fn failed_sets_leave_the_config_untouched() {
+        let mut cfg = config(
+            "defaults:\n  agent: pi\norgs:\n  - org: acme\n    poll_interval_minutes: 9\nrepos:\n  - name: org/one\n",
+        );
+        let before = cfg.clone();
+        for (key, value, needle) in [
+            ("", "x", "dotted path"),
+            ("   ", "x", "dotted path"),
+            ("defaults", "x", "at least two segments"),
+            ("defaults..engine", "x", "empty key segment"),
+            (".engine", "x", "empty key segment"),
+            ("defaults.", "x", "empty key segment"),
+            ("defaults.[0]", "x", "empty key segment"),
+            ("repos.org/one", "x", "cannot set a whole repo entry"),
+            ("repos.org/one.", "x", "empty key segment"),
+            ("defaults.skip.labels[0]x", "x", "unexpected text 'x'"),
+            ("defaults.skip.labels[-1]", "x", "not a valid list index"),
+            (
+                "defaults.skip.authors[0][0]",
+                "x",
+                "inner list does not exist",
+            ),
+            ("defaults.skip.labels[0][0]", "x", "needs a list"),
+            ("defaults.skip[0].labels", "x", "only the last key segment"),
+            // A wrong type is caught by the round trip through the schema.
+            (
+                "defaults.poll_interval_minutes",
+                "soon",
+                "does not round-trip",
+            ),
+            ("defaults.skip.labels", "wip", "does not round-trip"),
+            ("defaults.review_mode", "sometimes", "does not round-trip"),
+            ("menu.sort", "oldest", "does not round-trip"),
+            // Renaming a repo through its own key would orphan the path.
+            ("repos.org/one.name", "org/two", "did not take effect"),
+            // Org entries are a list keyed by `org`; key paths cannot
+            // address them (edit the file instead).
+            (
+                "orgs.acme.poll_interval_minutes",
+                "3",
+                "already holds a list",
+            ),
+            (
+                "orgs[0].poll_interval_minutes",
+                "3",
+                "only the last key segment",
+            ),
+        ] {
+            let err = set_value(&mut cfg, key, value).unwrap_err();
+            assert!(err.contains(needle), "{key:?}: {err}");
+            assert_eq!(cfg, before, "{key:?} changed the config");
+        }
+    }
+
+    /// Unknown keys are kept where the schema has a pass-through map, so a
+    /// key from a newer prx can be set by an older one.
+    #[test]
+    fn unknown_keys_are_stored_where_the_schema_passes_them_through() {
+        let mut cfg = config("defaults:\n  agent: pi\nrepos:\n  - name: org/one\n");
+        set_value(&mut cfg, "future.flag", "true").unwrap();
+        set_value(&mut cfg, "defaults.future_default", "7").unwrap();
+        set_value(&mut cfg, "repos.org/one.future_repo.depth", "deep").unwrap();
+        assert_eq!(cfg.extra["future"]["flag"], Value::Bool(true));
+        assert_eq!(
+            cfg.defaults.extra["future_default"],
+            Value::Number(7.into())
+        );
+        assert_eq!(
+            cfg.repos[0].overrides.extra["future_repo"]["depth"],
+            Value::String("deep".into())
+        );
+        let back: Config = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    /// YAML scalar typing: the quoting rule the docs give for strings that
+    /// look like another type.
+    #[test]
+    fn scalar_values_keep_their_yaml_type() {
+        let mut cfg = config("defaults:\n  agent: pi\nrepos: []\n");
+        set_value(&mut cfg, "defaults.review_mode", "review comment").unwrap();
+        assert_eq!(
+            cfg.defaults.review_mode,
+            crate::config::ReviewMode::ReviewComment
+        );
+        set_value(&mut cfg, "defaults.review_mode", "off").unwrap();
+        assert_eq!(cfg.defaults.review_mode, crate::config::ReviewMode::Off);
+        // A bare number is not a string, so a text key needs quotes…
+        set_value(&mut cfg, "defaults.agent_model", "5").unwrap_err();
+        set_value(&mut cfg, "defaults.agent_model", "\"5\"").unwrap();
+        assert_eq!(cfg.defaults.agent_model.as_deref(), Some("5"));
+        // …and text with a colon and a space is a mapping to YAML.
+        set_value(&mut cfg, "defaults.block_message", "Blocked: see comments").unwrap_err();
+        set_value(
+            &mut cfg,
+            "defaults.block_message",
+            "\"Blocked: see comments\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.defaults.block_message, "Blocked: see comments");
+    }
+
+    #[test]
+    fn open_with_passes_editor_arguments_before_the_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("prx-cfg-edit-args-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let editor = dir.join("fake-editor");
+        std::fs::write(&editor, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$3.args\"\n").unwrap();
+        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.join("config.yml");
+
+        // Git-style `$EDITOR` with flags, and extra spaces between words.
+        let command = format!("{}   --wait  -n ", editor.display());
+        open_with(&path, &command).unwrap();
+        let args = std::fs::read_to_string(dir.join("config.yml.args")).unwrap();
+        assert_eq!(args, format!("--wait\n-n\n{}\n", path.display()));
+        // A failing editor is reported with its exit status.
+        std::fs::write(&editor, "#!/bin/sh\nexit 3\n").unwrap();
+        let err = open_with(&path, editor.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("exited with"), "{err}");
+        assert!(open_with(&path, "   ").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

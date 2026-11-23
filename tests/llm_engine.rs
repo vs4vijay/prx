@@ -255,6 +255,7 @@ async fn review_once(engine: Engine) -> (Observed, Option<FakeTransport>) {
         store: &store,
         dry_run: false,
         fresh_session: false,
+        confirmed: false,
     };
     let outcome = pipeline
         .run_and_brief(&mut state, "org/one#1")
@@ -265,6 +266,8 @@ async fn review_once(engine: Engine) -> (Observed, Option<FakeTransport>) {
     let history = prx::history::query(&data.child("history.jsonl"), None, 0)
         .unwrap()
         .into_iter()
+        // Tracking the PR wrote a `new_pr` entry; the review is what counts.
+        .filter(|entry| !matches!(entry, prx::history::HistoryEntry::NewPr { .. }))
         .map(|entry| {
             let mut v = serde_json::to_value(entry).unwrap();
             let obj = v.as_object_mut().unwrap();
@@ -305,6 +308,25 @@ async fn review_once(engine: Engine) -> (Observed, Option<FakeTransport>) {
         writes,
         review_body: std::fs::read_to_string(gh_dir.child("org_one#1.review-body.txt")).ok(),
     };
+    // Invariant 7: the API key lives in the environment and one request
+    // header. Nothing prx keeps (state, history, manifests, config) and
+    // nothing it shows holds it, whatever the run's outcome.
+    let mut kept = format!("{observed:?}");
+    let mut dirs = vec![data.path().to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()) {
+            match entry.path() {
+                path if path.is_dir() => dirs.push(path),
+                path => kept.push_str(&String::from_utf8_lossy(&std::fs::read(path).unwrap())),
+            }
+        }
+    }
+    // (The config in the data dir names the variable: the scan reads files.)
+    assert_eq!(kept.contains(KEY_VAR), yaml.contains(KEY_VAR));
+    assert!(
+        !kept.contains("sk-test-key"),
+        "the API key was stored or shown"
+    );
     // The manifest artifact is kept on both paths (A3).
     let manifests: Vec<PathBuf> = std::fs::read_dir(data.child("manifests"))
         .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).collect())

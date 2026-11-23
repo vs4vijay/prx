@@ -68,7 +68,8 @@
     } else {
       svg.setAttribute("aria-hidden", "true");
     }
-    (ICONS[name] || []).forEach(function (shape) {
+    // Own entries only: "constructor" is not an icon.
+    (Object.prototype.hasOwnProperty.call(ICONS, name) ? ICONS[name] : []).forEach(function (shape) {
       const node = document.createElementNS(NS, shape[0]);
       Object.keys(shape[1]).forEach(function (key) { node.setAttribute(key, shape[1][key]); });
       svg.append(node);

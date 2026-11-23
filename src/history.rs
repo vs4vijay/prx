@@ -157,6 +157,23 @@ pub enum HistoryEntry {
         title: String,
         author: String,
     },
+    /// prx started tracking an open PR (first seen, or reopened): written
+    /// with the `on_new_pr` notification, so PRX.app can raise its banner
+    /// while the daemon defers to it.
+    NewPr {
+        ts: DateTime<Utc>,
+        repo: String,
+        number: u64,
+        title: String,
+        author: String,
+    },
+    /// An entry whose `event` this build does not know (written by a newer
+    /// prx, or sent by a newer daemon). It decodes instead of failing the
+    /// whole line or payload, carries nothing, and readers skip it:
+    /// [`query`] leaves it out and [`compact`] keeps its line untouched.
+    /// Never written by this build.
+    #[serde(other)]
+    Unknown,
 }
 
 impl HistoryEntry {
@@ -249,6 +266,13 @@ impl HistoryEntry {
                 title,
                 author,
             },
+            HistoryEvent::NewPr => HistoryEntry::NewPr {
+                ts: now,
+                repo,
+                number,
+                title,
+                author,
+            },
         }
     }
 
@@ -262,7 +286,9 @@ impl HistoryEntry {
             | HistoryEntry::PrMerged { repo, .. }
             | HistoryEntry::PrClosed { repo, .. }
             | HistoryEntry::NewCommits { repo, .. }
+            | HistoryEntry::NewPr { repo, .. }
             | HistoryEntry::Brief { repo, .. } => repo,
+            HistoryEntry::Unknown => "",
         }
     }
 
@@ -276,7 +302,9 @@ impl HistoryEntry {
             | HistoryEntry::PrMerged { number, .. }
             | HistoryEntry::PrClosed { number, .. }
             | HistoryEntry::NewCommits { number, .. }
+            | HistoryEntry::NewPr { number, .. }
             | HistoryEntry::Brief { number, .. } => *number,
+            HistoryEntry::Unknown => 0,
         }
     }
 
@@ -290,7 +318,10 @@ impl HistoryEntry {
             | HistoryEntry::PrMerged { ts, .. }
             | HistoryEntry::PrClosed { ts, .. }
             | HistoryEntry::NewCommits { ts, .. }
+            | HistoryEntry::NewPr { ts, .. }
             | HistoryEntry::Brief { ts, .. } => *ts,
+            // Undated: sorts before everything (readers skip it anyway).
+            HistoryEntry::Unknown => DateTime::<Utc>::UNIX_EPOCH,
         }
     }
 
@@ -310,6 +341,8 @@ impl HistoryEntry {
             HistoryEntry::PrClosed { .. } => "\u{1f5d1}\u{fe0f}", // 🗑️
             HistoryEntry::NewCommits { .. } => "\u{1f501}",  // 🔁
             HistoryEntry::Brief { .. } => "\u{1f4dd}",       // 📝
+            HistoryEntry::NewPr { .. } => "\u{1f195}",       // 🆕
+            HistoryEntry::Unknown => "\u{2022}",             // •
         }
     }
 }
@@ -337,6 +370,7 @@ pub fn append(path: &Path, entry: &HistoryEntry) -> Result<(), HistoryError> {
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|source| HistoryError::Write {
@@ -348,12 +382,37 @@ pub fn append(path: &Path, entry: &HistoryEntry) -> Result<(), HistoryError> {
         source: std::io::Error::other(format!("serialization failed: {e}")),
     })?;
     line.push('\n');
+    // A writer killed mid-line leaves the file without its final newline.
+    // Start on a fresh line then, or this entry would be glued onto the torn
+    // one and lost with it.
+    if ends_mid_line(&mut file) {
+        line.insert(0, '\n');
+    }
     file.write_all(line.as_bytes())
         .and_then(|()| file.flush())
         .map_err(|source| HistoryError::Write {
             path: path.to_path_buf(),
             source,
         })
+}
+
+/// Whether the (non-empty) file's last byte is not a newline. Read errors
+/// count as "no": the append itself reports a broken file.
+fn ends_mid_line(file: &mut std::fs::File) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
+}
+
+/// The file's text, with bytes that are not UTF-8 replaced (U+FFFD) instead
+/// of failing the read: a line torn inside a multi-byte character is one
+/// corrupt line to skip, not a reason to lose the whole history.
+fn read_lossy(path: &Path) -> Result<String, HistoryError> {
+    let bytes = std::fs::read(path).map_err(|source| HistoryError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Read history entries, newest first. `repo` filters to one `org/repo`
@@ -378,16 +437,17 @@ pub fn query_page(
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = std::fs::read_to_string(path).map_err(|source| HistoryError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let raw = read_lossy(path)?;
     let mut entries = Vec::new();
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<HistoryEntry>(line) {
+            // A newer prx's event: nothing this build can show.
+            Ok(HistoryEntry::Unknown) => {
+                tracing::debug!("skipping history line with an unknown event");
+            }
             Ok(entry) => {
                 if repo.is_none_or(|r| entry.repo() == r) && before.is_none_or(|b| entry.ts() < b) {
                     entries.push(entry);
@@ -425,10 +485,7 @@ pub fn set_review_brief(
     if !path.exists() {
         return Ok(false);
     }
-    let raw = std::fs::read_to_string(path).map_err(|source| HistoryError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let raw = read_lossy(path)?;
     let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
     let mut updated = false;
     for line in lines.iter_mut().rev() {
@@ -503,12 +560,13 @@ pub fn compact(path: &Path, days: u64) -> Result<Compaction, HistoryError> {
             removed: 0,
         });
     }
-    let raw = std::fs::read_to_string(path).map_err(|source| HistoryError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let cutoff = Utc::now().date_naive()
-        - chrono::TimeDelta::try_days(days as i64).unwrap_or_else(chrono::TimeDelta::zero);
+    let raw = read_lossy(path)?;
+    // A window too large to represent reaches back before any entry.
+    let cutoff = i64::try_from(days)
+        .ok()
+        .and_then(chrono::TimeDelta::try_days)
+        .and_then(|window| Utc::now().date_naive().checked_sub_signed(window))
+        .unwrap_or(chrono::NaiveDate::MIN);
     let mut kept_lines: Vec<String> = Vec::new();
     let mut removed = 0usize;
     for line in raw.lines() {
@@ -516,6 +574,9 @@ pub fn compact(path: &Path, days: u64) -> Result<Compaction, HistoryError> {
             continue;
         }
         match serde_json::from_str::<HistoryEntry>(line) {
+            // A newer prx's event: its date cannot be read here, so its
+            // line is kept as written rather than lost.
+            Ok(HistoryEntry::Unknown) => kept_lines.push(line.to_string()),
             Ok(entry) => {
                 if entry.ts().date_naive() >= cutoff {
                     kept_lines.push(line.to_string());
@@ -591,8 +652,11 @@ mod tests {
             blocking_count: 0,
             nit_count: 0,
             review_session: None,
+            review_session_info: None,
+            last_manifest: None,
             review_attempts: 0,
             diff_too_large: false,
+            skip_detail: None,
             human_approved_at: None,
             exec_summary: None,
             brief: None,
@@ -1007,6 +1071,79 @@ mod tests {
     }
 
     #[test]
+    fn new_pr_entry_roundtrips_with_serde_tag() {
+        let entry = HistoryEntry::from_effect(
+            &HistoryEvent::NewPr,
+            &rec(),
+            None,
+            None,
+            Vec::new(),
+            Utc::now(),
+        );
+        assert!(matches!(&entry, HistoryEntry::NewPr { number: 7, .. }));
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""event":"new_pr""#), "{json}");
+        assert_eq!(serde_json::from_str::<HistoryEntry>(&json).unwrap(), entry);
+    }
+
+    /// An event this build does not know (a newer prx's) decodes as
+    /// `Unknown` instead of failing: alone, and inside a payload list, so
+    /// one new variant never breaks `GET /history` for an older client.
+    #[test]
+    fn unknown_event_decodes_as_unknown() {
+        let line = r#"{"event":"pr_teleported","ts":"2026-10-01T00:00:00Z","repo":"o/r","number":3,"extra":{"x":1}}"#;
+        assert_eq!(
+            serde_json::from_str::<HistoryEntry>(line).unwrap(),
+            HistoryEntry::Unknown
+        );
+        let payload = format!(
+            r#"[{line},{{"event":"pr_merged","ts":"2026-10-01T00:00:00Z","repo":"o/r","number":3,"title":"t","author":"a"}}]"#
+        );
+        let entries: Vec<HistoryEntry> = serde_json::from_str(&payload).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], HistoryEntry::Unknown);
+        assert!(matches!(
+            entries[1],
+            HistoryEntry::PrMerged { number: 3, .. }
+        ));
+        // A known event with a field it does not know still decodes fully.
+        let newer = r#"{"event":"pr_closed","ts":"2026-10-01T00:00:00Z","repo":"o/r","number":4,"title":"t","author":"a","shiny":true}"#;
+        assert!(matches!(
+            serde_json::from_str::<HistoryEntry>(newer).unwrap(),
+            HistoryEntry::PrClosed { number: 4, .. }
+        ));
+    }
+
+    /// Readers skip an unknown line; compaction keeps it as written (its
+    /// age cannot be read here, and a newer prx still wants it).
+    #[test]
+    fn unknown_lines_are_skipped_by_query_and_kept_by_compaction() {
+        let path = dir("unknown-lines").join("history.jsonl");
+        let unknown =
+            r#"{"event":"pr_teleported","ts":"2001-01-01T00:00:00Z","repo":"o/r","number":3}"#;
+        let raw = format!(
+            "{unknown}\n{{\"event\":\"pr_merged\",\"ts\":\"2001-01-01T00:00:00Z\",\"repo\":\"o/r\",\"number\":3,\"title\":\"t\",\"author\":\"a\"}}\n"
+        );
+        std::fs::write(&path, raw).unwrap();
+        let entries = query(&path, None, 0).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0], HistoryEntry::PrMerged { .. }));
+
+        let stats = compact(&path, 90).unwrap();
+        assert_eq!(
+            stats,
+            Compaction {
+                kept: 1,
+                removed: 1
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{unknown}\n")
+        );
+    }
+
+    #[test]
     fn old_file_without_new_commits_kind_still_parses() {
         // A pre-2.2 history.jsonl carries no `new_commits` tag; per-line
         // tagged deserialization must keep reading it untouched.
@@ -1312,5 +1449,395 @@ mod tests {
         assert!(query_page(&path, Some("org/two"), Some(before), 0)
             .unwrap()
             .is_empty());
+    }
+
+    /// A fresh, empty history file for one test.
+    fn fresh(tag: &str) -> std::path::PathBuf {
+        let path = dir(tag).join("history.jsonl");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn merged(repo: &str, number: u64, ts: &str) -> HistoryEntry {
+        HistoryEntry::PrMerged {
+            ts: ts.parse().unwrap(),
+            repo: repo.into(),
+            number,
+            title: format!("PR {number}"),
+            author: "alice".into(),
+        }
+    }
+
+    fn numbers(entries: &[HistoryEntry]) -> Vec<u64> {
+        entries.iter().map(HistoryEntry::number).collect()
+    }
+
+    /// "Newest first" is append order reversed, whatever the timestamps say;
+    /// the repo filter applies before the limit, and a limit beyond the end
+    /// (or 0) returns everything.
+    #[test]
+    fn query_orders_by_append_position_and_filters_before_limiting() {
+        let path = fresh("order");
+        append(&path, &merged("org/one", 1, "2026-09-03T00:00:00Z")).unwrap();
+        append(&path, &merged("org/two", 2, "2026-09-01T00:00:00Z")).unwrap();
+        append(&path, &merged("org/one", 3, "2026-09-02T00:00:00Z")).unwrap();
+        append(&path, &merged("org/two", 4, "2026-09-04T00:00:00Z")).unwrap();
+
+        assert_eq!(numbers(&query(&path, None, 0).unwrap()), [4, 3, 2, 1]);
+        assert_eq!(numbers(&query(&path, None, 3).unwrap()), [4, 3, 2]);
+        assert_eq!(numbers(&query(&path, None, 99).unwrap()), [4, 3, 2, 1]);
+        // The two newest org/one entries, not "org/one among the two newest".
+        assert_eq!(numbers(&query(&path, Some("org/one"), 2).unwrap()), [3, 1]);
+        assert_eq!(numbers(&query(&path, Some("org/one"), 1).unwrap()), [3]);
+        // The filter is an exact match, not a prefix.
+        assert!(query(&path, Some("org/on"), 0).unwrap().is_empty());
+        assert!(query(&path, Some("org/one/"), 0).unwrap().is_empty());
+    }
+
+    /// Regression: a writer killed mid-line leaves the file without a final
+    /// newline. The next append used to be glued onto that torn line, so a
+    /// perfectly good entry was lost with it.
+    #[test]
+    fn append_after_a_torn_last_line_starts_a_fresh_line() {
+        let path = fresh("torn");
+        append(&path, &merged("org/one", 1, "2026-09-01T00:00:00Z")).unwrap();
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        write!(f, r#"{{"event":"pr_merged","ts":"2026-09-02T00"#).unwrap();
+        drop(f);
+
+        append(&path, &merged("org/one", 3, "2026-09-03T00:00:00Z")).unwrap();
+        append(&path, &merged("org/one", 4, "2026-09-04T00:00:00Z")).unwrap();
+
+        assert_eq!(numbers(&query(&path, None, 0).unwrap()), [4, 3, 1]);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // The torn line stays on a line of its own; nothing else is padded.
+        assert_eq!(raw.lines().count(), 4, "{raw}");
+        assert!(raw.ends_with("}\n"), "{raw}");
+        assert!(!raw.contains("\n\n"), "{raw}");
+    }
+
+    /// Regression: one line torn inside a multi-byte character made the
+    /// whole file unreadable (`stream did not contain valid UTF-8`), which
+    /// failed `prx history`, `prx insights`, `prx usage` and the daemon's
+    /// compaction. It is one corrupt line like any other.
+    #[test]
+    fn a_line_that_is_not_utf8_is_skipped_like_any_corrupt_line() {
+        let path = fresh("not-utf8");
+        let since: DateTime<Utc> = "2026-09-01T00:00:00Z".parse().unwrap();
+        let recent = Utc::now();
+        let review = HistoryEntry::from_effect(
+            &HistoryEvent::ReviewCompleted {
+                verdict: Verdict::Approved,
+                blocking_count: 0,
+                nit_count: 0,
+            },
+            &rec(),
+            Some("claude"),
+            None,
+            Vec::new(),
+            recent,
+        );
+        append(&path, &review).unwrap();
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        // "café" cut after the first byte of the two-byte "é".
+        f.write_all(b"{\"event\":\"pr_merged\",\"title\":\"caf\xc3\n")
+            .unwrap();
+        drop(f);
+        let later = HistoryEntry::from_effect(
+            &HistoryEvent::NewCommits,
+            &rec(),
+            None,
+            None,
+            Vec::new(),
+            recent,
+        );
+        append(&path, &later).unwrap();
+
+        let entries = query(&path, None, 0).unwrap();
+        assert_eq!(entries, [later.clone(), review]);
+
+        // The other two readers of the file cope the same way.
+        assert!(set_review_brief(&path, "org/one", 7, since, Some("a brief"), None).unwrap());
+        assert_eq!(
+            compact(&path, 90).unwrap(),
+            Compaction {
+                kept: 2,
+                removed: 1
+            }
+        );
+        let entries = query(&path, None, 0).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            &entries[1],
+            HistoryEntry::ReviewCompleted { brief: Some(b), .. } if b == "a brief"
+        ));
+    }
+
+    /// Each entry is written with one append-mode write, so writers in
+    /// different threads (or processes: the CLI fallback next to a daemon)
+    /// never interleave bytes and every writer's entries keep their order.
+    #[test]
+    fn concurrent_appends_keep_every_line_whole() {
+        const WRITERS: u64 = 8;
+        const PER_WRITER: u64 = 60;
+        let path = fresh("concurrent");
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let path = &path;
+                scope.spawn(move || {
+                    for i in 0..PER_WRITER {
+                        let entry = HistoryEntry::ReviewSkipped {
+                            ts: "2026-09-01T00:00:00Z".parse().unwrap(),
+                            repo: format!("org/w{writer}"),
+                            number: i,
+                            title: "t".repeat(2_000),
+                            author: "alice".into(),
+                            agent: None,
+                            reason: "diff too large".into(),
+                        };
+                        append(path, &entry).unwrap();
+                    }
+                });
+            }
+        });
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count() as u64, WRITERS * PER_WRITER);
+        let all = query(&path, None, 0).unwrap();
+        assert_eq!(all.len() as u64, WRITERS * PER_WRITER, "no line was torn");
+        for writer in 0..WRITERS {
+            let mine = query(&path, Some(&format!("org/w{writer}")), 0).unwrap();
+            let expected: Vec<u64> = (0..PER_WRITER).rev().collect();
+            assert_eq!(numbers(&mine), expected, "writer {writer}");
+        }
+    }
+
+    /// A log far larger than the retention window normally leaves behind
+    /// still pages correctly from the newest end.
+    #[test]
+    fn large_log_is_queried_from_the_newest_end() {
+        let path = fresh("large");
+        let mut payload = String::new();
+        for n in 0..20_000u64 {
+            let repo = if n % 2 == 0 { "org/even" } else { "org/odd" };
+            let entry = merged(repo, n, "2026-09-01T00:00:00Z");
+            payload.push_str(&serde_json::to_string(&entry).unwrap());
+            payload.push('\n');
+        }
+        std::fs::write(&path, payload).unwrap();
+
+        assert_eq!(query(&path, None, 0).unwrap().len(), 20_000);
+        assert_eq!(
+            numbers(&query(&path, None, 3).unwrap()),
+            [19_999, 19_998, 19_997]
+        );
+        assert_eq!(
+            numbers(&query(&path, Some("org/even"), 2).unwrap()),
+            [19_998, 19_996]
+        );
+        assert_eq!(query(&path, Some("org/odd"), 0).unwrap().len(), 10_000);
+    }
+
+    /// Retention is by calendar day (UTC): an entry exactly `days` days old
+    /// is kept, one a day older goes. A window of 0 keeps only today's.
+    #[test]
+    fn compact_keeps_the_boundary_day_and_drops_the_day_before() {
+        let path = fresh("compact-boundary");
+        // Noon today: whole-day offsets from it cannot straddle a date line.
+        let noon = Utc::now()
+            .date_naive()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc();
+        let at = |days: i64| (noon - chrono::TimeDelta::try_days(days).unwrap()).to_rfc3339();
+        append(&path, &merged("org/one", 91, &at(91))).unwrap();
+        append(&path, &merged("org/one", 90, &at(90))).unwrap();
+        append(&path, &merged("org/one", 1, &at(1))).unwrap();
+        append(&path, &merged("org/one", 0, &at(0))).unwrap();
+
+        assert_eq!(
+            compact(&path, 90).unwrap(),
+            Compaction {
+                kept: 3,
+                removed: 1
+            }
+        );
+        assert_eq!(numbers(&query(&path, None, 0).unwrap()), [0, 1, 90]);
+
+        assert_eq!(
+            compact(&path, 0).unwrap(),
+            Compaction {
+                kept: 1,
+                removed: 2
+            }
+        );
+        assert_eq!(numbers(&query(&path, None, 0).unwrap()), [0]);
+    }
+
+    /// Kept lines are copied byte for byte (a field written by a newer prx
+    /// survives an older prx's compaction), a file with nothing to drop is
+    /// not rewritten, and dropping everything leaves an empty file behind.
+    #[test]
+    fn compact_keeps_lines_verbatim_and_leaves_a_clean_file_alone() {
+        let path = fresh("compact-verbatim");
+        let today = Utc::now().to_rfc3339();
+        let newer = format!(
+            r#"{{"event":"pr_closed","ts":"{today}","repo":"org/one","number":5,"title":"t","author":"a","added_later":{{"x":1}}}}"#
+        );
+        let old = r#"{"event":"pr_closed","ts":"2020-01-01T00:00:00Z","repo":"org/one","number":4,"title":"t","author":"a"}"#;
+        std::fs::write(&path, format!("{old}\n\n{newer}\n")).unwrap();
+
+        assert_eq!(
+            compact(&path, 90).unwrap(),
+            Compaction {
+                kept: 1,
+                removed: 1
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{newer}\n")
+        );
+
+        // Nothing to remove (blank lines do not count): the bytes stay put.
+        let untouched = format!("\n{newer}\n\n");
+        std::fs::write(&path, &untouched).unwrap();
+        assert_eq!(
+            compact(&path, 90).unwrap(),
+            Compaction {
+                kept: 1,
+                removed: 0
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), untouched);
+
+        // Everything expired: an empty file, not a lone newline.
+        std::fs::write(&path, format!("{old}\n")).unwrap();
+        assert_eq!(
+            compact(&path, 90).unwrap(),
+            Compaction {
+                kept: 0,
+                removed: 1
+            }
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        assert!(query(&path, None, 0).unwrap().is_empty());
+    }
+
+    /// A retention window too large for a date (`u64::MAX` days) keeps
+    /// everything instead of overflowing.
+    #[test]
+    fn compact_with_an_unrepresentable_window_keeps_everything() {
+        let path = fresh("compact-huge");
+        append(&path, &merged("org/one", 1, "1999-01-01T00:00:00Z")).unwrap();
+        for days in [u64::MAX, i64::MAX as u64, 400_000_000] {
+            assert_eq!(
+                compact(&path, days).unwrap(),
+                Compaction {
+                    kept: 1,
+                    removed: 0
+                },
+                "{days} days"
+            );
+        }
+    }
+
+    /// `set_review_brief` rewrites only its one line: corrupt and blank
+    /// lines around it come through untouched, `since` is inclusive, the
+    /// newest of several matching reviews is the one updated, and no temp
+    /// file is left behind.
+    #[test]
+    fn set_review_brief_touches_one_line_and_keeps_the_rest_of_the_file() {
+        let path = fresh("brief-rest");
+        let at = |ts: &str| {
+            HistoryEntry::from_effect(
+                &HistoryEvent::ReviewCompleted {
+                    verdict: Verdict::Approved,
+                    blocking_count: 0,
+                    nit_count: 0,
+                },
+                &rec(),
+                Some("claude"),
+                None,
+                Vec::new(),
+                ts.parse().unwrap(),
+            )
+        };
+        let first = serde_json::to_string(&at("2026-09-01T10:00:00Z")).unwrap();
+        let second = serde_json::to_string(&at("2026-09-01T11:00:00Z")).unwrap();
+        std::fs::write(&path, format!("{first}\n{{corrupt\n\n{second}\n")).unwrap();
+
+        // `since` equal to the newest review's timestamp still matches it.
+        let since: DateTime<Utc> = "2026-09-01T11:00:00Z".parse().unwrap();
+        assert!(set_review_brief(&path, "org/one", 7, since, Some("newest"), None).unwrap());
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 4, "{raw}");
+        assert_eq!(&lines[..3], [first.as_str(), "{corrupt", ""]);
+        assert!(lines[3].contains(r#""brief":"newest""#), "{raw}");
+
+        // A second past the newest review: nothing matches, nothing changes.
+        let after = since + chrono::TimeDelta::try_seconds(1).unwrap();
+        assert!(!set_review_brief(&path, "org/one", 7, after, Some("x"), None).unwrap());
+        // Neither does a call with nothing to set, or a missing file.
+        assert!(!set_review_brief(&path, "org/one", 7, since, None, None).unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        let missing = path.with_file_name("absent.jsonl");
+        assert!(!set_review_brief(&missing, "org/one", 7, since, Some("x"), None).unwrap());
+        assert!(!missing.exists());
+
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".summary."))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// An event kind this build does not know (written by a newer prx) and a
+    /// line missing a required field are skipped; the rest still reads.
+    #[test]
+    fn unknown_event_kinds_and_incomplete_lines_are_skipped() {
+        let path = fresh("unknown-kind");
+        let good = serde_json::to_string(&merged("org/one", 1, "2026-09-01T00:00:00Z")).unwrap();
+        let unknown = r#"{"event":"pr_reopened","ts":"2026-09-02T00:00:00Z","repo":"org/one","number":2,"title":"t","author":"a"}"#;
+        let no_verdict = r#"{"event":"review_completed","ts":"2026-09-03T00:00:00Z","repo":"org/one","number":3,"title":"t","author":"a","blocking_count":0,"nit_count":0}"#;
+        let no_ts = r#"{"event":"pr_merged","repo":"org/one","number":4,"title":"t","author":"a"}"#;
+        std::fs::write(&path, format!("{unknown}\n{no_verdict}\n{no_ts}\n{good}\n")).unwrap();
+        assert_eq!(numbers(&query(&path, None, 0).unwrap()), [1]);
+    }
+
+    /// I/O failures name the history file instead of panicking or reading
+    /// as "no history".
+    #[test]
+    fn io_failures_are_errors_that_name_the_file() {
+        let base = dir("io-errors");
+        // The parent "directory" is a regular file: nothing can be created.
+        let blocker = base.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let under_file = blocker.join("history.jsonl");
+        let err = append(&under_file, &merged("org/one", 1, "2026-09-01T00:00:00Z")).unwrap_err();
+        assert!(matches!(err, HistoryError::Write { .. }), "{err}");
+        assert!(err.to_string().contains("blocker"), "{err}");
+
+        // The history path is a directory: it exists but cannot be read.
+        let a_dir = base.join("history.jsonl.d");
+        std::fs::create_dir_all(&a_dir).unwrap();
+        for err in [
+            query(&a_dir, None, 0).unwrap_err(),
+            compact(&a_dir, 90).unwrap_err(),
+        ] {
+            assert!(matches!(err, HistoryError::Read { .. }), "{err}");
+            assert!(err.to_string().contains("history.jsonl.d"), "{err}");
+        }
     }
 }

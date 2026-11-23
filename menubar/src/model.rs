@@ -101,6 +101,8 @@ pub const START_DAEMON_ID: &str = "daemon-start";
 /// Open the newest daemon log in Console (offline menu; online, the ⌥
 /// alternate of Open PRX and the version-mismatch health line).
 pub const SHOW_LOG_ID: &str = "daemon-log";
+/// The poll-health line: stop the running daemon and start a fresh one.
+pub const RESTART_DAEMON_ID: &str = "daemon-restart";
 
 /// The PRX app's own version (the headline's ⌥ diagnostics line; the
 /// daemon reports its own).
@@ -186,6 +188,8 @@ pub struct ModelItem {
     pub symbol: Option<Symbol>,
     /// Key equivalent shown at the row's trailing edge.
     pub shortcut: Option<Shortcut>,
+    /// `NSMenuItem.toolTip`: the brief preview's full brief.
+    pub tooltip: Option<String>,
     pub children: Vec<ModelItem>,
 }
 
@@ -206,6 +210,7 @@ impl ModelItem {
             indent: 0,
             symbol: None,
             shortcut: None,
+            tooltip: None,
             children: Vec::new(),
         }
     }
@@ -227,6 +232,7 @@ impl ModelItem {
             indent: 0,
             symbol: None,
             shortcut: None,
+            tooltip: None,
             children,
         }
     }
@@ -249,6 +255,12 @@ impl ModelItem {
     /// This item with a key equivalent.
     fn with_shortcut(mut self, shortcut: Shortcut) -> ModelItem {
         self.shortcut = Some(shortcut);
+        self
+    }
+
+    /// This item with a tooltip.
+    fn with_tooltip(mut self, tooltip: impl Into<String>) -> ModelItem {
+        self.tooltip = Some(tooltip.into());
         self
     }
 
@@ -479,6 +491,10 @@ pub struct MenuModel {
     pub stopped: bool,
     /// A daemon-wide pause is active (also the icon's paused variant).
     pub paused: bool,
+    /// Ready / blocked PRs not opened yet (`notifications.menubar_bell`;
+    /// drives the icon's bell badge and the title's `✓N ✕N`). The app sets
+    /// it from its [`crate::bell::BellTracker`] after building the model.
+    pub bell: crate::bell::BellCounts,
     pub sections: Vec<MenuSection>,
 }
 
@@ -826,7 +842,7 @@ pub fn build_model(
         .with_symbol(status_symbol),
         diagnostics_item(status, now),
     ];
-    if let Some(health) = health_item(status) {
+    if let Some(health) = health_item(status, now) {
         top.push(health);
     }
 
@@ -1007,6 +1023,7 @@ pub fn build_model(
         in_flight: status.in_flight,
         stopped: off,
         paused: pause_left.is_some(),
+        bell: crate::bell::BellCounts::default(),
         sections,
     }
 }
@@ -1053,13 +1070,18 @@ fn diagnostics_item(status: &StatusResponse, now: DateTime<Utc>) -> ModelItem {
 
 /// Menu length of the config-error message in the health line.
 const CONFIG_ERROR_MENU_CHARS: usize = 60;
+/// Menu length of the poll error in the health line.
+const POLL_ERROR_MENU_CHARS: usize = 70;
 
 /// The header's health line, present only when the running daemon is not
 /// healthy, and always carrying its fix: a config.yml the daemon could not
 /// load (it runs on the last good one) opens the raw config; a daemon whose
 /// version differs from the app's (a stale build still running) opens its
-/// log.
-fn health_item(status: &StatusResponse) -> Option<ModelItem> {
+/// log; polls that keep failing (see [`prx::health`]) restart the daemon,
+/// the fix for a daemon whose session went stale; a saved setting that
+/// applies only after a restart (`restart_required`) offers the same
+/// restart.
+fn health_item(status: &StatusResponse, now: DateTime<Utc>) -> Option<ModelItem> {
     if let Some(error) = &status.config_error {
         return Some(
             ModelItem::new(
@@ -1070,6 +1092,26 @@ fn health_item(status: &StatusResponse) -> Option<ModelItem> {
                 ),
                 true,
                 ItemKind::Action,
+            )
+            .with_symbol(Symbol::Warning),
+        );
+    }
+    let thresholds = prx::health::HealthThresholds::default();
+    if let Some(warning) = prx::health::sync_warning(&status.poll_health, &thresholds) {
+        let since = warning
+            .since
+            .map(|at| format!(" {}", prx::health::format_age(now - at)))
+            .unwrap_or_default();
+        return Some(
+            ModelItem::new(
+                RESTART_DAEMON_ID,
+                format!(
+                    "Sync failing{since} ({}): {} \u{2014} Restart daemon",
+                    warning.repos_label(),
+                    prx::health::truncate_chars(&warning.error, POLL_ERROR_MENU_CHARS)
+                ),
+                true,
+                ItemKind::Supervise,
             )
             .with_symbol(Symbol::Warning),
         );
@@ -1086,6 +1128,22 @@ fn health_item(status: &StatusResponse) -> Option<ModelItem> {
                 ItemKind::Supervise,
             )
             .with_symbol(Symbol::Warning),
+        );
+    }
+    // A saved setting that waits for a restart (`restart_required`, e.g.
+    // `max_concurrent_reviews`): the same restart the sync line offers.
+    if !status.config_state.restart_required.is_empty() {
+        return Some(
+            ModelItem::new(
+                RESTART_DAEMON_ID,
+                format!(
+                    "Restart daemon to apply {}",
+                    status.config_state.restart_required.join(", ")
+                ),
+                true,
+                ItemKind::Supervise,
+            )
+            .with_symbol(Symbol::Info),
         );
     }
     None
@@ -1167,6 +1225,7 @@ pub fn offline_model_for(daemon: &DaemonState) -> MenuModel {
         in_flight: 0,
         stopped: false,
         paused: false,
+        bell: crate::bell::BellCounts::default(),
         sections: vec![
             MenuSection { items: top },
             MenuSection { items: supervise },
@@ -1438,9 +1497,23 @@ fn pr_item(entry: &StatusEntry, engines: &[String], now: DateTime<Utc>) -> Model
     } else {
         (actions::BLOCK_PREFIX, "Block (request changes)\u{2026}")
     };
+    // The PR details page in the app window (spec "PR details page"): the
+    // brief and latest review in readable text. A read, so always enabled.
+    let details = ModelItem::new(
+        format!("{}|{key}", actions::DETAILS_PREFIX),
+        "Show details\u{2026}",
+        true,
+        ItemKind::Action,
+    );
     // Grouped by separators: open · brief · review runs · your verdict on
     // GitHub · hide it for a while.
-    let mut children = vec![open];
+    let mut children = vec![open, details];
+    // Why prx is not reviewing it, in full (the row's summary is capped).
+    if let Some(line) = skip_line(entry) {
+        children.push(ModelItem::separator());
+        children
+            .push(ModelItem::info(format!("info|skip|{key}"), &line).with_symbol(Symbol::Skipped));
+    }
     let brief = brief_items(entry, now);
     if !brief.is_empty() {
         children.push(ModelItem::separator());
@@ -1486,6 +1559,14 @@ fn pr_item(entry: &StatusEntry, engines: &[String], now: DateTime<Utc>) -> Model
         action(
             format!("{}|{key}", actions::REVIEW_PROMPT_PREFIX),
             "Review with prompt…",
+        ),
+        // Review Chat: an interactive agent session in a terminal; no
+        // daemon mutation, so merged and closed PRs keep it too.
+        ModelItem::new(
+            format!("{}|{key}", actions::CHAT_PREFIX),
+            "Open Review Chat\u{2026}",
+            true,
+            ItemKind::Action,
         ),
         ModelItem::separator(),
         action(
@@ -1545,15 +1626,18 @@ fn pr_number(key: &str) -> &str {
     key.rsplit_once('#').map(|(_, n)| n).unwrap_or(key)
 }
 
-/// Menu length of the drill-down's brief line (design D11: "about 200
-/// characters"; the full text is copied on demand).
-pub const SUMMARY_MENU_CHARS: usize = 200;
+/// Menu length of the drill-down's brief preview: short enough to keep the
+/// submenu narrow, since the full brief is the line's tooltip and a click
+/// away on the PR details page (spec "Brief in the menu opens the details
+/// page").
+pub const SUMMARY_MENU_CHARS: usize = 100;
 
 /// Menu length of the drill-down's "Brief failed: …" line.
 const BRIEF_ERROR_MENU_CHARS: usize = 80;
 
 /// The drill-down's brief block (task 4.1, spec "Brief in the menu bar"):
-/// with a brief, the verdict line, the brief on one line, "updated <age>"
+/// with a brief, the verdict line, a preview of the brief (enabled: opens
+/// the PR details page; tooltip: the whole brief), "updated <age>"
 /// (plus "· stale"), "Copy brief" and "Regenerate brief"; without one,
 /// "Write brief" when the repo can have briefs. While a brief is being
 /// written the action is disabled and reads "Writing brief…"; after a
@@ -1569,10 +1653,17 @@ fn brief_items(entry: &StatusEntry, now: DateTime<Utc>) -> Vec<ModelItem> {
             ModelItem::info(format!("info|verdict|{key}"), verdict_line(entry))
                 .with_symbol(verdict_symbol(entry.last_verdict)),
         );
-        items.push(ModelItem::info(
-            format!("info|brief|{key}"),
-            truncate_summary(&brief.text, SUMMARY_MENU_CHARS),
-        ));
+        // An enabled line (readable, not greyed out) whose click opens the
+        // PR details page; the tooltip holds the whole brief.
+        items.push(
+            ModelItem::new(
+                format!("{}|{key}", actions::READ_BRIEF_PREFIX),
+                truncate_summary(&brief.text, SUMMARY_MENU_CHARS),
+                true,
+                ItemKind::Action,
+            )
+            .with_tooltip(brief.text.trim()),
+        );
         let mut age = format!("updated {} ago", compact_age(brief.updated_at, now));
         if brief.stale {
             age.push_str(" \u{b7} stale");
@@ -1649,6 +1740,14 @@ fn verdict_line(entry: &StatusEntry) -> String {
 /// `{key} · {author} · {age} — {title} — {summary}` (design D8); the state
 /// is the row's symbol ([`pr_symbol`]), not an emoji in the text. The age
 /// segment is omitted when the payload carries no `created_at`.
+/// The PR submenu's skip line: `Skipped — <detail>` from the daemon's
+/// `skip_detail` (absent from older daemons, and when nothing holds the PR
+/// back).
+pub fn skip_line(entry: &StatusEntry) -> Option<String> {
+    let detail = entry.skip_detail.as_deref()?.trim();
+    (!detail.is_empty()).then(|| format!("Skipped \u{2014} {detail}"))
+}
+
 fn pr_label(entry: &StatusEntry, now: DateTime<Utc>) -> String {
     let mut head = format!("{} · {}", entry.key, entry.author);
     if let Some(age) = entry.created_at.map(|at| compact_age(at, now)) {
@@ -1661,11 +1760,12 @@ fn pr_label(entry: &StatusEntry, now: DateTime<Utc>) -> String {
         truncate_summary(&entry.title, PR_TITLE_MENU_CHARS)
     );
     if !entry.summary.trim().is_empty() {
-        let _ = write!(
-            label,
-            " — {}",
-            truncate_summary(&entry.summary, PR_SUMMARY_MENU_CHARS)
-        );
+        // A skip reason is the row's whole point: give it more room.
+        let cap = match entry.skip_detail {
+            Some(_) => PR_SKIP_SUMMARY_MENU_CHARS,
+            None => PR_SUMMARY_MENU_CHARS,
+        };
+        let _ = write!(label, " — {}", truncate_summary(&entry.summary, cap));
     }
     label
 }
@@ -1673,6 +1773,8 @@ fn pr_label(entry: &StatusEntry, now: DateTime<Utc>) -> String {
 /// Menu lengths of a PR row's title and summary segments.
 const PR_TITLE_MENU_CHARS: usize = 48;
 const PR_SUMMARY_MENU_CHARS: usize = 36;
+/// A skipped row's summary (`Skipped — 2,140 lines changed (limit 1,500)`).
+const PR_SKIP_SUMMARY_MENU_CHARS: usize = 56;
 
 /// Compact elapsed time since `since`: minutes under an hour (at least
 /// `1m`), hours under a day, days under a week, weeks beyond. A `since` in
@@ -1735,6 +1837,8 @@ fn history_symbol(entry: &HistoryEntry) -> Symbol {
         HistoryEntry::NewCommits { .. } => Symbol::ReReview,
         HistoryEntry::Brief { brief: Some(_), .. } => Symbol::Brief,
         HistoryEntry::Brief { brief: None, .. } => Symbol::Failed,
+        HistoryEntry::NewPr { .. } => Symbol::NeedsReview,
+        HistoryEntry::Unknown => Symbol::Info,
     }
 }
 
@@ -1773,6 +1877,8 @@ fn history_line(entry: &HistoryEntry, now: DateTime<Utc>) -> String {
         HistoryEntry::NewCommits { .. } => "New commits — re-review pending".to_string(),
         HistoryEntry::Brief { brief: Some(_), .. } => "Brief written".to_string(),
         HistoryEntry::Brief { brief: None, .. } => "Brief failed".to_string(),
+        HistoryEntry::NewPr { .. } => "New PR".to_string(),
+        HistoryEntry::Unknown => "Unknown event".to_string(),
     };
     format!(
         "{}#{} — {} \u{b7} {} ago",
@@ -1815,6 +1921,7 @@ mod tests {
             icon: "•".to_string(),
             state,
             skip_reason,
+            skip_detail: None,
             title: title.to_string(),
             author: "alice".to_string(),
             head_branch: "f/x".to_string(),
@@ -1865,7 +1972,105 @@ mod tests {
             paused_until: None,
             engines: vec![],
             menu: Default::default(),
+            config_state: Default::default(),
+            poll_health: Default::default(),
+            restart_recommended: false,
         }
+    }
+
+    /// Polls that keep failing get the health line (under a config error,
+    /// above a version mismatch); its click restarts the daemon. Two failed
+    /// polls are not enough, and a successful poll clears it.
+    #[test]
+    fn failing_polls_add_a_restart_line_to_the_header() {
+        use prx::health::RepoPollHealth;
+        let mut payload = status(vec![]);
+        payload.version = "9.9.9".into();
+        let mut failing = RepoPollHealth::default();
+        let start = now() - chrono::Duration::hours(3);
+        failing.record_failure(start, "gh command failed (gh pr list): tls: failed to verify certificate: x509: OSStatus -26276");
+        failing.record_failure(
+            start + chrono::Duration::minutes(15),
+            "tls: failed to verify certificate: x509: OSStatus -26276",
+        );
+        payload
+            .poll_health
+            .insert("org/one".into(), failing.clone());
+        let model = build(&payload, &[]);
+        assert_eq!(
+            model.sections[0].items[2].id, SHOW_LOG_ID,
+            "two failures: no warning yet"
+        );
+
+        failing.record_failure(
+            start + chrono::Duration::minutes(30),
+            "tls: failed to verify certificate: x509: OSStatus -26276",
+        );
+        payload.poll_health.insert("org/one".into(), failing);
+        let model = build(&payload, &[]);
+        let line = &model.sections[0].items[2];
+        assert_eq!(
+            (line.id.as_str(), line.enabled, line.kind, line.symbol),
+            (
+                RESTART_DAEMON_ID,
+                true,
+                ItemKind::Supervise,
+                Some(Symbol::Warning)
+            )
+        );
+        assert_eq!(
+            line.label,
+            "Sync failing 3h 0m (org/one): tls: failed to verify certificate: x509: OSStatus -26276 \u{2014} Restart daemon"
+        );
+
+        payload.config_error = Some(prx::ipc::ConfigErrorInfo {
+            message: "bad".into(),
+            at: now(),
+        });
+        assert_eq!(
+            build(&payload, &[]).sections[0].items[2].id,
+            actions::OPEN_CONFIG_ID
+        );
+        payload.config_error = None;
+
+        let mut synced = RepoPollHealth::default();
+        synced.record_success(now());
+        payload.poll_health.insert("org/one".into(), synced);
+        payload.version = APP_VERSION.into();
+        let healthy = build(&payload, &[]);
+        assert!(healthy.items().all(|i| i.id != RESTART_DAEMON_ID));
+    }
+
+    /// A saved setting that waits for a daemon restart (config-reload's
+    /// `restart_required`) offers the same restart as the sync line, below
+    /// every warning.
+    #[test]
+    fn restart_required_offers_the_daemon_restart() {
+        let mut payload = status(vec![]);
+        payload.version = APP_VERSION.into();
+        payload.config_state.restart_required = vec!["max_concurrent_reviews".into()];
+        let model = build(&payload, &[]);
+        let line = model
+            .items()
+            .find(|i| i.id == RESTART_DAEMON_ID)
+            .expect("restart line");
+        assert_eq!(line.label, "Restart daemon to apply max_concurrent_reviews");
+        assert_eq!(
+            (line.enabled, line.kind, line.symbol),
+            (true, ItemKind::Supervise, Some(Symbol::Info))
+        );
+
+        // A version mismatch outranks it (one health line at a time).
+        payload.version = "9.9.9".into();
+        let model = build(&payload, &[]);
+        assert!(model.items().any(|i| i.id == SHOW_LOG_ID));
+        assert!(model.items().all(|i| i.id != RESTART_DAEMON_ID));
+
+        payload.version = APP_VERSION.into();
+        payload.config_state.restart_required.clear();
+        assert!(build(&payload, &[])
+            .items()
+            .all(|i| i.id != RESTART_DAEMON_ID));
     }
 
     fn history_entry(repo: &str, number: u64) -> HistoryEntry {
@@ -1907,8 +2112,11 @@ mod tests {
             blocking_count: 0,
             nit_count: 0,
             review_session: None,
+            review_session_info: None,
+            last_manifest: None,
             review_attempts: 0,
             diff_too_large: false,
+            skip_detail: None,
             human_approved_at: None,
             exec_summary: None,
             brief: None,
@@ -2249,6 +2457,37 @@ mod tests {
         assert_eq!(open.label, "Open in GitHub");
     }
 
+    /// "Open Review Chat…" sits with the review actions and stays enabled
+    /// on merged PRs (it mutates nothing), unlike the daemon actions.
+    #[test]
+    fn review_chat_item_is_offered_on_every_pr() {
+        let model = build(
+            &status(vec![
+                entry("org/repo#1", PrState::Pending, "open one", "ready"),
+                entry("org/repo#2", PrState::Merged, "merged one", "merged"),
+            ]),
+            &[],
+        );
+        for key in ["org/repo#1", "org/repo#2"] {
+            let row = find(&model, &format!("pr|{key}")).expect("row");
+            let chat = row
+                .children
+                .iter()
+                .find(|c| c.id == format!("chat|{key}"))
+                .expect("chat item");
+            assert_eq!(chat.label, "Open Review Chat\u{2026}");
+            assert_eq!(chat.kind, ItemKind::Action);
+            assert!(chat.enabled, "{key}");
+        }
+        let merged = find(&model, "pr|org/repo#2").unwrap();
+        let review = merged
+            .children
+            .iter()
+            .find(|c| c.id == "review|org/repo#2")
+            .unwrap();
+        assert!(!review.enabled);
+    }
+
     #[test]
     fn every_pr_row_offers_the_full_action_submenu() {
         let model = build(
@@ -2269,12 +2508,14 @@ mod tests {
             ids,
             vec![
                 "open|org/repo#13",
+                "details|org/repo#13",
                 "separator",
                 "brief|org/repo#13",
                 "separator",
                 "review|org/repo#13",
                 "review-nopost|org/repo#13",
                 "review-prompt|org/repo#13",
+                "chat|org/repo#13",
                 "separator",
                 "approve|org/repo#13",
                 "block|org/repo#13",
@@ -2282,10 +2523,10 @@ mod tests {
                 "snooze",
                 "ignore|org/repo#13",
             ],
-            "open / write brief / review / no-post / prompt / approve / block / snooze / \
-             ignore (no engine list: no Review with)"
+            "open / details / write brief / review / no-post / prompt / chat / approve / block / \
+             snooze / ignore (no engine list: no Review with)"
         );
-        let snooze = &row.children[11];
+        let snooze = &row.children[13];
         assert_eq!(
             snooze
                 .children
@@ -2304,6 +2545,72 @@ mod tests {
             .children
             .iter()
             .all(|c| c.enabled || c.kind == ItemKind::Separator));
+    }
+
+    /// A skipped row says why, concisely: the summary gets more room than a
+    /// verdict summary, and the submenu repeats the full reason as a
+    /// disabled line after "Open in GitHub". Older daemons send no detail:
+    /// no extra line.
+    #[test]
+    fn skipped_rows_say_why() {
+        let mut capped = entry(
+            "org/repo#7",
+            PrState::Pending,
+            "big change",
+            "Skipped \u{2014} 2,140 lines changed (limit 1,500)",
+        );
+        capped.skip_detail = Some("2,140 lines changed (limit 1,500)".into());
+        let mut rule = entry(
+            "org/repo#8",
+            PrState::Skipped,
+            "bump deps",
+            "Skipped \u{2014} author dependabot[bot] excluded",
+        );
+        rule.skip_reason = Some(SkipReason::Config);
+        rule.skip_detail = Some("author dependabot[bot] excluded".into());
+        let old = entry("org/repo#9", PrState::Skipped, "old", "skipped: config");
+
+        let model = build(&status(vec![capped, rule, old]), &[]);
+        let row = |key: &str| {
+            model
+                .items()
+                .find(|i| i.kind == ItemKind::Pr && i.id.ends_with(key))
+                .unwrap_or_else(|| panic!("{key}"))
+                .clone()
+        };
+        let capped = row("org/repo#7");
+        assert!(
+            capped
+                .label
+                .ends_with(" — Skipped \u{2014} 2,140 lines changed (limit 1,500)"),
+            "{}",
+            capped.label
+        );
+        // Open in GitHub, Show details…, then the skip line in its own group.
+        assert_eq!(capped.children[2].kind, ItemKind::Separator);
+        let line = &capped.children[3];
+        assert_eq!(line.id, "info|skip|org/repo#7");
+        assert_eq!(
+            line.label,
+            "Skipped \u{2014} 2,140 lines changed (limit 1,500)"
+        );
+        assert!(!line.enabled);
+
+        let rule = row("org/repo#8");
+        assert!(
+            rule.label
+                .ends_with(" — Skipped \u{2014} author dependabot[bot] excluded"),
+            "{}",
+            rule.label
+        );
+        assert!(rule
+            .children
+            .iter()
+            .any(|c| c.label == "Skipped \u{2014} author dependabot[bot] excluded"));
+
+        let old = row("org/repo#9");
+        assert!(!old.children.iter().any(|c| c.id.starts_with("info|skip|")));
+        assert!(old.label.ends_with(" — skipped: config"), "{}", old.label);
     }
 
     #[test]
@@ -2385,8 +2692,14 @@ mod tests {
         // Briefs work in any tracked state (task 4.1): Write brief too.
         let write = format!("{}|org/repo#9", actions::BRIEF_PREFIX);
         assert!(row.children.iter().any(|c| c.id == write && c.enabled));
+        // Show details is a read too.
+        let details = format!("{}|org/repo#9", actions::DETAILS_PREFIX);
+        assert!(row.children.iter().any(|c| c.id == details && c.enabled));
+        // Review Chat mutates nothing either.
+        let chat = format!("{}|org/repo#9", actions::CHAT_PREFIX);
+        assert!(row.children.iter().any(|c| c.id == chat && c.enabled));
         for child in &row.children {
-            if child.id != open.id && child.id != write {
+            if child.id != open.id && child.id != write && child.id != details && child.id != chat {
                 assert!(!child.enabled, "{} must be disabled on terminal", child.id);
             }
             for grandchild in &child.children {
@@ -3152,8 +3465,10 @@ mod tests {
     }
 
     /// Task 4.1: with a brief the drill-down shows the verdict line, the
-    /// brief truncated to one ~200-char line, "updated <age>", "Copy brief"
-    /// and "Regenerate brief" (all enabled, terminal PRs included).
+    /// brief as a ~100-char preview, "updated <age>", "Copy brief" and
+    /// "Regenerate brief" (all enabled, terminal PRs included). Spec "Brief
+    /// in the menu opens the details page": the preview is an enabled item
+    /// that opens the PR details page, with the whole brief as its tooltip.
     #[test]
     fn drill_down_shows_the_brief_with_copy_and_regenerate() {
         let long = format!("First line.\n\n{}", "lorem ipsum ".repeat(40));
@@ -3169,22 +3484,31 @@ mod tests {
         let model = build(&status(vec![with, merged]), &[]);
 
         assert_eq!(
-            &child_ids(&model, "pr|o/r#3")[..6],
+            &child_ids(&model, "pr|o/r#3")[..7],
             [
                 "open|o/r#3",
+                "details|o/r#3",
                 "info|verdict|o/r#3",
-                "info|brief|o/r#3",
+                "read-brief|o/r#3",
                 "info|brief-age|o/r#3",
                 "copy-brief|o/r#3",
                 "brief|o/r#3",
             ]
         );
         let row = find(&model, "pr|o/r#3").unwrap();
-        assert_eq!(row.children[1].kind, ItemKind::Separator, "open · brief");
-        assert_eq!(row.children[2].label, "Approved · 1 blocking · 2 nits");
-        let line = &row.children[3];
-        assert_eq!(line.kind, ItemKind::Info);
-        assert!(!line.enabled);
+        assert_eq!(row.children[1].label, "Show details\u{2026}");
+        assert!(row.children[1].enabled && row.children[1].tooltip.is_none());
+        assert_eq!(row.children[2].kind, ItemKind::Separator, "open · brief");
+        assert_eq!(row.children[3].label, "Approved · 1 blocking · 2 nits");
+        let line = &row.children[4];
+        assert_eq!(line.kind, ItemKind::Action);
+        assert!(line.enabled);
+        assert_eq!(line.tooltip.as_deref(), Some(long.trim()));
+        assert_eq!(
+            actions::details_key(&line.id),
+            Some("o/r#3"),
+            "the preview opens the details page"
+        );
         assert_eq!(line.label.chars().count(), SUMMARY_MENU_CHARS);
         assert!(
             line.label.starts_with("First line. lorem ipsum"),
@@ -3193,18 +3517,18 @@ mod tests {
         );
         assert!(line.label.ends_with('\u{2026}'));
         assert!(!line.label.contains('\n'));
-        assert_eq!(row.children[4].label, "updated 2h ago");
-        let copy = &row.children[5];
+        assert_eq!(row.children[5].label, "updated 2h ago");
+        let copy = &row.children[6];
         assert_eq!(copy.label, "Copy brief");
         assert!(copy.enabled && copy.kind == ItemKind::Action);
-        let regenerate = &row.children[6];
+        let regenerate = &row.children[7];
         assert_eq!(regenerate.label, "Regenerate brief");
         assert!(regenerate.enabled && regenerate.kind == ItemKind::Action);
 
         // A short brief shows whole; Copy and Regenerate stay available on
         // terminal PRs (briefs work in any tracked state).
         assert_eq!(
-            find(&model, "info|brief|o/r#4").unwrap().label,
+            find(&model, "read-brief|o/r#4").unwrap().label,
             "Short brief."
         );
         assert_eq!(
@@ -3213,6 +3537,7 @@ mod tests {
         );
         assert!(find(&model, "copy-brief|o/r#4").unwrap().enabled);
         assert!(find(&model, "brief|o/r#4").unwrap().enabled);
+        assert!(find(&model, "read-brief|o/r#4").unwrap().enabled);
     }
 
     /// Task 4.1: a stale brief says so on its age line.
@@ -3249,12 +3574,12 @@ mod tests {
         assert_eq!(write.label, "Write brief");
         assert!(write.enabled && write.kind == ItemKind::Action);
         assert_eq!(
-            child_ids(&model, "pr|o/r#5")[..2],
-            ["open|o/r#5", "brief|o/r#5"]
+            child_ids(&model, "pr|o/r#5")[..3],
+            ["open|o/r#5", "details|o/r#5", "brief|o/r#5"]
         );
         for id in [
             "info|verdict|o/r#5",
-            "info|brief|o/r#5",
+            "read-brief|o/r#5",
             "info|brief-age|o/r#5",
             "copy-brief|o/r#5",
         ] {
@@ -3283,7 +3608,7 @@ mod tests {
         }
         // The previous brief stays visible (and copyable) meanwhile, and a
         // stale failure is not shown while a new run is under way.
-        assert_eq!(find(&model, "info|brief|o/r#4").unwrap().label, "Kept.");
+        assert_eq!(find(&model, "read-brief|o/r#4").unwrap().label, "Kept.");
         assert!(find(&model, "copy-brief|o/r#4").unwrap().enabled);
         assert!(find(&model, "info|brief-error|o/r#3").is_none());
     }
@@ -3646,10 +3971,10 @@ mod tests {
             .filter(|c| c.kind != ItemKind::Separator)
             .map(|c| c.id.as_str())
             .collect();
-        // After Open and the brief action (task 4.1).
-        assert_eq!(ids[1], "brief|o/r#7");
+        // After Open, Show details and the brief action (task 4.1).
+        assert_eq!(ids[2], "brief|o/r#7");
         assert_eq!(
-            &ids[2..6],
+            &ids[3..7],
             [
                 "review|o/r#7",
                 "review-with",
@@ -3664,7 +3989,7 @@ mod tests {
             .map(|c| c.label.as_str())
             .collect();
         assert_eq!(
-            &labels[2..6],
+            &labels[3..7],
             [
                 "Review",
                 "Review with",
@@ -3672,7 +3997,7 @@ mod tests {
                 "Review with prompt…"
             ]
         );
-        let with = &row.children[5];
+        let with = &row.children[6];
         let engines: Vec<(&str, &str)> = with
             .children
             .iter()

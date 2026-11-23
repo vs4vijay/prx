@@ -108,6 +108,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 Linux uses `-p prx` because the menu bar crate does not build there.
 
+`cargo fmt -- <files>` formats the whole workspace, not only the files named. To format one file,
+run `rustfmt --edition 2021 <file>`.
+
 ## Tests
 
 - **Pure unit tests** for the heart of the system: the state-machine transition table (every edge in
@@ -119,7 +122,13 @@ Linux uses `-p prx` because the menu bar crate does not build there.
   exit codes, sleeps for timeout testing) — no network, no real GitHub, no real agent. The fakes
   are driven by `FAKE_GH_*` and `FAKE_AGENT_*` environment variables. `PRX_CONFIG` /
   `PRX_DATA_DIR` redirect all state into per-test temp dirs, and `HOME` is redirected too. These
-  tests are Unix-only.
+  tests are Unix-only. The harness (`install_fake_gh` in `tests/common/mod.rs`) also puts
+  do-nothing `osascript` and `notify-send` next to the fake `gh`, so a test never raises a real
+  desktop banner; start daemons and raise notifications only through it.
+- **CLI tests** cover both paths of every command: `tests/cli_thin_client.rs` against a scripted
+  stand-in daemon, `tests/cli_fallback.rs` and `tests/cli_pause_paths.rs` with no daemon.
+- **Invariant tests** (`tests/review_invariants.rs`) run the real pipeline in-process against
+  recording doubles for `gh`, and show that no automated path approves, blocks, or dismisses.
 - **Daemon tests** spawn the actual detached daemon and exercise IPC round-trips, the
   single-instance guard, graceful stop, notification tiers, and log rotation.
 - **Hardening (chaos) tests**: agent crash mid-review (retry once, state stays reviewable), daemon
@@ -129,7 +138,11 @@ Linux uses `-p prx` because the menu bar crate does not build there.
   overwritten; history degrades gracefully line by line).
 - **Menu bar tests** (`cargo test -p prx-menubar`, macOS) cover the menu model, actions, clipboard,
   banners, and the settings bridge.
-- **Settings UI tests** (`menubar/settings-ui-tests/*.test.js`) run under `node --test`.
+- **Settings UI tests** (`menubar/settings-ui-tests/*.test.js`) run under `node --test`. Pure
+  helpers are tested directly. Pages are tested end to end: `fake-dom.js` loads the scripts
+  `index.html` lists into a small fake DOM with a fake daemon behind the bridge, and
+  `page-fixtures.js` holds the payloads and the helpers that drive a page. The fake DOM has no
+  HTML parser, so a page that builds markup from text fails its test.
 
 ## Working on the settings UI
 

@@ -16,6 +16,8 @@
 //! - [`IconState::Attention`]: a solid dot (the notification-dot idiom).
 //! - [`IconState::Reviewing`]: three small dots (work in progress).
 //! - [`IconState::Paused`]: pause bars (a pause, or review mode `off`).
+//! - [`IconState::Bell`]: a small bell (ready or blocked PRs not opened yet,
+//!   `notifications.menubar_bell`; drawn here only, not in the SVG master).
 //! - [`IconState::Offline`]: the mark dimmed, plus a slashed ring.
 //!
 //! The attention COUNT is not drawn into the glyph: it is the status item's
@@ -69,6 +71,19 @@ const RING_R: f64 = 3.25;
 const SLASH: [Pt; 2] = [(11.7, 11.7), (16.3, 16.3)];
 const OFFLINE_HALF_W: f64 = 0.625;
 const OFFLINE_MARK_ALPHA: f64 = 0.45;
+/// Bell: a dome (circle, upper half) over a flaring body, a rim bar, and a
+/// clapper below the rim. Everything stays within r = 4 of the badge center.
+const BELL_DOME: Pt = (14.0, 12.0);
+const BELL_DOME_R: f64 = 2.0;
+/// Body from the dome's center line down to the rim: half-width at top and
+/// bottom.
+const BELL_BODY_Y: (f64, f64) = (12.0, 15.2);
+const BELL_BODY_HALF_W: (f64, f64) = (2.0, 3.0);
+/// Rim `(x, y, w, h)`, corner radius 0.4.
+const BELL_RIM: (f64, f64, f64, f64) = (10.7, 15.1, 6.6, 0.9);
+const BELL_RIM_RADIUS: f64 = 0.4;
+const BELL_CLAPPER: Pt = (14.0, 17.0);
+const BELL_CLAPPER_R: f64 = 0.7;
 
 /// Largest count the title spells out; above it the title reads "99+".
 pub const MAX_TITLE_COUNT: usize = 99;
@@ -87,6 +102,8 @@ pub enum IconState {
     /// No automatic reviews right now: a daemon-wide pause, or review mode
     /// `off`. The menu header says which.
     Paused,
+    /// Ready or blocked PRs the user has not opened yet (the menu bar bell).
+    Bell,
     /// Daemon unreachable: dimmed mark with a slashed ring.
     Offline,
 }
@@ -94,14 +111,17 @@ pub enum IconState {
 impl IconState {
     /// The state for a menu model. Precedence: offline, then paused /
     /// stopped (nothing is reviewed automatically — the state the user
-    /// must not forget), then reviews in flight (so a running review is
-    /// visible even with attention pending; the count stays in the title),
-    /// then attention, else idle.
+    /// must not forget), then the bell (finished reviews the user has not
+    /// opened: news outranks work in progress), then reviews in flight (so
+    /// a running review is visible even with attention pending; the count
+    /// stays in the title), then attention, else idle.
     pub fn for_model(model: &crate::model::MenuModel) -> IconState {
         if model.offline {
             IconState::Offline
         } else if model.stopped || model.paused {
             IconState::Paused
+        } else if model.bell.total() > 0 {
+            IconState::Bell
         } else if model.in_flight > 0 {
             IconState::Reviewing
         } else if model.attention > 0 {
@@ -117,15 +137,32 @@ impl IconState {
 /// something needs attention, whatever the glyph state — a running review
 /// or a pause does not make the waiting PRs go away. Offline shows none:
 /// there is no fresh count to show.
+///
+/// The bell's counts follow the attention count: `✓N` for ready PRs and
+/// `✕N` for blocked ones not opened yet, each only when not zero
+/// (`"4 ✓2 ✕1"`, `"✓1"`).
 pub fn count_title(model: &crate::model::MenuModel) -> Option<String> {
-    if model.offline || model.attention == 0 {
+    if model.offline {
         return None;
     }
-    Some(if model.attention > MAX_TITLE_COUNT {
-        format!("{MAX_TITLE_COUNT}+")
-    } else {
-        model.attention.to_string()
-    })
+    let capped = |n: usize| {
+        if n > MAX_TITLE_COUNT {
+            format!("{MAX_TITLE_COUNT}+")
+        } else {
+            n.to_string()
+        }
+    };
+    let mut parts = Vec::new();
+    if model.attention > 0 {
+        parts.push(capped(model.attention));
+    }
+    if model.bell.ready > 0 {
+        parts.push(format!("\u{2713}{}", capped(model.bell.ready)));
+    }
+    if model.bell.blocked > 0 {
+        parts.push(format!("\u{2715}{}", capped(model.bell.blocked)));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// The status item's tooltip (also its accessibility help): the state in
@@ -136,10 +173,19 @@ pub fn tooltip(model: &crate::model::MenuModel) -> String {
         parts.push("daemon offline".into());
     } else {
         parts.push(match model.attention {
+            0 if model.bell.total() > 0 => String::new(),
             0 => "all clear".into(),
             1 => "1 PR needs attention".into(),
             n => format!("{n} PRs need attention"),
         });
+        let unopened = |n: usize, what: &str| match n {
+            0 => None,
+            1 => Some(format!("1 {what} PR not opened yet")),
+            n => Some(format!("{n} {what} PRs not opened yet")),
+        };
+        parts.extend(unopened(model.bell.ready, "ready"));
+        parts.extend(unopened(model.bell.blocked, "blocked"));
+        parts.retain(|part| !part.is_empty());
         if model.stopped {
             parts.push("reviews off".into());
         } else if model.paused {
@@ -204,6 +250,7 @@ fn sample(x: f64, y: f64, state: IconState) -> f64 {
             .iter()
             .any(|&(bx, by, w, h)| in_round_rect(x, y, (bx, by, w, h), BAR_RADIUS))
             || cut_mark()),
+        IconState::Bell => on(bell(p) || cut_mark()),
         IconState::Offline => {
             let ring = (dist(p, BADGE_CENTER) - RING_R).abs() <= OFFLINE_HALF_W;
             if ring || seg_dist(p, SLASH[0], SLASH[1]) <= OFFLINE_HALF_W {
@@ -215,6 +262,20 @@ fn sample(x: f64, y: f64, state: IconState) -> f64 {
             }
         }
     }
+}
+
+/// The bell badge: dome, flaring body, rim, and clapper.
+fn bell(p: Pt) -> bool {
+    let (x, y) = p;
+    let dome = y <= BELL_DOME.1 && dist(p, BELL_DOME) <= BELL_DOME_R;
+    let (top, bottom) = BELL_BODY_Y;
+    let body = (top..=bottom).contains(&y) && {
+        let t = (y - top) / (bottom - top);
+        let half = BELL_BODY_HALF_W.0 + t * (BELL_BODY_HALF_W.1 - BELL_BODY_HALF_W.0);
+        (x - BELL_DOME.0).abs() <= half
+    };
+    let rim = in_round_rect(x, y, BELL_RIM, BELL_RIM_RADIUS);
+    dome || body || rim || dist(p, BELL_CLAPPER) <= BELL_CLAPPER_R
 }
 
 /// The Verdict X; `lower` keeps the counter-stroke's lower segment (only the
@@ -348,7 +409,7 @@ pub fn apply_title(tray: &tray_icon::TrayIcon, title: Option<&str>, tooltip: &st
 mod tests {
     use super::*;
 
-    const ALL: [IconState; 5] = [Idle, Attention, Reviewing, Paused, Offline];
+    const ALL: [IconState; 6] = [Idle, Attention, Reviewing, Paused, Bell, Offline];
 
     fn pixels(rgba: &[u8]) -> &[[u8; 4]] {
         rgba.as_chunks::<4>().0
@@ -488,7 +549,7 @@ mod tests {
     /// band between the badge (r <= 4) and the knock-out (r = 5).
     #[test]
     fn badges_are_knocked_out_of_the_mark() {
-        for state in [Attention, Reviewing, Paused, Offline] {
+        for state in [Attention, Reviewing, Paused, Bell, Offline] {
             for i in 0..360 {
                 let a = f64::from(i).to_radians();
                 for r in [4.1, 4.5, 4.9] {
@@ -517,6 +578,14 @@ mod tests {
         assert_eq!(ink(Offline, (14.0, 14.0 - RING_R)), 1.0, "ring");
         assert_eq!(ink(Offline, (15.5, 12.5)), 0.0, "hollow");
         assert_eq!(ink(Attention, (15.5, 12.5)), 1.0, "solid");
+        // Bell: inked at the center, narrow at the top where the dot is
+        // round, and a gap between the rim and the clapper.
+        assert_eq!(ink(Bell, BADGE_CENTER), 1.0);
+        assert_eq!(ink(Bell, (11.5, 12.5)), 0.0, "narrow shoulders");
+        assert_eq!(ink(Attention, (11.5, 12.5)), 1.0);
+        assert_eq!(ink(Bell, (14.0, 16.15)), 0.0, "gap above the clapper");
+        assert_eq!(ink(Bell, BELL_CLAPPER), 1.0, "clapper");
+        assert_eq!(ink(Bell, (11.0, 15.5)), 1.0, "rim");
     }
 
     #[test]
@@ -624,8 +693,66 @@ mod tests {
             in_flight,
             stopped,
             paused,
+            bell: crate::bell::BellCounts::default(),
             sections: Vec::new(),
         }
+    }
+
+    fn with_bell(
+        mut model: crate::model::MenuModel,
+        ready: usize,
+        blocked: usize,
+    ) -> crate::model::MenuModel {
+        model.bell = crate::bell::BellCounts { ready, blocked };
+        model
+    }
+
+    #[test]
+    fn the_bell_shows_between_paused_and_reviewing() {
+        let online = model(false, false, false, 2, 3);
+        assert_eq!(IconState::for_model(&with_bell(online.clone(), 1, 0)), Bell);
+        assert_eq!(IconState::for_model(&with_bell(online, 0, 1)), Bell);
+        assert_eq!(
+            IconState::for_model(&with_bell(model(false, false, true, 0, 0), 1, 1)),
+            Paused
+        );
+        assert_eq!(
+            IconState::for_model(&with_bell(model(true, false, false, 0, 0), 1, 1)),
+            Offline
+        );
+    }
+
+    #[test]
+    fn count_title_adds_ready_and_blocked_counts() {
+        let title = |attention, ready, blocked| {
+            count_title(&with_bell(
+                model(false, false, false, 0, attention),
+                ready,
+                blocked,
+            ))
+        };
+        assert_eq!(title(4, 2, 1).as_deref(), Some("4 \u{2713}2 \u{2715}1"));
+        assert_eq!(title(0, 1, 0).as_deref(), Some("\u{2713}1"));
+        assert_eq!(title(3, 0, 2).as_deref(), Some("3 \u{2715}2"));
+        assert_eq!(title(0, 120, 0).as_deref(), Some("\u{2713}99+"));
+        assert_eq!(title(0, 0, 0), None);
+        assert_eq!(
+            count_title(&with_bell(model(true, false, false, 0, 0), 1, 1)),
+            None,
+            "offline: no stale count"
+        );
+    }
+
+    #[test]
+    fn tooltip_names_the_unopened_prs() {
+        assert_eq!(
+            tooltip(&with_bell(model(false, false, false, 0, 1), 2, 1)),
+            "PRX · 1 PR needs attention · 2 ready PRs not opened yet · 1 blocked PR not opened yet"
+        );
+        assert_eq!(
+            tooltip(&with_bell(model(false, false, false, 0, 0), 1, 0)),
+            "PRX · 1 ready PR not opened yet"
+        );
     }
 
     #[test]
@@ -707,5 +834,5 @@ mod tests {
         }
     }
 
-    use IconState::{Attention, Idle, Offline, Paused, Reviewing};
+    use IconState::{Attention, Bell, Idle, Offline, Paused, Reviewing};
 }

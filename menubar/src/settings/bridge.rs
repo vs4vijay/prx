@@ -13,7 +13,8 @@
 //!             {"id": 14, "method": "history.list",    "params": {"limit": 50, "repo": "o/r", "before": "<RFC3339>"}}
 //!             {"id": 15, "method": "usage.get",       "params": {"bucket": "week", "window": "30d", "group": "engine", "repo": "o/r"}}
 //!             {"id": 16, "method": "insights.get",    "params": {"days": 30, "repo": "o/r"}}
-//!             {"id": 17, "method": "review.request",  "params": {"target": "42", "engine": "codex", "post": false, "extra_prompt": "…"}}
+//!             {"id": 17, "method": "review.request",  "params": {"target": "42", "engine": "codex", "post": false, "extra_prompt": "…", "confirm": true}}
+//!             {"id": 21, "method": "review.preflight", "params": {"target": "42"}}
 //!             {"id": 18, "method": "brief.request",   "params": {"key": "acme/api#42"}}
 //!             {"id": 19, "method": "pause.start",     "params": {"hours": 2}}   or {"until": "<RFC3339>"}
 //!             {"id": 20, "method": "pause.resume",    "params": {}}
@@ -91,11 +92,16 @@ pub enum Call {
     GetUsage(String),
     /// `GET /insights?…` — the path with its query (`days`, `repo`).
     GetInsights(String),
-    /// `POST /review` (forced) for any target form with per-run options.
+    /// `POST /review` (forced) for any target form with per-run options;
+    /// `confirm` when the human confirmed the pre-flight warnings.
     RequestReview {
         target: String,
         overrides: ReviewOverrides,
+        confirm: bool,
     },
+    /// `POST /review/preflight`: what a review of the target needs
+    /// confirmed first. `null` from a daemon that predates the route.
+    PreflightReview(String),
     /// `POST /brief` (task 4.3): write or regenerate a PR's brief in the
     /// background; the window follows `brief_pending` on `/status`.
     RequestBrief(String),
@@ -109,7 +115,40 @@ pub enum Call {
     Resume,
 }
 
+/// What a successful call changed in the daemon, for the menu: the window
+/// host tells the poller, so the menu bar shows the change at once instead
+/// of on its next 10 s poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effect {
+    /// The config was written (form, raw YAML, review mode): poll now and
+    /// keep polling fast for a few seconds (a new repo's first poll).
+    Config,
+    /// Daemon state changed (pause, resume, a review or brief started).
+    State,
+}
+
 impl Call {
+    /// What this call changes when it succeeds (`None` for reads).
+    pub fn effect(&self) -> Option<Effect> {
+        match self {
+            Call::PutConfig(_) | Call::PutConfigYaml(_) | Call::SetReviewMode(_) => {
+                Some(Effect::Config)
+            }
+            Call::Pause { .. }
+            | Call::Resume
+            | Call::RequestReview { .. }
+            | Call::RequestBrief(_) => Some(Effect::State),
+            Call::GetConfig
+            | Call::DiscoverAgents
+            | Call::DiscoverRepos
+            | Call::GetStatus
+            | Call::ListHistory(_)
+            | Call::GetUsage(_)
+            | Call::GetInsights(_)
+            | Call::PreflightReview(_) => None,
+        }
+    }
+
     /// The wire method name (for logs; never the payload).
     pub fn method(&self) -> &'static str {
         match self {
@@ -124,6 +163,7 @@ impl Call {
             Call::GetUsage(_) => "usage.get",
             Call::GetInsights(_) => "insights.get",
             Call::RequestReview { .. } => "review.request",
+            Call::PreflightReview(_) => "review.preflight",
             Call::RequestBrief(_) => "brief.request",
             Call::Pause { .. } => "pause.start",
             Call::Resume => "pause.resume",
@@ -300,6 +340,16 @@ pub fn parse(body: &str) -> Result<(Value, Call), Box<Response>> {
         "review.request" => {
             parse_review(&raw.params).map_err(|e| fail(format!("review.request: {e}")))?
         }
+        "review.preflight" => match raw.params.get("target") {
+            Some(Value::String(target)) if !target.trim().is_empty() => {
+                Call::PreflightReview(target.trim().to_string())
+            }
+            _ => {
+                return Err(fail(
+                    "review.preflight: enter a PR reference (`target`)".into(),
+                ))
+            }
+        },
         "brief.request" => match raw.params.get("key") {
             Some(Value::String(key)) if !key.trim().is_empty() => {
                 Call::RequestBrief(key.trim().to_string())
@@ -408,6 +458,11 @@ fn parse_review(params: &Value) -> Result<Call, String> {
         Some(Value::Bool(post)) => Some(*post),
         Some(_) => return Err("`post` must be a boolean".into()),
     };
+    let confirm = match params.get("confirm") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(confirm)) => *confirm,
+        Some(_) => return Err("`confirm` must be a boolean".into()),
+    };
     Ok(Call::RequestReview {
         target,
         overrides: ReviewOverrides {
@@ -415,6 +470,7 @@ fn parse_review(params: &Value) -> Result<Call, String> {
             post,
             extra_prompt: text("extra_prompt")?,
         },
+        confirm,
     })
 }
 
@@ -450,7 +506,7 @@ pub struct DaemonBackend;
 
 impl Backend for DaemonBackend {
     async fn execute(&self, call: Call) -> Result<Value, BridgeError> {
-        let client = DaemonClient::discover()
+        let client = DaemonClient::discover_as_menubar()
             .await
             .ok_or_else(BridgeError::offline)?;
         let encode = |value: Result<Value, serde_json::Error>| {
@@ -503,10 +559,14 @@ impl Backend for DaemonBackend {
             Call::ListHistory(path) | Call::GetUsage(path) | Call::GetInsights(path) => {
                 loopback_get(&path).await
             }
-            Call::RequestReview { target, overrides } => {
+            Call::RequestReview {
+                target,
+                overrides,
+                confirm,
+            } => {
                 // Forced, like the menu's review actions (same request).
                 let response = client
-                    .review_with(&target, true, &overrides)
+                    .review_confirmed(&target, true, &overrides, confirm)
                     .await
                     .map_err(|e| {
                         BridgeError::new(
@@ -515,6 +575,15 @@ impl Backend for DaemonBackend {
                         )
                     })?;
                 encode(serde_json::to_value(response))
+            }
+            Call::PreflightReview(target) => {
+                let preflight = client.preflight(&target).await.map_err(|e| {
+                    BridgeError::new(
+                        "daemon",
+                        crate::actions::daemon_error_text(&format!("{e:#}")),
+                    )
+                })?;
+                encode(serde_json::to_value(preflight))
             }
             Call::RequestBrief(key) => {
                 let response = client.brief(&key).await.map_err(|e| {
@@ -630,6 +699,9 @@ pub struct Bridge<B: Backend> {
     /// must answer through the same reply path. `None` answers
     /// `unsupported`.
     chooser: Option<Arc<dyn Fn(Value) + Send + Sync>>,
+    /// Told (on the worker thread) after a call with an [`Effect`]
+    /// succeeded, before its reply is delivered.
+    on_effect: Option<Arc<dyn Fn(Effect) + Send + Sync>>,
 }
 
 impl<B: Backend> Clone for Bridge<B> {
@@ -638,6 +710,7 @@ impl<B: Backend> Clone for Bridge<B> {
             backend: Arc::clone(&self.backend),
             deliver: Arc::clone(&self.deliver),
             chooser: self.chooser.clone(),
+            on_effect: self.on_effect.clone(),
         }
     }
 }
@@ -648,7 +721,15 @@ impl<B: Backend> Bridge<B> {
             backend: Arc::new(backend),
             deliver,
             chooser: None,
+            on_effect: None,
         }
+    }
+
+    /// Call `on_effect` after every successful call that changes the
+    /// daemon (the window host nudges the menu's poller with it).
+    pub fn with_on_effect(mut self, on_effect: Arc<dyn Fn(Effect) + Send + Sync>) -> Self {
+        self.on_effect = Some(on_effect);
+        self
     }
 
     /// Route `browsers.choose` to `chooser` (called on the thread that
@@ -699,7 +780,11 @@ impl<B: Backend> Bridge<B> {
         let spawned = std::thread::Builder::new()
             .name("prx-settings-bridge".into())
             .spawn(move || {
+                let effect = call.effect();
                 let reply = me.run(worker_id, call);
+                if let (true, Some(effect), Some(on_effect)) = (reply.ok, effect, &me.on_effect) {
+                    on_effect(effect);
+                }
                 (me.deliver)(reply);
             });
         if let Err(error) = spawned {
@@ -765,10 +850,16 @@ mod tests {
                 Call::GetStatus => Ok(json!({ "prs": [] })),
                 Call::ListHistory(path) | Call::GetInsights(path) => Ok(json!({ "path": path })),
                 Call::GetUsage(path) => http_reply(&path, 404, b""),
-                Call::RequestReview { target, overrides } => Ok(json!({
+                Call::RequestReview {
+                    target,
+                    overrides,
+                    confirm,
+                } => Ok(json!({
                     "enqueued": [target],
                     "note": serde_json::to_value(&overrides).unwrap(),
+                    "confirm": confirm,
                 })),
+                Call::PreflightReview(target) => Ok(json!({ "key": target, "warnings": [] })),
                 Call::RequestBrief(key) if key.ends_with("#9") => Err(BridgeError::new(
                     "daemon",
                     format!("a brief for {key} is already being written"),
@@ -802,6 +893,52 @@ mod tests {
 
     fn recv(rx: &mpsc::Receiver<Response>) -> Response {
         rx.recv_timeout(Duration::from_secs(5)).expect("a reply")
+    }
+
+    /// A successful config write reports `Effect::Config` before its reply
+    /// arrives; a rejected one and a read report nothing; pause reports a
+    /// state change.
+    #[test]
+    fn successful_writes_report_their_effect() {
+        let (tx, rx) = mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let effects = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&effects);
+        let bridge = Bridge::new(
+            Fake,
+            Arc::new(move |reply| {
+                let _ = tx.lock().unwrap().send(reply);
+            }),
+        )
+        .with_on_effect(Arc::new(move |effect| seen.lock().unwrap().push(effect)));
+
+        bridge.handle(r#"{"id": 1, "method": "config.put", "params": {"yaml": "repos: []"}}"#);
+        assert!(recv(&rx).ok);
+        assert_eq!(*effects.lock().unwrap(), [Effect::Config]);
+
+        bridge.handle(
+            r#"{"id": 2, "method": "config.put", "params": {"yaml": "defaults:\n  poll_interval_minutes: 0\n"}}"#,
+        );
+        assert!(!recv(&rx).ok);
+        bridge.handle(r#"{"id": 3, "method": "status.get"}"#);
+        assert!(recv(&rx).ok);
+        assert_eq!(*effects.lock().unwrap(), [Effect::Config]);
+
+        bridge.handle(r#"{"id": 4, "method": "pause.resume"}"#);
+        assert!(recv(&rx).ok);
+        assert_eq!(*effects.lock().unwrap(), [Effect::Config, Effect::State]);
+    }
+
+    #[test]
+    fn calls_map_to_their_effects() {
+        assert_eq!(Call::GetConfig.effect(), None);
+        assert_eq!(
+            Call::SetReviewMode(ReviewMode::Monitor).effect(),
+            Some(Effect::Config)
+        );
+        assert_eq!(Call::PutConfig(Value::Null).effect(), Some(Effect::Config));
+        assert_eq!(Call::Resume.effect(), Some(Effect::State));
+        assert_eq!(Call::GetStatus.effect(), None);
     }
 
     #[test]
@@ -972,6 +1109,7 @@ mod tests {
                     post: Some(false),
                     extra_prompt: Some("focus".into()),
                 },
+                confirm: false,
             }
         );
         assert_eq!(
@@ -980,13 +1118,30 @@ mod tests {
             Call::RequestReview {
                 target: "acme/api#42".into(),
                 overrides: ReviewOverrides::default(),
+                confirm: false,
             }
+        );
+        assert_eq!(
+            call(r#"{"id":1,"method":"review.request","params":{"target":"42","confirm":true}}"#)
+                .unwrap(),
+            Call::RequestReview {
+                target: "42".into(),
+                overrides: ReviewOverrides::default(),
+                confirm: true,
+            }
+        );
+        assert_eq!(
+            call(r#"{"id":1,"method":"review.preflight","params":{"target":" acme/api#42 "}}"#)
+                .unwrap(),
+            Call::PreflightReview("acme/api#42".into())
         );
         for body in [
             r#"{"id":1,"method":"review.request","params":{}}"#,
             r#"{"id":1,"method":"review.request","params":{"target":"  "}}"#,
             r#"{"id":1,"method":"review.request","params":{"target":"42","post":"no"}}"#,
             r#"{"id":1,"method":"review.request","params":{"target":"42","engine":3}}"#,
+            r#"{"id":1,"method":"review.request","params":{"target":"42","confirm":"yes"}}"#,
+            r#"{"id":1,"method":"review.preflight","params":{}}"#,
         ] {
             assert_eq!(
                 call(body).unwrap_err().error.unwrap().kind,

@@ -13,6 +13,7 @@
 //! then nudges the poller so the menu reflects the new `/status` state.
 
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +26,7 @@ use prx::ipc::{
 use prx::review::ReviewOverrides;
 
 use crate::clipboard::{Clipboard, SystemClipboard};
+use crate::review_chat::{SystemTerminal, TerminalLauncher};
 
 use crate::poller::PollerCommand;
 
@@ -58,10 +60,19 @@ pub const BLOCK_PREFIX: &str = "block";
 /// "Copy brief" in a PR's drill-down (task 4.1): copies the PR's full
 /// brief text (fetched fresh from `/status`) to the clipboard.
 pub const COPY_BRIEF_PREFIX: &str = "copy-brief";
+/// "Show details…" in a PR's drill-down (spec "PR details page"): opens
+/// the app window on the PR's details page. Handled by the menu shell.
+pub const DETAILS_PREFIX: &str = "details";
+/// The drill-down's brief preview line: a click opens the PR details page,
+/// where the whole brief reads comfortably. Handled by the menu shell.
+pub const READ_BRIEF_PREFIX: &str = "read-brief";
 /// "Write brief" / "Regenerate brief" (task 4.2) → `POST /brief`. The
 /// daemon generates in the background; the menu shows "Writing brief…"
 /// from `/status`'s `brief_pending` until the new brief lands.
 pub const BRIEF_PREFIX: &str = "brief";
+/// "Open Review Chat…" (openspec change `review-chat`): a terminal window
+/// running the bundled `prx chat <key>` (see [`crate::review_chat`]).
+pub const CHAT_PREFIX: &str = "chat";
 pub const UNBLOCK_PREFIX: &str = "unblock";
 /// The "Review mode: …" submenu parent (navigation only).
 pub const MODE_PARENT_ID: &str = "mode";
@@ -136,6 +147,15 @@ pub fn window_page(id: &str) -> Option<&'static str> {
     }
 }
 
+/// The PR whose details page an id opens ("Show details…" and the brief
+/// preview line); `None` for every other id.
+pub fn details_key(id: &str) -> Option<&str> {
+    match id.split_once('|')? {
+        (DETAILS_PREFIX | READ_BRIEF_PREFIX, key) if !key.is_empty() => Some(key),
+        _ => None,
+    }
+}
+
 /// A parsed review action id (design D9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewAction {
@@ -204,6 +224,30 @@ pub fn review_action(id: &str) -> Option<ReviewAction> {
 /// scheduler asynchronously; the 10 s poller would also catch it later).
 pub const REVIEW_NOW_SETTLE: Duration = Duration::from_secs(2);
 
+/// A review the pre-flight says needs the human's confirmation: the shell
+/// shows `confirmation` (an `NSAlert`) and sends it with
+/// [`ActionController::dispatch_confirmed_review`] only on "Review anyway".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReview {
+    /// The menu id or panel id that started it (for logs and the outcome).
+    pub id: String,
+    pub target: String,
+    pub overrides: ReviewOverrides,
+    pub confirmation: Confirmation,
+}
+
+/// What a review action does after its pre-flight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewStep {
+    /// Nothing to confirm: the review was sent; the outcome line.
+    Sent(String),
+    /// Warnings: ask the human first.
+    Confirm(PendingReview),
+}
+
+/// Hands a [`PendingReview`] to the GUI thread.
+pub type ReviewConfirmer = Arc<dyn Fn(PendingReview) + Send + Sync>;
+
 /// Runs menu actions and reports their outcome. Cheap to clone.
 #[derive(Clone)]
 pub struct ActionController {
@@ -214,6 +258,14 @@ pub struct ActionController {
     publish: Arc<dyn Fn(String) + Send + Sync>,
     /// "Copy brief" target (the system clipboard; injectable for tests).
     clipboard: Arc<dyn Clipboard>,
+    /// Where a review that needs confirming goes (the GUI's alert). `None`
+    /// (self-test): such a review is not sent and the warnings are the
+    /// outcome.
+    confirmer: Option<ReviewConfirmer>,
+    /// "Open Review Chat…" terminal (Terminal.app; injectable for tests).
+    terminal: Arc<dyn TerminalLauncher>,
+    /// The bundled `prx` a chat runs (injectable for tests).
+    helper: Arc<dyn Fn() -> Option<PathBuf> + Send + Sync>,
 }
 
 impl ActionController {
@@ -222,7 +274,29 @@ impl ActionController {
             refresh,
             publish,
             clipboard: Arc::new(SystemClipboard),
+            confirmer: None,
+            terminal: Arc::new(SystemTerminal::default()),
+            helper: Arc::new(crate::supervisor::bundled_prx),
         }
+    }
+
+    /// Ask the human (through `confirmer`) before a review with pre-flight
+    /// warnings.
+    pub fn with_review_confirmer(mut self, confirmer: ReviewConfirmer) -> Self {
+        self.confirmer = Some(confirmer);
+        self
+    }
+
+    /// Replace the Review Chat terminal and helper (tests).
+    #[cfg(test)]
+    pub fn with_terminal(
+        mut self,
+        terminal: Arc<dyn TerminalLauncher>,
+        helper: Option<PathBuf>,
+    ) -> Self {
+        self.terminal = terminal;
+        self.helper = Arc::new(move || helper.clone());
+        self
     }
 
     /// Replace the clipboard (tests).
@@ -256,8 +330,7 @@ impl ActionController {
             .name("prx-menubar-action".into())
             .spawn(move || {
                 let id = format!("{REVIEW_PROMPT_PREFIX}|{target}");
-                let result = block_on(review_target(&target, &overrides));
-                me.finish(&id, result);
+                me.review_flow(&id, &target, overrides);
             });
         if let Err(error) = spawned {
             (self.publish)(format!("⚠ cannot start action thread: {error}"));
@@ -268,8 +341,44 @@ impl ActionController {
     /// `dispatch` runs this on a thread; the self-test harness calls it
     /// synchronously — same code either way.
     pub fn run(&self, id: &str) {
+        if let Some((target, overrides)) = review_action(id).and_then(|r| r.request()) {
+            self.review_flow(id, &target, overrides);
+            return;
+        }
         let result = block_on(self.perform(id));
         self.finish(id, result);
+    }
+
+    /// A review action: the pre-flight, then either the review or the
+    /// confirmation hand-off (no outcome line until the human answers).
+    fn review_flow(&self, id: &str, target: &str, overrides: ReviewOverrides) {
+        match block_on(start_review(id, target, overrides)) {
+            Ok(ReviewStep::Sent(note)) => self.finish(id, Ok(note)),
+            Ok(ReviewStep::Confirm(pending)) => match &self.confirmer {
+                Some(ask) => {
+                    eprintln!("prx-menubar: action {id} -> asking before the review");
+                    ask(pending);
+                }
+                None => self.finish(id, Err(unconfirmed_text(&pending))),
+            },
+            Err(error) => self.finish(id, Err(error)),
+        }
+    }
+
+    /// Send a review the human confirmed in the alert (`confirm: true`), on
+    /// a background thread; same outcome/refresh path as
+    /// [`ActionController::dispatch`].
+    pub fn dispatch_confirmed_review(&self, pending: PendingReview) {
+        let me = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("prx-menubar-action".into())
+            .spawn(move || {
+                let result = block_on(send_review(&pending.target, &pending.overrides, true));
+                me.finish(&pending.id, result);
+            });
+        if let Err(error) = spawned {
+            (self.publish)(format!("⚠ cannot start action thread: {error}"));
+        }
     }
 
     /// Publish an action's outcome and nudge the poller.
@@ -290,7 +399,10 @@ impl ActionController {
     pub async fn perform(&self, id: &str) -> Result<String, String> {
         if let Some(review) = review_action(id) {
             return match review.request() {
-                Some((target, overrides)) => review_target(&target, &overrides).await,
+                Some((target, overrides)) => match start_review(id, &target, overrides).await? {
+                    ReviewStep::Sent(note) => Ok(note),
+                    ReviewStep::Confirm(pending) => Err(unconfirmed_text(&pending)),
+                },
                 None => Err("this review is submitted from the review panel".into()),
             };
         }
@@ -300,7 +412,7 @@ impl ActionController {
                 let url = github_url(key)?;
                 // The repo's effective `browser` (daemon effective view;
                 // system handler when the daemon cannot say).
-                let client = DaemonClient::discover().await;
+                let client = DaemonClient::discover_as_menubar().await;
                 let browser =
                     crate::browser::resolve(client.as_ref(), crate::browser::repo_of(key)).await;
                 crate::browser::open(&browser, &url)?;
@@ -312,6 +424,13 @@ impl ActionController {
                 copy_brief(&status, key, self.clipboard.as_ref())
             }
             BRIEF_PREFIX => request_brief(key).await,
+            CHAT_PREFIX => crate::review_chat::open_review_chat(
+                key,
+                (self.helper)(),
+                &prx::paths::data_dir(),
+                &prx::paths::config_path(),
+                self.terminal.as_ref(),
+            ),
             BLOCK_PREFIX => {
                 let client = daemon().await?;
                 let response = client.block(key).await.map_err(format_error)?;
@@ -372,7 +491,8 @@ impl ActionController {
                 tokio::time::sleep(REVIEW_NOW_SETTLE).await;
                 Ok(summarize_check(response.note.as_deref()))
             }
-            SETTINGS_ID | OPEN_WINDOW_ID | OPEN_HISTORY_ID | OPEN_CONFIG_ID | OPEN_REPOS_ID => {
+            SETTINGS_ID | OPEN_WINDOW_ID | OPEN_HISTORY_ID | OPEN_CONFIG_ID | OPEN_REPOS_ID
+            | DETAILS_PREFIX | READ_BRIEF_PREFIX => {
                 Err("the window is opened by the menu shell".into())
             }
             PR_ROW_PREFIX | HISTORY_ID => Err(submenu_hint(action)),
@@ -442,16 +562,14 @@ pub fn summarize_brief(response: &BriefResponse) -> String {
 /// Re-discover the daemon per action (fresh port/token files — heals across
 /// daemon restarts exactly like the poller).
 async fn daemon() -> Result<DaemonClient, String> {
-    DaemonClient::discover()
+    DaemonClient::discover_as_menubar()
         .await
         .ok_or_else(|| "daemon offline — action not sent".to_string())
 }
 
 /// Run an action future on a fresh current-thread runtime (action threads
 /// and the self-test harness have none).
-fn block_on(
-    future: impl std::future::Future<Output = Result<String, String>>,
-) -> Result<String, String> {
+fn block_on<T>(future: impl std::future::Future<Output = Result<T, String>>) -> Result<T, String> {
     match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -467,17 +585,87 @@ fn block_on(
 /// skip/terminal legality and resolves the target. Its error text (unknown
 /// engine, ambiguous candidates, merged PR, …) is returned verbatim, minus
 /// the transport's `daemon returned <status>:` prefix.
-pub async fn review_target(target: &str, overrides: &ReviewOverrides) -> Result<String, String> {
+/// `confirm` carries the human's confirmation of the pre-flight warnings.
+pub async fn send_review(
+    target: &str,
+    overrides: &ReviewOverrides,
+    confirm: bool,
+) -> Result<String, String> {
     let target = target.trim();
     if target.is_empty() {
         return Err("no PR reference entered — nothing sent".into());
     }
     let client = daemon().await?;
     let response = client
-        .review_with(target, true, overrides)
+        .review_confirmed(target, true, overrides, confirm)
         .await
         .map_err(|e| daemon_error_text(&format_error(e)))?;
     Ok(summarize_review(target, overrides, response))
+}
+
+/// A review action's first step: `POST /review/preflight`, then the review
+/// itself when nothing needs confirming. A pre-flight with warnings returns
+/// [`ReviewStep::Confirm`] and sends nothing. An older daemon without the
+/// route never runs a skipped or oversized review, so the review is sent
+/// as before.
+pub async fn start_review(
+    id: &str,
+    target: &str,
+    overrides: ReviewOverrides,
+) -> Result<ReviewStep, String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("no PR reference entered — nothing sent".into());
+    }
+    let client = daemon().await?;
+    let preflight = client
+        .preflight(target)
+        .await
+        .map_err(|e| daemon_error_text(&format_error(e)))?;
+    if let Some(preflight) = preflight.filter(|p| p.needs_confirmation()) {
+        return Ok(ReviewStep::Confirm(PendingReview {
+            id: id.to_string(),
+            target: target.to_string(),
+            overrides,
+            confirmation: review_confirmation(&preflight),
+        }));
+    }
+    let response = client
+        .review_confirmed(target, true, &overrides, false)
+        .await
+        .map_err(|e| daemon_error_text(&format_error(e)))?;
+    Ok(ReviewStep::Sent(summarize_review(
+        target, &overrides, response,
+    )))
+}
+
+/// The alert for a review with pre-flight warnings: the warnings, one per
+/// line, the size when known, and what a confirmed review costs.
+pub fn review_confirmation(preflight: &prx::preflight::Preflight) -> Confirmation {
+    let mut body = preflight.lines().join("\n");
+    let skipped = preflight
+        .warnings
+        .iter()
+        .any(|w| w.kind == prx::preflight::WarningKind::Skipped);
+    body.push_str("\n\nReviewing it runs the engine and can use many tokens.");
+    if skipped {
+        body.push_str(" The PR stays skipped for automatic reviews.");
+    }
+    Confirmation {
+        title: format!("Review {} anyway?", preflight.key),
+        body,
+        button: "Review anyway".into(),
+    }
+}
+
+/// The outcome line when a review needed confirming and nobody could be
+/// asked (self-test).
+fn unconfirmed_text(pending: &PendingReview) -> String {
+    format!(
+        "{} needs your confirmation; not sent ({})",
+        pending.target,
+        pending.confirmation.body.lines().next().unwrap_or_default()
+    )
 }
 
 /// Strip the client's `daemon returned 400 Bad Request: ` prefix so the
@@ -878,6 +1066,24 @@ pub(crate) mod tests {
         assert_eq!(window_page(MODE_PARENT_ID), None);
     }
 
+    /// Spec "PR details page": "Show details…" and the brief preview open
+    /// the window at the PR; the controller never handles them itself.
+    #[test]
+    fn details_ids_name_the_pr_the_window_opens_at() {
+        assert_eq!(details_key("details|acme/api#42"), Some("acme/api#42"));
+        assert_eq!(details_key("read-brief|acme/api#42"), Some("acme/api#42"));
+        assert_eq!(details_key("details|"), None);
+        assert_eq!(details_key("details"), None);
+        assert_eq!(details_key("brief|acme/api#42"), None);
+        assert_eq!(details_key("open|acme/api#42"), None);
+        for id in ["details|acme/api#42", "read-brief|acme/api#42"] {
+            assert_eq!(
+                perform_offline(id),
+                Err("the window is opened by the menu shell".to_string())
+            );
+        }
+    }
+
     #[test]
     fn daemon_error_text_strips_the_transport_prefix() {
         assert_eq!(
@@ -888,6 +1094,48 @@ pub(crate) mod tests {
             daemon_error_text("cannot reach the daemon: refused"),
             "cannot reach the daemon: refused"
         );
+    }
+
+    /// "Open Review Chat…" (`chat|{key}`) writes the `.command` file under
+    /// the data dir and hands it to the terminal launcher; it needs no
+    /// daemon and sends nothing to one.
+    #[test]
+    fn chat_id_opens_a_terminal_running_prx_chat() {
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Vec<std::path::PathBuf>>);
+        impl TerminalLauncher for Recording {
+            fn open(&self, script: &std::path::Path) -> Result<(), String> {
+                self.0.lock().unwrap().push(script.to_path_buf());
+                Ok(())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("prx-chat-action-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let terminal = Arc::new(Recording::default());
+        let with = controller().with_terminal(terminal.clone(), Some(PathBuf::from("/b/prx")));
+        let result = with_data_dir(&dir, || {
+            block_on_test(with.perform(&format!("{CHAT_PREFIX}|org/repo#13")))
+        });
+        assert_eq!(
+            result,
+            Ok("opened Review Chat for org/repo#13 in a terminal".to_string())
+        );
+        let opened = terminal.0.lock().unwrap().clone();
+        assert_eq!(opened, vec![dir.join("chats/launch/org_repo-13.command")]);
+        let script = std::fs::read_to_string(&opened[0]).unwrap();
+        assert!(
+            script.ends_with("exec '/b/prx' chat 'org/repo#13'\n"),
+            "{script}"
+        );
+        // Without the bundled helper nothing opens.
+        let without = controller().with_terminal(terminal.clone(), None);
+        let result = with_data_dir(&dir, || {
+            block_on_test(without.perform(&format!("{CHAT_PREFIX}|org/repo#13")))
+        });
+        assert!(result.unwrap_err().contains("bundled prx"));
+        assert_eq!(terminal.0.lock().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Serializes the tests that point `PRX_DATA_DIR` somewhere (process
@@ -982,12 +1230,16 @@ pub(crate) mod tests {
         }
         let dir = std::env::temp_dir().join(format!("prx-menubar-offline-{}", std::process::id()));
         let prompted = with_data_dir(&dir, || {
-            block_on_test(review_target("org/repo#2", &ReviewOverrides::default()))
+            block_on_test(send_review(
+                "org/repo#2",
+                &ReviewOverrides::default(),
+                false,
+            ))
         });
         assert_eq!(prompted, Err(OFFLINE.to_string()));
         // An empty reference never reaches discovery.
         assert!(
-            block_on_test(review_target("  \n", &ReviewOverrides::default()))
+            block_on_test(send_review("  \n", &ReviewOverrides::default(), false))
                 .unwrap_err()
                 .contains("nothing sent")
         );
@@ -1141,7 +1393,7 @@ pub(crate) mod tests {
             (
                 block_on_test(controller().perform("block|org/r#5")),
                 block_on_test(controller().perform("unblock|org/r#5")),
-                block_on_test(review_target("org/r#5", &prompt)),
+                block_on_test(send_review("org/r#5", &prompt, false)),
             )
         });
         assert_eq!(block, Ok("org/r#5: blocked (changes requested)".into()));
@@ -1198,7 +1450,10 @@ pub(crate) mod tests {
     /// option.
     #[test]
     fn review_actions_post_their_overrides() {
-        let (dir, requests) = fake_daemon(|_| r#"{"enqueued":["org/r#5"]}"#.into());
+        let (dir, requests) = fake_daemon(|path| match path {
+            "/review/preflight" => r#"{"key":"org/r#5","warnings":[]}"#.into(),
+            _ => r#"{"enqueued":["org/r#5"]}"#.into(),
+        });
         let results: Vec<Result<String, String>> = with_data_dir(&dir, || {
             [
                 "review|org/r#5",
@@ -1217,8 +1472,15 @@ pub(crate) mod tests {
                 Ok("org/r#5: review queued (not posted)".to_string()),
             ]
         );
-        let seen: Vec<serde_json::Value> = requests
-            .try_iter()
+        let lines: Vec<String> = requests.try_iter().collect();
+        let preflights = lines
+            .iter()
+            .filter(|l| l.starts_with("POST /review/preflight "))
+            .count();
+        assert_eq!(preflights, 3, "every review asks the pre-flight first");
+        let seen: Vec<serde_json::Value> = lines
+            .iter()
+            .filter(|l| !l.starts_with("POST /review/preflight "))
             .map(|line| {
                 assert!(line.starts_with("POST /review "), "{line}");
                 serde_json::from_str(line.trim_start_matches("POST /review ")).unwrap()
@@ -1231,6 +1493,79 @@ pub(crate) mod tests {
                 serde_json::json!({"key": "org/r#5", "force": true, "engine": "my-agent"}),
                 serde_json::json!({"key": "org/r#5", "force": true, "post": false}),
             ]
+        );
+    }
+
+    const RISKY_PREFLIGHT: &str = r#"{"key":"org/r#5","warnings":[{"kind":"skipped","message":"Skipped — draft"},{"kind":"too_large","message":"Large PR — 2,140 lines changed (limit 1,500)"}],"size":{"files_changed":3,"lines":2140,"max_files":50,"max_lines":1500}}"#;
+
+    /// The alert lists the warnings, what a review costs, and that a
+    /// skipped PR stays skipped.
+    #[test]
+    fn review_confirmation_lists_the_warnings() {
+        let preflight: prx::preflight::Preflight = serde_json::from_str(RISKY_PREFLIGHT).unwrap();
+        let confirmation = review_confirmation(&preflight);
+        assert_eq!(confirmation.title, "Review org/r#5 anyway?");
+        assert_eq!(confirmation.button, "Review anyway");
+        assert_eq!(
+            confirmation.body,
+            "Skipped — draft\nLarge PR — 2,140 lines changed (limit 1,500)\n\n\
+             Reviewing it runs the engine and can use many tokens. \
+             The PR stays skipped for automatic reviews."
+        );
+    }
+
+    /// A review whose pre-flight warns is not sent: the GUI's confirmer
+    /// gets it (with no outcome line yet); without one, the warning is the
+    /// outcome. A confirmed review is sent with `confirm: true`.
+    #[test]
+    fn a_risky_review_is_held_for_confirmation() {
+        let (dir, requests) = fake_daemon(|path| match path {
+            "/review/preflight" => RISKY_PREFLIGHT.into(),
+            _ => r#"{"enqueued":["org/r#5"]}"#.into(),
+        });
+        let published = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let held = Arc::new(std::sync::Mutex::new(Vec::<PendingReview>::new()));
+        let (log, sink) = (published.clone(), held.clone());
+        let asking = ActionController::new(
+            std::sync::mpsc::channel().0,
+            Arc::new(move |line| log.lock().unwrap().push(line)),
+        )
+        .with_review_confirmer(Arc::new(move |pending| sink.lock().unwrap().push(pending)));
+        with_data_dir(&dir, || asking.run("review-nopost|org/r#5"));
+        let held = held.lock().unwrap().clone();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].id, "review-nopost|org/r#5");
+        assert_eq!(held[0].target, "org/r#5");
+        assert_eq!(held[0].overrides.post, Some(false));
+        assert_eq!(held[0].confirmation.title, "Review org/r#5 anyway?");
+        assert!(published.lock().unwrap().is_empty(), "no outcome yet");
+        let lines: Vec<String> = requests.try_iter().collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].starts_with("POST /review/preflight "), "{lines:?}");
+
+        let result = with_data_dir(&dir, || {
+            block_on_test(controller().perform("review|org/r#5"))
+        });
+        let error = result.unwrap_err();
+        assert!(error.contains("needs your confirmation"), "{error}");
+        assert!(error.contains("Skipped — draft"), "{error}");
+        assert!(requests
+            .try_iter()
+            .all(|l| l.starts_with("POST /review/preflight ")));
+
+        let result = with_data_dir(&dir, || {
+            block_on_test(send_review("org/r#5", &held[0].overrides, true))
+        });
+        assert_eq!(
+            result,
+            Ok("org/r#5: review queued (not posted)".to_string())
+        );
+        let line = requests.try_recv().expect("the confirmed review");
+        let body: serde_json::Value =
+            serde_json::from_str(line.trim_start_matches("POST /review ")).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"key": "org/r#5", "force": true, "post": false, "confirm": true})
         );
     }
 
@@ -1247,7 +1582,7 @@ pub(crate) mod tests {
             post: Some(false),
             extra_prompt: Some("focus on auth".into()),
         };
-        let result = with_data_dir(&dir, || block_on_test(review_target(" 42 ", &options)));
+        let result = with_data_dir(&dir, || block_on_test(send_review(" 42 ", &options, false)));
         assert_eq!(
             result,
             Err("42 matches more than one watched repo: acme/api#42, acme/web#42".to_string())

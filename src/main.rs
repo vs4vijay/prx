@@ -34,8 +34,15 @@ async fn main() {
         }
     };
     if let Err(e) = run(cli.command).await {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
+        let code = if e.is::<daemon::RestartRequested>() {
+            daemon::RESTART_EXIT_CODE
+        } else {
+            eprintln!("error: {e:#}");
+            1
+        };
+        // Flush the daemon's file log before exiting.
+        drop(_log_guard);
+        std::process::exit(code);
     }
 }
 
@@ -44,9 +51,17 @@ async fn run(command: Command) -> Result<()> {
         Command::Init => cmd_init(),
         Command::Doctor => cmd_doctor().await,
         Command::Repos { cmd } => match cmd {
-            ReposCmd::Add { repo } => cmd_repos_add(&repo),
+            ReposCmd::Add { repo } => {
+                cmd_repos_add(&repo)?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
             ReposCmd::List => cmd_repos_list(),
-            ReposCmd::Remove { repo } => cmd_repos_remove(&repo),
+            ReposCmd::Remove { repo } => {
+                cmd_repos_remove(&repo)?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
         },
         Command::Status(args) => cmd_status(args).await,
         Command::Review {
@@ -56,6 +71,7 @@ async fn run(command: Command) -> Result<()> {
             engine,
             no_post,
             prompt,
+            yes,
         } => {
             let overrides = review::ReviewOverrides {
                 engine,
@@ -63,9 +79,24 @@ async fn run(command: Command) -> Result<()> {
                 extra_prompt: prompt,
             }
             .normalized();
-            cmd_review(target.as_deref(), all, dry_run, &overrides).await
+            cmd_review(target.as_deref(), all, dry_run, &overrides, yes).await
         }
         Command::Brief { target, regenerate } => review::run_brief_cmd(&target, regenerate).await,
+        Command::Chat {
+            target,
+            new,
+            engine,
+            dir,
+            dry_run,
+        } => prx::chat::run_chat_cmd(
+            &target,
+            prx::chat::ChatOptions {
+                new,
+                engine,
+                dir,
+                dry_run,
+            },
+        ),
         Command::Approve { target } => cmd_approve(&target).await,
         Command::Snooze {
             target,
@@ -96,8 +127,16 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Config { cmd } => match cmd {
             None | Some(ConfigCmd::Show) => cmd_config_show(),
-            Some(ConfigCmd::Edit) => cmd_config_edit(),
-            Some(ConfigCmd::Set { key, value }) => cmd_config_set(&key, &value),
+            Some(ConfigCmd::Edit) => {
+                cmd_config_edit()?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
+            Some(ConfigCmd::Set { key, value }) => {
+                cmd_config_set(&key, &value)?;
+                nudge_daemon_reload().await;
+                Ok(())
+            }
         },
         Command::Daemon { cmd } => match cmd {
             DaemonCmd::Start { foreground } => {
@@ -134,6 +173,7 @@ async fn cmd_review(
     all: bool,
     dry_run: bool,
     overrides: &review::ReviewOverrides,
+    yes: bool,
 ) -> Result<()> {
     // Mirror run_review_cmd's argument validation so the daemon path cannot
     // turn a bare `prx review` into an accidental `--all`.
@@ -149,7 +189,28 @@ async fn cmd_review(
             // reviews only currently-due PRs. D10: the target goes through
             // unparsed — the daemon resolves every reference form.
             let resp = match target {
-                Some(target) if !all => client.review_with(target, true, overrides).await?,
+                Some(target) if !all => {
+                    // The pre-flight (an older daemon has none and never
+                    // runs a skipped or oversized review): ask, or refuse
+                    // without a terminal, before tokens are spent.
+                    let preflight = match yes {
+                        true => None,
+                        false => client.preflight(target).await?,
+                    };
+                    let confirm = match preflight {
+                        None => yes,
+                        Some(preflight) => match review::decide_on_terminal(&preflight)? {
+                            review::Decision::Proceed { confirm } => confirm,
+                            review::Decision::Declined => {
+                                println!("{} was not reviewed", preflight.key);
+                                return Ok(());
+                            }
+                        },
+                    };
+                    client
+                        .review_confirmed(target, true, overrides, confirm)
+                        .await?
+                }
                 _ => client.review(target, all, target.is_some()).await?,
             };
             if resp.enqueued.is_empty() {
@@ -187,7 +248,7 @@ async fn cmd_review(
             );
         }
     }
-    review::run_review_cmd(target, all, dry_run, overrides).await
+    review::run_review_cmd(target, all, dry_run, overrides, yes).await
 }
 
 async fn cmd_approve(target: &str) -> Result<()> {
@@ -258,7 +319,14 @@ async fn cmd_review_now() -> Result<()> {
         return Ok(());
     }
     // Same semantics as `prx review --all`: poll everything, review what's due.
-    review::run_review_cmd(None, true, false, &review::ReviewOverrides::default()).await
+    review::run_review_cmd(
+        None,
+        true,
+        false,
+        &review::ReviewOverrides::default(),
+        false,
+    )
+    .await
 }
 
 /// D5: the pause end in effect at `now` per state.json (in-process paths).
@@ -332,6 +400,24 @@ async fn cmd_resume() -> Result<()> {
 async fn cmd_status(args: StatusArgs) -> Result<()> {
     if let Some(client) = ipc::DaemonClient::discover().await {
         let payload = client.get_status().await?;
+        // The daemon keeps running on its last good config while the file is
+        // broken; say so, or edits that "do nothing" have no explanation on
+        // the CLI. On stderr, so `--json` output stays the bare array.
+        if let Some(err) = &payload.config_error {
+            eprintln!(
+                "warning: the config file has errors; the daemon is using its last good config: {}",
+                err.message
+            );
+        }
+        // Polls that keep failing leave the table stale: say why, also on
+        // stderr.
+        for line in prx::health::status_warnings(
+            &payload.poll_health,
+            payload.restart_recommended,
+            Utc::now(),
+        ) {
+            eprintln!("{line}");
+        }
         let mut prs = payload.prs;
         if let Some(repo) = &args.repo {
             let prefix = format!("{repo}#");
@@ -485,6 +571,9 @@ fn format_history_entry(entry: &HistoryEntry) -> String {
                 title
             )
         }
+        H::NewPr { .. } => format!("{} {} {:<16} new PR · {}", ts, entry.icon(), key, title),
+        // `query` never returns one; shown plainly if it ever does.
+        H::Unknown => format!("{} unknown event", entry.icon()),
     }
 }
 
@@ -502,7 +591,10 @@ fn tokens_text(usages: &[Option<&prx::usage::TokenUsage>]) -> String {
         return String::new();
     }
     let sum = |f: fn(&prx::usage::TokenUsage) -> Option<u64>| -> Option<u64> {
-        known.iter().filter_map(|u| f(u)).reduce(|a, b| a + b)
+        known
+            .iter()
+            .filter_map(|u| f(u))
+            .reduce(u64::saturating_add)
     };
     let mut parts = Vec::new();
     if let Some(n) = sum(|u| u.input_tokens) {
@@ -533,7 +625,9 @@ fn entry_title(entry: &HistoryEntry) -> String {
         | HistoryEntry::PrMerged { title, .. }
         | HistoryEntry::PrClosed { title, .. }
         | HistoryEntry::NewCommits { title, .. }
+        | HistoryEntry::NewPr { title, .. }
         | HistoryEntry::Brief { title, .. } => title.clone(),
+        HistoryEntry::Unknown => String::new(),
     }
 }
 
@@ -636,8 +730,15 @@ async fn snooze_inprocess(target: &str, hours: Option<f64>, until_push: bool) ->
     if hours.is_none() && !until_push {
         bail!("specify --hours N or --until-push");
     }
-    if hours.is_some_and(|h| h <= 0.0) {
+    // The same bounds the daemon's `POST /snooze` enforces: NaN and
+    // infinities are not durations, and the cap (~10 years) keeps the end
+    // time representable instead of overflowing.
+    const MAX_SNOOZE_HOURS: f64 = 87_600.0;
+    if hours.is_some_and(|h| !h.is_finite() || h <= 0.0) {
         bail!("--hours must be > 0");
+    }
+    if hours.is_some_and(|h| h > MAX_SNOOZE_HOURS) {
+        bail!("--hours is too large (max {MAX_SNOOZE_HOURS})");
     }
     let (repo_name, number) = review::parse_pr_key(target)?;
     let (config, repo) = load_config_and_repo(&repo_name)?;
@@ -952,10 +1053,18 @@ async fn cmd_doctor() -> Result<()> {
     for (source, key) in engine_refs {
         let label = format!("engine ({source})");
         match config.as_ref().and_then(|cfg| cfg.resolve_engine(&key)) {
-            Some(config::EngineConfig::Agent(agent)) => match paths::find_in_path(&agent.command) {
+            Some(config::EngineConfig::Agent(agent)) => match resolve_command(&agent.command) {
                 Some(path) => {
                     checks.push(check(label, true, format!("{key} -> {}", path.display())))
                 }
+                None if agent.command.contains('/') => checks.push(check(
+                    label,
+                    false,
+                    format!(
+                        "agent '{key}' command '{}' does not exist or is not executable",
+                        agent.command
+                    ),
+                )),
                 None => checks.push(check(
                     label,
                     false,
@@ -1053,6 +1162,11 @@ async fn cmd_doctor() -> Result<()> {
         for (names, browser) in browsers {
             match browser_launchable(&browser) {
                 Ok(detail) => checks.push(check("browser", true, format!("{names}: {detail}"))),
+                // Only a configured browser has the system one to fall back to.
+                Err(problem) if browser == config::Browser::System => checks.push(check_warn(
+                    "browser",
+                    format!("{names}: {problem}; prx cannot open PRs in a browser"),
+                )),
                 Err(problem) => checks.push(check_warn(
                     "browser",
                     format!("{names}: {problem}; PRs open in the system browser instead"),
@@ -1202,6 +1316,21 @@ async fn cmd_doctor() -> Result<()> {
     Ok(())
 }
 
+/// Where an engine's `command` resolves, the way running it would: a
+/// command with a slash is a path (`PATH` is not consulted, so an absolute
+/// path resolves with any `PATH`, even an empty one); a bare name is looked
+/// up on `PATH`.
+fn resolve_command(command: &str) -> Option<std::path::PathBuf> {
+    if !command.contains('/') {
+        return paths::find_in_path(command);
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::path::PathBuf::from(command);
+    let executable = std::fs::metadata(&path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0);
+    executable.then_some(path)
+}
+
 /// The serde token of a unit enum value (`openai_compatible`).
 fn serde_plain_token<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_value(value)
@@ -1283,7 +1412,7 @@ fn probe_write(dir: &std::path::Path) -> bool {
 
 fn load_config_for_edit() -> Result<(std::path::PathBuf, Config)> {
     let path = paths::config_path();
-    let config = Config::load(&path).context("failed to load config (run `prx init` first)")?;
+    let config = Config::load(&path).context("failed to load config")?;
     Ok((path, config))
 }
 
@@ -1360,6 +1489,53 @@ fn cmd_repos_remove(repo: &str) -> Result<()> {
 
 // ---------------------------------------------------------------- config
 
+/// After a command edited the config file: have a running daemon apply it
+/// now (`POST /config/reload`) instead of waiting for its file watcher, and
+/// say what the daemon did. Stderr only: stdout stays the command's own
+/// output. No daemon, no message (the next start reads the file).
+async fn nudge_daemon_reload() {
+    let Some(client) = ipc::DaemonClient::discover().await else {
+        return;
+    };
+    match client.reload_config().await {
+        Ok(response) => eprintln!("{}", reload_note(&response)),
+        // An older daemon has no reload route; its watcher still applies
+        // the file within a few seconds.
+        Err(e) => eprintln!(
+            "note: the running daemon did not confirm the change ({e:#}); it applies file \
+             changes within a few seconds"
+        ),
+    }
+}
+
+/// One stderr line (two with a restart notice) for a reload answer.
+fn reload_note(response: &ipc::ConfigReloadResponse) -> String {
+    use ipc::ConfigReloadOutcome;
+    let revision = response
+        .config_state
+        .config_revision
+        .map(|r| format!(" (config revision {r})"))
+        .unwrap_or_default();
+    let mut note = match response.outcome {
+        ConfigReloadOutcome::Applied => format!("the running daemon applied the change{revision}"),
+        // Its watcher got there first, or the edit changed nothing.
+        ConfigReloadOutcome::Unchanged => format!("the running daemon runs this config{revision}"),
+        ConfigReloadOutcome::Rejected => format!(
+            "warning: the running daemon rejected the config file and keeps its last good \
+             config: {}",
+            response.error.as_deref().unwrap_or("unknown error")
+        ),
+    };
+    if !response.config_state.restart_required.is_empty() {
+        note.push_str(&format!(
+            "\nnote: {} applies after a daemon restart (`prx daemon stop`, then `prx daemon \
+             start`; or quit PRX and open it again)",
+            response.config_state.restart_required.join(", ")
+        ));
+    }
+    note
+}
+
 fn cmd_config_show() -> Result<()> {
     let config = load_config_for_edit()?.1;
     config.validate().context("configuration is invalid")?;
@@ -1377,9 +1553,12 @@ fn cmd_config_edit() -> Result<()> {
     let path = paths::config_path();
     // POSIX convention: $VISUAL (full-screen editor) wins over $EDITOR
     // (line-oriented fallback) when both are set.
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .map_err(|_| {
+    // An empty or blank value counts as unset.
+    let editor = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
             anyhow::anyhow!(
                 "no $EDITOR (or $VISUAL) set; edit {} directly",
                 path.display()
@@ -1390,7 +1569,7 @@ fn cmd_config_edit() -> Result<()> {
 
 fn cmd_config_set(key: &str, value: &str) -> Result<()> {
     let path = paths::config_path();
-    let mut config = Config::load(&path).context("failed to load config (run `prx init` first)")?;
+    let mut config = Config::load(&path).context("failed to load config")?;
     config_edit::set_value(&mut config, key, value).map_err(|e| anyhow::anyhow!("{e}"))?;
     // Validate before writing: a `set` that would produce an invalid config
     // leaves the file untouched.
@@ -1402,4 +1581,520 @@ fn cmd_config_set(key: &str, value: &str) -> Result<()> {
         .with_context(|| format!("cannot write {}", path.display()))?;
     println!("set {key} = {value}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::DateTime;
+    use prx::state::Verdict;
+    use prx::usage::TokenUsage;
+    use std::path::{Path, PathBuf};
+
+    fn ts() -> DateTime<Utc> {
+        "2026-08-22T10:05:59Z".parse().unwrap()
+    }
+
+    fn tokens(input: Option<u64>, output: Option<u64>) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            output_tokens: output,
+            ..Default::default()
+        }
+    }
+
+    fn reload(
+        outcome: ipc::ConfigReloadOutcome,
+        error: Option<&str>,
+        restart: &[&str],
+    ) -> ipc::ConfigReloadResponse {
+        ipc::ConfigReloadResponse {
+            outcome,
+            error: error.map(str::to_string),
+            added: vec![],
+            removed: vec![],
+            config_state: ipc::ConfigRevision {
+                config_revision: Some(3),
+                config_loaded_at: None,
+                restart_required: restart.iter().map(|s| s.to_string()).collect(),
+            },
+        }
+    }
+
+    /// The CLI's reload line says what the daemon did, quotes a rejection,
+    /// and adds the restart notice only when a key needs one.
+    #[test]
+    fn reload_note_reports_the_daemon_outcome() {
+        use ipc::ConfigReloadOutcome::*;
+        assert_eq!(
+            reload_note(&reload(Applied, None, &[])),
+            "the running daemon applied the change (config revision 3)"
+        );
+        assert_eq!(
+            reload_note(&reload(Unchanged, None, &[])),
+            "the running daemon runs this config (config revision 3)"
+        );
+        let rejected = reload_note(&reload(Rejected, Some("bad yaml"), &[]));
+        assert!(rejected.starts_with("warning: the running daemon rejected"));
+        assert!(rejected.ends_with("bad yaml"));
+        let restart = reload_note(&reload(Applied, None, &["max_concurrent_reviews"]));
+        assert!(restart
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with("note: max_concurrent_reviews applies after a daemon restart"));
+    }
+
+    fn completed(verdict: Verdict) -> HistoryEntry {
+        HistoryEntry::ReviewCompleted {
+            ts: ts(),
+            repo: "org/one".into(),
+            number: 7,
+            title: "Add feature".into(),
+            author: "alice".into(),
+            agent: Some("claude".into()),
+            verdict,
+            blocking_count: 2,
+            nit_count: 1,
+            duration_seconds: Some(95),
+            blocking_texts: Vec::new(),
+            brief: None,
+            posted: None,
+            usage: None,
+            summary_usage: None,
+        }
+    }
+
+    /// A unique scratch directory under the system temp dir.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "prx-main-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"").unwrap();
+    }
+
+    // ------------------------------------------------------ history timeline
+
+    /// One `prx history` line per event kind: minute-resolution UTC time,
+    /// the event's icon, the PR key padded to 16 columns, what happened,
+    /// then the title.
+    #[test]
+    fn timeline_line_for_every_event_kind() {
+        let common = |event: &str| -> HistoryEntry {
+            serde_json::from_value(serde_json::json!({
+                "event": event, "ts": "2026-08-22T10:05:59Z", "repo": "org/one",
+                "number": 7, "title": "Add feature", "author": "alice",
+                "reason": "diff too large"
+            }))
+            .unwrap()
+        };
+        let brief = |text: Option<&str>| HistoryEntry::Brief {
+            ts: ts(),
+            repo: "org/one".into(),
+            number: 7,
+            title: "Add feature".into(),
+            author: "alice".into(),
+            agent: None,
+            brief: text.map(Into::into),
+            usage: None,
+        };
+        let cases = [
+            (
+                common("review_started"),
+                "2026-08-22 10:05 \u{1f50d} org/one#7        review started · Add feature",
+            ),
+            (
+                common("review_failed"),
+                "2026-08-22 10:05 \u{274c} org/one#7        review failed · Add feature",
+            ),
+            (
+                common("review_skipped"),
+                "2026-08-22 10:05 \u{23ed}\u{fe0f} org/one#7        review skipped (diff too large) · Add feature",
+            ),
+            (
+                common("pr_merged"),
+                "2026-08-22 10:05 \u{2714}\u{fe0f} org/one#7        merged · Add feature",
+            ),
+            (
+                common("pr_closed"),
+                "2026-08-22 10:05 \u{1f5d1}\u{fe0f} org/one#7        closed · Add feature",
+            ),
+            (
+                common("new_commits"),
+                "2026-08-22 10:05 \u{1f501} org/one#7        new commits · Add feature",
+            ),
+            (
+                brief(Some("what it does")),
+                "2026-08-22 10:05 \u{1f4dd} org/one#7        brief written · Add feature",
+            ),
+            (
+                brief(None),
+                "2026-08-22 10:05 \u{1f4dd} org/one#7        brief failed · Add feature",
+            ),
+            (
+                completed(Verdict::Approved),
+                "2026-08-22 10:05 \u{2705} org/one#7         approved — 2 blocking, 1 nits · claude · 95s · Add feature",
+            ),
+            (
+                completed(Verdict::ChangesRequested),
+                "2026-08-22 10:05 \u{26a0}\u{fe0f} org/one#7         changes requested — 2 blocking, 1 nits · claude · 95s · Add feature",
+            ),
+            (
+                completed(Verdict::CommentOnly),
+                "2026-08-22 10:05 \u{1f4ac} org/one#7         commented — 2 blocking, 1 nits · claude · 95s · Add feature",
+            ),
+        ];
+        for (entry, line) in cases {
+            assert_eq!(format_history_entry(&entry), line);
+        }
+    }
+
+    /// The optional parts of a completed-review line: a run that made no
+    /// GitHub writes says so (design D4), and an unknown engine, duration,
+    /// or usage is left out rather than shown as a placeholder.
+    #[test]
+    fn completed_line_marks_unposted_runs_and_omits_unknown_parts() {
+        let line = |edit: &dyn Fn(&mut HistoryEntry)| {
+            let mut entry = completed(Verdict::Approved);
+            edit(&mut entry);
+            format_history_entry(&entry)
+        };
+        let set_posted = |value: Option<bool>| {
+            line(&|e| {
+                if let HistoryEntry::ReviewCompleted { posted, .. } = e {
+                    *posted = value;
+                }
+            })
+        };
+        assert!(set_posted(Some(false)).contains(" approved (not posted) — 2 blocking"));
+        assert!(!set_posted(Some(true)).contains("not posted"));
+        assert!(!set_posted(None).contains("not posted"));
+
+        let bare = line(&|e| {
+            if let HistoryEntry::ReviewCompleted {
+                agent,
+                duration_seconds,
+                ..
+            } = e
+            {
+                *agent = None;
+                *duration_seconds = None;
+            }
+        });
+        assert!(
+            bare.ends_with(" approved — 2 blocking, 1 nits · Add feature"),
+            "{bare}"
+        );
+
+        let with_usage = line(&|e| {
+            if let HistoryEntry::ReviewCompleted {
+                usage,
+                summary_usage,
+                ..
+            } = e
+            {
+                *usage = Some(tokens(Some(12_345), Some(1_100)));
+                *summary_usage = Some(tokens(Some(655), Some(100)));
+            }
+        });
+        assert!(
+            with_usage.ends_with(" · claude · 95s · 13.0k in / 1.2k out · Add feature"),
+            "{with_usage}"
+        );
+    }
+
+    /// Titles are cut at 36 characters (characters, not bytes) with an
+    /// ellipsis; a key longer than its column is shown whole.
+    #[test]
+    fn timeline_cuts_long_titles_and_keeps_long_keys() {
+        let entry = |repo: &str, title: &str| HistoryEntry::PrMerged {
+            ts: ts(),
+            repo: repo.into(),
+            number: 12345,
+            title: title.into(),
+            author: "alice".into(),
+        };
+        let exactly = "x".repeat(36);
+        assert!(format_history_entry(&entry("o/r", &exactly)).ends_with(&format!(" · {exactly}")));
+        let longer = format_history_entry(&entry("o/r", &"x".repeat(37)));
+        assert!(
+            longer.ends_with(&format!(" · {exactly}\u{2026}")),
+            "{longer}"
+        );
+        // Multi-byte characters are counted, never split.
+        let wide = format_history_entry(&entry("o/r", &"\u{6f22}".repeat(40)));
+        assert!(
+            wide.ends_with(&format!(" · {}\u{2026}", "\u{6f22}".repeat(36))),
+            "{wide}"
+        );
+        assert_eq!(truncate("", 3), "");
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("abcd", 3), "abc\u{2026}");
+        assert_eq!(truncate("abcd", 0), "\u{2026}");
+
+        let long_key = format_history_entry(&entry("a-long-organisation/a-long-repository", "t"));
+        assert!(
+            long_key.contains(" a-long-organisation/a-long-repository#12345 merged · t"),
+            "{long_key}"
+        );
+    }
+
+    /// Design D11: only what a run reported is shown. Review and summary
+    /// usage add up, a field neither reported is absent, cache writes are
+    /// not in the timeline, and no usage at all prints nothing (never
+    /// zeros).
+    #[test]
+    fn tokens_text_sums_reported_fields_only() {
+        assert_eq!(tokens_text(&[]), "");
+        assert_eq!(tokens_text(&[None, None]), "");
+        // A model alone is not usage.
+        let identity = TokenUsage {
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        assert_eq!(tokens_text(&[Some(&identity)]), "");
+
+        let review = TokenUsage {
+            cache_read_tokens: Some(40_000),
+            cost_usd: Some(0.41),
+            ..tokens(Some(12_345), Some(1_100))
+        };
+        let summary = tokens(Some(655), None);
+        assert_eq!(
+            tokens_text(&[Some(&review), Some(&summary)]),
+            " · 13.0k in / 1.1k out / 40.0k cached · $0.41"
+        );
+        assert_eq!(tokens_text(&[None, Some(&summary)]), " · 655 in");
+        assert_eq!(tokens_text(&[Some(&tokens(None, Some(9)))]), " · 9 out");
+        assert_eq!(tokens_text(&[Some(&tokens(Some(0), None))]), " · 0 in");
+
+        let cost_only = TokenUsage {
+            cost_usd: Some(0.006),
+            ..Default::default()
+        };
+        assert_eq!(tokens_text(&[Some(&cost_only)]), " · $0.0060");
+        assert_eq!(
+            tokens_text(&[Some(&cost_only), Some(&cost_only)]),
+            " · $0.01"
+        );
+        let cache_write_only = TokenUsage {
+            cache_write_tokens: Some(500),
+            ..Default::default()
+        };
+        assert_eq!(tokens_text(&[Some(&cache_write_only)]), "");
+        // Absurd counts saturate instead of overflowing.
+        let huge = tokens(Some(u64::MAX), None);
+        assert!(tokens_text(&[Some(&huge), Some(&huge)]).ends_with("M in"));
+    }
+
+    // --------------------------------------------------------------- doctor
+
+    fn registration(binary: Option<&Path>) -> autostart::Status {
+        autostart::Status {
+            installed: true,
+            path: Some(PathBuf::from("/home/maya/registration.file")),
+            binary: binary.map(Path::to_path_buf),
+        }
+    }
+
+    /// The autostart line: a missing registration is a plain hint; an
+    /// unreadable one, a stale binary, and a build-directory binary are
+    /// warnings; none of them is a failure.
+    #[test]
+    fn autostart_check_covers_every_registration_state() {
+        let dir = scratch("autostart-check");
+        let stable = dir.join("bin/prx");
+        let build = dir.join("checkout/target/debug/prx");
+        touch(&stable);
+        touch(&build);
+
+        let absent = autostart::Status {
+            installed: false,
+            path: None,
+            binary: None,
+        };
+        let c = autostart_check("autostart", "run `prx daemon install`", &absent);
+        assert_eq!((c.ok, c.warning), (true, false));
+        assert_eq!(c.name, "autostart");
+        assert_eq!(c.detail, "not installed (run `prx daemon install`)");
+
+        let c = autostart_check("autostart", "hint", &registration(None));
+        assert_eq!((c.ok, c.warning), (true, true));
+        assert_eq!(
+            c.detail,
+            "installed (/home/maya/registration.file) — registered binary could not be parsed"
+        );
+
+        let gone = dir.join("bin/removed");
+        let c = autostart_check("autostart", "hint", &registration(Some(&gone)));
+        assert_eq!((c.ok, c.warning), (true, true));
+        assert!(
+            c.detail.contains(&format!(
+                "registered binary {} no longer exists (stale install; re-run `prx daemon install`)",
+                gone.display()
+            )),
+            "{}",
+            c.detail
+        );
+
+        let c = autostart_check("autostart", "hint", &registration(Some(&build)));
+        assert_eq!((c.ok, c.warning), (true, true));
+        assert!(
+            c.detail.contains("lives in a build directory"),
+            "{}",
+            c.detail
+        );
+        assert!(c.detail.contains("--binary-path"), "{}", c.detail);
+
+        let c = autostart_check("menubar autostart", "hint", &registration(Some(&stable)));
+        assert_eq!((c.ok, c.warning), (true, false));
+        assert_eq!(c.name, "menubar autostart");
+        assert_eq!(
+            c.detail,
+            format!(
+                "installed (/home/maya/registration.file) — binary: {}",
+                stable.display()
+            )
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The PRX.app login-item line: fine while the registered bundle
+    /// exists, a warning when it was moved or deleted or the plist cannot
+    /// be read back.
+    #[test]
+    fn app_autostart_check_follows_the_registered_bundle() {
+        let dir = scratch("app-autostart-check");
+        let bundle = dir.join("PRX.app");
+        let executable = bundle.join("Contents/MacOS/PRX");
+
+        let c = app_autostart_check(&registration(Some(&executable)));
+        assert_eq!((c.ok, c.warning), (true, true));
+        assert!(
+            c.detail.contains(&format!(
+                "registered app {} no longer exists (reinstall PRX.app",
+                bundle.display()
+            )),
+            "{}",
+            c.detail
+        );
+
+        touch(&executable);
+        let c = app_autostart_check(&registration(Some(&executable)));
+        assert_eq!((c.ok, c.warning), (true, false));
+        assert_eq!(
+            c.detail,
+            format!(
+                "PRX.app login item (/home/maya/registration.file) — app: {}",
+                bundle.display()
+            )
+        );
+
+        let c = app_autostart_check(&registration(None));
+        assert_eq!((c.ok, c.warning), (true, true));
+        assert!(c.detail.contains("could not be parsed"), "{}", c.detail);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A warning is rendered WARN and never counted as a failure; a failed
+    /// check is neither ok nor a warning.
+    #[test]
+    fn checks_are_ok_failed_or_warning() {
+        let c = check("gh binary", false, "gh not found on PATH");
+        assert_eq!((c.ok, c.warning), (false, false));
+        let c = check_warn("browser", "falls back");
+        assert_eq!((c.ok, c.warning), (true, true));
+        assert_eq!(
+            (c.name.as_str(), c.detail.as_str()),
+            ("browser", "falls back")
+        );
+    }
+
+    /// Browser resolvability for a command template: the program is looked
+    /// up as a path when it has a slash and on `PATH` otherwise; nothing is
+    /// ever launched.
+    #[test]
+    fn browser_command_is_launchable_when_its_program_resolves() {
+        let dir = scratch("browser-launchable");
+        let program = dir.join("my-browser");
+        touch(&program);
+        let template = |program: &str| {
+            config::Browser::Command(vec![program.to_string(), "{{URL}}".to_string()])
+        };
+
+        let path = program.display().to_string();
+        assert_eq!(
+            browser_launchable(&template(&path)),
+            Ok(format!("command `{path} {{{{URL}}}}`"))
+        );
+        let missing = dir.join("absent").display().to_string();
+        assert_eq!(
+            browser_launchable(&template(&missing)),
+            Err(format!("command '{missing}' not found on PATH"))
+        );
+        assert_eq!(
+            browser_launchable(&template("prx-test-no-such-browser")),
+            Err("command 'prx-test-no-such-browser' not found on PATH".to_string())
+        );
+        // `sh` is on every PATH these tests run with.
+        assert_eq!(
+            browser_launchable(&template("sh")),
+            Ok("command `sh {{URL}}`".to_string())
+        );
+        assert_eq!(
+            browser_launchable(&config::Browser::Command(Vec::new())),
+            Err("command '' not found on PATH".to_string())
+        );
+
+        // An application given as a path is checked on disk (macOS); other
+        // platforms cannot open an application by name at all.
+        let app = config::Browser::App(dir.join("Absent.app").display().to_string());
+        let problem = browser_launchable(&app).unwrap_err();
+        if cfg!(target_os = "macos") {
+            assert!(problem.ends_with("not found"), "{problem}");
+            let present = config::Browser::App(path.clone());
+            assert_eq!(
+                browser_launchable(&present),
+                Ok(format!("application '{path}'"))
+            );
+        } else {
+            assert!(problem.contains("needs macOS `open -a`"), "{problem}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn doctor_helpers_first_line_token_and_write_probe() {
+        assert_eq!(first_line("one\ntwo\n"), "one");
+        assert_eq!(first_line("only"), "only");
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line("\nsecond"), "");
+
+        assert_eq!(serde_plain_token(&prx::usage::Window::Days7), "7d");
+        assert_eq!(
+            serde_plain_token(&Verdict::ChangesRequested),
+            "changes_requested"
+        );
+        // Not a unit value: no token.
+        assert_eq!(serde_plain_token(&42), "");
+
+        let dir = scratch("probe");
+        assert!(probe_write(&dir));
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the probe file is removed"
+        );
+        assert!(!probe_write(&dir.join("does-not-exist")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

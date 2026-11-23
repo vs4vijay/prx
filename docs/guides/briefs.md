@@ -6,7 +6,9 @@ areas, migrations, breaking changes). Each tracked PR has at most one, stored in
 `created_at` (first brief), `updated_at` (last write), the head SHA it describes, its source
 (`review` or `on_demand`), and the engine. `GET /status` reports it with a derived `stale` flag —
 true once the PR's head has moved past the brief's SHA. A stale brief stays visible until it is
-replaced. The menu bar shows it in the PR's submenu.
+replaced. The menu bar shows a preview in the PR's submenu (hover it for the whole brief; click it
+to read it on the PR's [details page](prx-app.md#pr-details) in the PRX window, next to the latest
+review). `prx brief` prints it wrapped at 80 columns on a terminal, unchanged when piped.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../media/screenshots/prs-dark.png">

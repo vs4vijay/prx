@@ -337,4 +337,93 @@ mod tests {
         assert_eq!(find_in("", &dirs), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// PATH order decides between two installs, a directory named like the
+    /// command is not a binary, and a path is taken as written.
+    #[test]
+    fn find_in_follows_dir_order_and_skips_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("prx-discover-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (first, second, third) = (root.join("first"), root.join("second"), root.join("third"));
+        // `first/tool` is a directory; `second` and `third` hold the binary.
+        std::fs::create_dir_all(first.join("tool")).unwrap();
+        for dir in [&second, &third] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("tool"), "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(dir.join("tool"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let missing = root.join("does-not-exist");
+        let dirs = vec![missing, first.clone(), second.clone(), third.clone()];
+        assert_eq!(find_in("tool", &dirs), Some(second.join("tool")));
+        assert_eq!(
+            find_in("tool", &[third.clone(), second]),
+            Some(third.join("tool"))
+        );
+        // An explicit path ignores the dirs, and must itself be executable.
+        let explicit = third.join("tool");
+        assert_eq!(find_in(explicit.to_str().unwrap(), &[]), Some(explicit));
+        assert_eq!(find_in(first.join("tool").to_str().unwrap(), &dirs), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Invariant 7: discovery reports whether an `llm_api` key variable is
+    /// set (non-empty), and nothing of its value.
+    #[test]
+    fn llm_candidates_report_key_presence_and_never_the_key() {
+        let var = format!("PRX_TEST_DISCOVER_KEY_{}", std::process::id());
+        let engines: EnginesMap = serde_yaml::from_str(&format!(
+            "api:\n  type: llm_api\n  provider: openai_compatible\n  base_url: http://127.0.0.1:1/v1\n  \
+             model: local\n  api_key_env: {var}\n"
+        ))
+        .unwrap();
+        std::env::set_var(&var, "sk-discover-secret");
+        assert!(env_present(&var));
+        let found = llm_api_candidates(&engines);
+        assert_eq!(
+            found,
+            [LlmApiCandidate {
+                name: "api".into(),
+                provider: LlmProvider::OpenaiCompatible,
+                model: "local".into(),
+                api_key_env: var.clone(),
+                key_present: true,
+            }]
+        );
+        let response = AgentsResponse {
+            llm_apis: found,
+            ..Default::default()
+        };
+        let wire = format!("{} {response:?}", serde_json::to_string(&response).unwrap());
+        assert!(
+            wire.contains(&var) && !wire.contains("sk-discover-secret"),
+            "{wire}"
+        );
+
+        // Set but empty counts as not set.
+        std::env::set_var(&var, "");
+        assert!(!env_present(&var));
+        assert!(!llm_api_candidates(&engines)[0].key_present);
+        std::env::remove_var(&var);
+        assert!(!env_present(&var));
+    }
+
+    /// Detection fills in where each known agent is, and never invents a
+    /// location: a reported path is an executable file named after the
+    /// command, and `on_path` implies a path.
+    #[test]
+    fn detected_agents_only_report_real_executables() {
+        let detected = detect_agents();
+        assert_eq!(detected.len(), known_agents().len());
+        for agent in &detected {
+            match &agent.path {
+                Some(path) => {
+                    assert!(is_executable(path), "{}: {}", agent.name, path.display());
+                    assert_eq!(path.file_name().unwrap().to_str().unwrap(), agent.command);
+                }
+                None => assert!(!agent.on_path, "{}", agent.name),
+            }
+        }
+    }
 }

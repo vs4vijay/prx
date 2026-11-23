@@ -17,7 +17,9 @@ For anything the daemon did, `prx daemon logs` tails the newest log file under
 
 ## A PR is not being reviewed
 
-Check these in order; `prx status` shows the state and skip reason of each PR.
+Check these in order; `prx status` shows the state of each PR and, for a skipped one, why
+(*Skipped — draft*, *Skipped — author dependabot[bot] excluded*, *Skipped — 2,140 lines changed
+(limit 1,500)*).
 
 | Cause | What to look for |
 |-------|------------------|
@@ -26,7 +28,7 @@ Check these in order; `prx status` shows the state and skip reason of each PR.
 | Schedule | With a `schedule` set, a repo waits for its next cron tick. *Check GitHub now* / `prx review-now` only polls early. See [Review schedule](guides/schedule.md). |
 | Pause | `prx status` shows the pause; `prx resume` lifts it. See [Pausing](guides/pausing.md). |
 | Mode `off` | No polling and no reviews for that repo; an explicit `prx review` is refused. See [Review modes](guides/review-modes.md). |
-| Diff too large | Diffs over `diff_max_files` (50) or `diff_max_lines` (4000) are skipped with a `too_large` note and re-checked on later polls. |
+| Diff too large | Diffs over `diff_max_files` (50) or `diff_max_lines` (4000) are skipped, with the size against the limit, and re-checked on later polls. To review one anyway, `prx review org/repo#N` and confirm (or `--yes`). |
 | Snoozed or ignored | `prx unignore`, or *Unsnooze* in the app. |
 
 ## A review failed
@@ -74,12 +76,18 @@ See [Autostart](guides/autostart.md).
 
 ## A config change did not apply
 
-The daemon re-reads `config.yml` within about a second. If an edit breaks the file (bad YAML or a
-failed validation), the daemon keeps running on the last good config and reports the reason as
-`config_error` in `GET /status`, in the app's menu, and in the settings pages. Fixing the file
-clears it.
+The daemon re-reads `config.yml` within about a second, and at once after a save in the PRX
+window or a `prx config set` / `edit` or `prx repos add` / `remove` (those print what the daemon
+did on stderr). PRX.app refreshes its menu as soon as the change is running. If an edit breaks the
+file (bad YAML or a failed validation), the daemon keeps running on the last good config and
+reports the reason as `config_error` in `GET /status`, in the app's menu, and in the settings
+pages; `prx status` prints it as a `warning:` line on stderr. Fixing the file clears it.
 
-- `max_concurrent_reviews` does not hot-reload. Restart the daemon after changing it.
+- To check which config runs, compare `config_revision` in `GET /status` before and after the
+  change; it goes up by one for each different config the daemon applies.
+- `max_concurrent_reviews` does not hot-reload. The PRX window and `prx config set` say so; quit
+  PRX and open it again (when PRX started the daemon), or run `prx daemon stop` and
+  `prx daemon start`.
 - A `review_prompt` that is a file path is rejected: it is the prompt text now. Paste the file's
   contents instead. See [Prompts](guides/prompts.md).
 - An unknown `{{...}}` placeholder in `comments.template` fails validation. The allowed set is in
@@ -137,12 +145,19 @@ step is needed again after each new download. See
   [update](getting-started/install.md#update), or stay on v0.1.0 and run
   `/Applications/PRX.app/Contents/Helpers/prx init` once, then choose *Start daemon* in the menu.
   On v0.1.1 or later the same two menu states mean something else: see the next entry.
-- **The menu shows *Daemon stopped*.** The app gave up after 5 daemon failures within 10 minutes.
+- **The menu shows *Daemon stopped*.** Either the daemon was stopped with `prx daemon stop` (the
+  app respects that until you choose *Start daemon*), or the app gave up after 5 daemon failures
+  within 10 minutes.
   Choose *Show daemon log*, and check `logs/daemon-stderr.log` in the data directory for start-up
   errors. *Start daemon* tries again. A config file that does not parse or validate is a common
   cause (`failed to parse config file …`, `configuration is invalid`): PRX.app creates a config
   only when there is none, and never replaces or repairs one that exists, so fix the file (or
   move it away to get a fresh default on the next start).
+- **The menu or the window says the daemon is offline right after opening PRX.app.** The app
+  starts the daemon itself (or uses one that already runs) and shows *Starting the daemon…*
+  until it answers, usually within a few seconds. You do not need to choose *Start daemon*. If a
+  daemon it used stops later, the app starts a new one within about 10 seconds. The exception is
+  `prx daemon stop`: the app then shows *Daemon stopped* and waits for *Start daemon*.
 - **The menu says the daemon and app versions differ.** An older daemon (from the CLI or a login
   item) is still running. Stop it with `prx daemon stop`, then choose *Start daemon* in the menu.
 - **No banners.** Check System Settings → Notifications → PRX, and
@@ -156,6 +171,28 @@ step is needed again after each new download. See
   `~/.local/bin/prx` is never overwritten: move it away first.
 - **The built app has a generic icon.** Install `rsvg-convert` (`brew install librsvg`) and
   rebuild.
+
+## PRX shows "GitHub sync failing"
+
+The menu's header line *Sync failing … — Restart daemon*, the window's *PRX can't sync with
+GitHub* banner, and a `warning: GitHub polls are failing …` line from `prx status` all mean the
+same thing: the daemon's last 3 or more polls of those repos failed, so the PR list may be out of
+date. The message ends with the error `gh` gave.
+
+- **TLS or certificate errors** (`tls: failed to verify certificate`, `x509: OSStatus -26276`),
+  **network errors, or timeouts**, while `gh pr list -R <repo>` works in your terminal. The daemon
+  process lost something a fresh process has: typically it was started by an earlier PRX.app that
+  has quit, and it kept running in that app's old macOS session, which can break after sleep.
+  Restart it: choose the *Sync failing* line in the menu, or run `prx daemon stop` and then
+  `prx daemon start`. PRX recovers on its own too: when every repo has failed this way for 30
+  minutes, the daemon asks for a restart. PRX.app then replaces the daemon, whether it started it
+  or not, at most once every 30 minutes (then every 1, 2, and 4 hours while it keeps failing). A
+  daemon that PRX.app or launchd (`prx daemon install`) runs exits by itself (exit code 75) so
+  that they start it fresh.
+- **`gh auth login` in the error.** The `gh` login expired. Run `gh auth login`; the next poll
+  picks it up. A restart would not help, so PRX does not restart for this.
+- **Any other error** (for example a repository that no longer exists): fix the cause; the warning
+  clears after the next successful poll.
 
 ## Usage shows no tokens
 

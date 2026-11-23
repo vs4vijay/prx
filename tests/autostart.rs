@@ -728,3 +728,167 @@ fn doctor_warns_when_the_registered_app_is_gone() {
     assert!(stdout.contains("[WARN] autostart"), "{stdout}");
     assert!(stdout.contains("no longer exists"), "{stdout}");
 }
+
+// ------------------------------------------- PATH snapshot / idempotence
+
+/// The `PATH` string recorded in a plist's `EnvironmentVariables`.
+fn snapshot_path(plist: &str) -> String {
+    let after = plist
+        .split_once("<key>PATH</key>")
+        .expect("plist has a PATH key")
+        .1;
+    let value = after.split_once("<string>").unwrap().1;
+    value.split_once("</string>").unwrap().0.to_string()
+}
+
+/// launchd starts agents with a bare PATH, so install records the PATH it
+/// was run with (XML-escaped), for `gh` and the engines to resolve at
+/// login. The snapshot is pinned at install time: only reinstalling
+/// refreshes it.
+#[test]
+fn install_snapshots_the_installing_path_and_reinstall_refreshes_it() {
+    let env = setup("path-snapshot");
+    let home = env.home.path().to_str().unwrap();
+    let install = |path: &str| {
+        run_cli(
+            &env.config,
+            env.data.path(),
+            &["daemon", "install"],
+            None,
+            &[("HOME", home), ("PRX_APP_SEARCH_DIRS", ""), ("PATH", path)],
+        )
+    };
+
+    let first = "/opt/tools & more/bin:/usr/bin:/bin";
+    assert!(install(first).status.success());
+    let plist = plist_contents(&env);
+    assert_eq!(
+        snapshot_path(&plist),
+        "/opt/tools &amp; more/bin:/usr/bin:/bin"
+    );
+    assert!(!plist.contains("& more"), "the raw `&` would break the XML");
+
+    // A later run with another PATH (uninstall, doctor) changes nothing.
+    assert!(run(&env, &["doctor"]).status.success());
+    assert_eq!(plist_contents(&env), plist);
+
+    let second = "/usr/local/bin:/usr/bin:/bin";
+    assert!(install(second).status.success());
+    assert_eq!(snapshot_path(&plist_contents(&env)), second);
+}
+
+/// Uninstall removes prx's own registration files and nothing else in
+/// `LaunchAgents`, and running it again is a quiet success.
+#[test]
+fn uninstall_is_idempotent_and_leaves_other_agents_alone() {
+    let env = setup("uninstall-twice");
+    let other = env
+        .home
+        .path()
+        .join("Library/LaunchAgents/com.example.other.plist");
+    write_file(&other, "<plist/>");
+    assert!(run(&env, &["daemon", "install"]).status.success());
+
+    let out = run(&env, &["daemon", "uninstall"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert!(
+        stdout_of(&out).contains(&format!("removed {}", plist_path(&env).display())),
+        "{}",
+        stdout_of(&out)
+    );
+    assert!(!plist_path(&env).exists());
+
+    let out = run(&env, &["daemon", "uninstall"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    assert_eq!(stdout_of(&out), "autostart was not installed\n");
+    assert_eq!(std::fs::read_to_string(&other).unwrap(), "<plist/>");
+
+    // Install → uninstall → install again lands in the same single file.
+    assert!(run(&env, &["daemon", "install"]).status.success());
+    let mut agents: Vec<String> = std::fs::read_dir(other.parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    agents.sort();
+    assert_eq!(agents, ["com.example.other.plist", "com.prx.daemon.plist"]);
+    let out = run(&env, &["doctor"]);
+    assert!(
+        stdout_of(&out).contains("installed (")
+            && !stdout_of(&out).contains("not installed (run `prx daemon install`)"),
+        "{}",
+        stdout_of(&out)
+    );
+}
+
+/// A registered path with a space and XML metacharacters survives the trip
+/// into the plist and back: doctor names the exact path it was given (here
+/// as stale, since nothing exists there).
+#[test]
+fn binary_path_with_spaces_and_xml_characters_round_trips() {
+    let env = setup("odd-binary-path");
+    let odd = env.home.path().join("My Tools & <more>/bin/prx");
+    let odd_str = odd.to_str().unwrap();
+
+    let out = run(&env, &["daemon", "install", "--binary-path", odd_str]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let plist = plist_contents(&env);
+    assert!(
+        plist.contains("My Tools &amp; &lt;more&gt;/bin/prx</string>"),
+        "{plist}"
+    );
+    assert!(!plist.contains("<more>"), "{plist}");
+
+    let out = run(&env, &["doctor"]);
+    let stdout = stdout_of(&out);
+    assert!(
+        out.status.success(),
+        "a stale install is a warning:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("registered binary {odd_str} no longer exists")),
+        "{stdout}"
+    );
+
+    // Once the binary is there, the same registration is healthy.
+    write_file(&odd, "");
+    let out = run(&env, &["doctor"]);
+    let stdout = stdout_of(&out);
+    assert!(stdout.contains(&format!("— binary: {odd_str}")), "{stdout}");
+    assert!(!stdout.contains("[WARN] autostart"), "{stdout}");
+}
+
+/// `--app` must name a real PRX.app by absolute path; a bad value fails the
+/// install before any registration file is written or removed.
+#[test]
+fn install_rejects_a_bad_app_path_and_writes_nothing() {
+    let env = setup("bad-app");
+    assert!(run(&env, &["daemon", "install"]).status.success());
+    let before = plist_contents(&env);
+
+    let out = run(
+        &env,
+        &["daemon", "install", "--app", "Applications/PRX.app"],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("the app path must be absolute"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    let not_a_bundle = env.home.path().join("Applications/Other.app");
+    std::fs::create_dir_all(&not_a_bundle).unwrap();
+    let out = run(
+        &env,
+        &["daemon", "install", "--app", not_a_bundle.to_str().unwrap()],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr_of(&out).contains("is not a PRX.app bundle (no Contents/MacOS/PRX)"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    assert_eq!(plist_contents(&env), before, "the headless agent stays");
+    assert!(!env.home.path().join(APP_PLIST).exists());
+}

@@ -208,3 +208,157 @@ fn usage_json_matches_the_endpoint_shape() {
     // Same shape as the typed endpoint payload.
     serde_json::from_value::<prx::usage::Usage>(v).unwrap();
 }
+
+/// The uniform token semantics, end to end: `input` is uncached input,
+/// cache reads and writes have their own columns, and nothing is folded
+/// into anything else. Cost is the sum of the costs runs reported: with
+/// none reported the column is `-`, never `$0.00`.
+#[test]
+fn usage_keeps_input_cache_and_cost_apart() {
+    let env = Env::new("usage-semantics");
+    env.seed(&[
+        completed(
+            "2026-08-20T10:00:00Z",
+            "org/one",
+            1,
+            "claude",
+            r#","usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":2000,"cache_write_tokens":300}"#,
+        ),
+        completed(
+            "2026-08-21T10:00:00Z",
+            "org/one",
+            2,
+            "codex",
+            r#","usage":{"input_tokens":50,"cache_read_tokens":500}"#,
+        ),
+    ]);
+    let out = env.run(&["usage", "--by", "month", "--window", "all", "--json"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let overall = &v["overall"];
+    assert_eq!(overall["input_tokens"], 150);
+    assert_eq!(overall["output_tokens"], 10);
+    assert_eq!(overall["cache_read_tokens"], 2500);
+    assert_eq!(overall["cache_write_tokens"], 300);
+    assert_eq!(overall["runs"], 2);
+    assert_eq!(overall["runs_with_cost"], 0);
+    assert_eq!(overall["cost_usd"], 0.0);
+
+    let out = env.run(&["usage", "--by", "month", "--window", "all"]);
+    let stdout = stdout_of(&out);
+    let overall: Vec<&str> = stdout
+        .lines()
+        .find(|l| l.starts_with("overall"))
+        .unwrap_or_else(|| panic!("no overall row: {stdout}"))
+        .split_whitespace()
+        .collect();
+    assert_eq!(overall, ["overall", "150", "10", "2.5k", "300", "-", "2"]);
+    assert!(!stdout.contains("without usage data"), "{stdout}");
+}
+
+/// Aggregation across engines, repos, and PRs from one seeded history:
+/// each `--group` partitions the same runs, and the group totals add up to
+/// the overall row whichever way they are cut.
+#[test]
+fn usage_groups_partition_the_same_runs() {
+    let env = Env::new("usage-groups");
+    env.seed(&seeded());
+    let groups = |group: &str| -> Vec<(String, u64, u64)> {
+        let out = env.run(&[
+            "usage", "--by", "month", "--window", "all", "--group", group, "--json",
+        ]);
+        assert!(out.status.success(), "{}", stderr_of(&out));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["overall"]["runs"], 4, "--group {group}");
+        assert_eq!(v["overall"]["input_tokens"], 18_300, "--group {group}");
+        v["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                (
+                    g["group"].as_str().unwrap().to_string(),
+                    g["totals"]["runs"].as_u64().unwrap(),
+                    g["totals"]["input_tokens"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    };
+    let row = |name: &str, runs, input| (name.to_string(), runs, input);
+    assert_eq!(groups("none"), [row("all", 4, 18_300)]);
+    assert_eq!(
+        groups("engine"),
+        [row("claude", 3, 16_800), row("codex", 1, 1_500)]
+    );
+    assert_eq!(
+        groups("repo"),
+        [row("org/one", 2, 16_000), row("org/two", 2, 2_300)]
+    );
+    assert_eq!(
+        groups("pr"),
+        [
+            row("org/one#1", 2, 16_000),
+            row("org/two#5", 1, 1_500),
+            row("org/two#7", 1, 800)
+        ]
+    );
+    for group in ["engine", "repo", "pr", "session"] {
+        let rows = groups(group);
+        assert_eq!(rows.iter().map(|r| r.1).sum::<u64>(), 4, "--group {group}");
+        assert_eq!(
+            rows.iter().map(|r| r.2).sum::<u64>(),
+            18_300,
+            "--group {group}"
+        );
+    }
+}
+
+/// The default window is 30 days ending today, so a history that is all
+/// older than that reports nothing (and no "without usage" note), while
+/// `--window all` reaches it. Invalid flag values are usage errors that
+/// name the allowed values.
+#[test]
+fn usage_default_window_excludes_old_runs() {
+    let env = Env::new("usage-window");
+    env.seed(&[completed(
+        "2020-01-15T10:00:00Z",
+        "org/one",
+        1,
+        "claude",
+        r#","usage":{"input_tokens":100}"#,
+    )]);
+    let out = env.run(&["usage", "--json"]);
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        (
+            v["bucket"].as_str(),
+            v["window"].as_str(),
+            v["group"].as_str()
+        ),
+        (Some("day"), Some("30d"), Some("none"))
+    );
+    assert_eq!(v["overall"]["runs"], 0);
+    assert_eq!(v["runs_without_usage"], 0);
+    assert_eq!(v["series"][0]["points"].as_array().unwrap().len(), 30);
+
+    let out = env.run(&["usage", "--window", "all", "--by", "month", "--json"]);
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["overall"]["input_tokens"], 100);
+    assert_eq!(v["series"][0]["points"][0]["bucket_start"], "2020-01-01");
+
+    for (flag, value, allowed) in [
+        ("--window", "14d", "7d, 30d, 90d, all"),
+        ("--group", "author", "none, engine, repo, pr, session"),
+        ("--by", "year", "day, week, month"),
+    ] {
+        let out = env.run(&["usage", flag, value]);
+        assert_eq!(out.status.code(), Some(2), "{flag} {value}");
+        assert!(
+            stderr_of(&out).contains(&format!("expected one of {allowed}")),
+            "{}",
+            stderr_of(&out)
+        );
+        assert_eq!(stdout_of(&out), "");
+    }
+}

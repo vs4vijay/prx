@@ -926,6 +926,46 @@
     return { node: node, focus: picker.focus };
   }
 
+  // An event's tier with an on/off switch in front: off is the `silent`
+  // tier (history only), on goes back to the last loud tier shown (else
+  // the event's built-in tier, else Info). The radios stay the tier.
+  function tierControl(id, field, value, commit) {
+    const seg = segmented(id, field.options, value, function (next) {
+      toggle.checked = next !== "silent";
+      if (next !== "silent") loud = next;
+      commit(next);
+    });
+    const toggle = el("input", { id: id + "-on", type: "checkbox", role: "switch", class: "switch",
+      "aria-label": "Notify: " + field.label });
+    toggle.checked = value !== "silent";
+    let loud = value && value !== "silent" ? value : field.fallback !== "silent" ? field.fallback : "informational";
+    toggle.addEventListener("change", function () {
+      const next = toggle.checked ? loud : "silent";
+      seg.group.querySelectorAll("input").forEach(function (radio) { radio.checked = radio.getAttribute("value") === next; });
+      commit(next);
+    });
+    return { node: el("div", { class: "inline tier-event" }, [toggle, seg.node]), focus: seg.focus, group: seg.group };
+  }
+
+  // An event's own sound: a macOS sound, No sound (`none`), or unset — the
+  // event's built-in sound, else its tier's (or Inherit on org/repo rows).
+  // Committed as the name, `none`, or null.
+  function soundControl(path, field, value, commit, opts) {
+    const names = (window.prxSchema && window.prxSchema.SOUNDS) || [];
+    const unsetText = field.builtin ? "Built in (" + field.builtin + ")" : "Tier's sound";
+    const items = [{ value: "none", label: "No sound" }].concat(names.map(function (n, i) { return { value: n, label: n, divider: i === 0 }; }));
+    if (!opts.inherit) {
+      items.unshift({ value: "", label: unsetText,
+        detail: field.builtin ? "This event's own sound." : "Whatever sound this event's tier plays." });
+    }
+    const parent = opts.parent || { value: null };
+    const parentText = parent.value === null || parent.value === undefined ? unsetText : parent.value === "none" ? "No sound" : null;
+    return schemaSelect(fieldId(path), items, value === null || value === undefined ? (opts.inherit ? value : "") : value,
+      function (next) { commit(next === "" ? null : next); },
+      { inherit: opts.inherit, inherited: opts.inherited, parent: opts.parent, parentText: parentText || undefined,
+        label: field.label + " sound", cls: "sound", unset: opts.unset });
+  }
+
   // Build the input for `field` showing `value`; `commit(newValue)` fires on
   // change with the parsed value (null = unset for optional fields).
   // Number parse failures are reported via app.localError and not committed
@@ -940,7 +980,8 @@
       case "number": return numberControl(app, path, field, value, commit);
       case "choice": return choiceControl(path, field, value, commit, opts);
       case "mode": return modeControl(path, field, value, commit, opts);
-      case "tier": return segmented(id, field.options, value, commit);
+      case "tier": return tierControl(id, field, value, commit);
+      case "sound": return soundControl(path, field, value, commit, opts);
       case "engine": return engineControl(app, path, field, value, commit, opts);
       case "model": return modelControl(app, path, field, value, commit, opts.context || {});
       case "schedule": return scheduleControl(app, path, value, commit, opts);

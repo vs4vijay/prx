@@ -84,6 +84,8 @@ pub enum HistoryEvent {
     },
     PrMerged,
     PrClosed,
+    /// prx started tracking an open PR (with `on_new_pr`).
+    NewPr,
     /// New commits on a reviewed PR (or an until-push snooze wake): the PR is
     /// re-review pending (A5/A9).
     NewCommits,
@@ -212,28 +214,47 @@ pub fn apply(current: Option<&PrRecord>, event: Event, ctx: &MachineCtx) -> Tran
 /// Evaluate skip rules (DEV-PLAN §4, audits A11/A19). Draft skip wins when
 /// several rules match; all non-draft reasons collapse into `Config`.
 pub fn evaluate_skip(snapshot: &PrSnapshot, skip: &SkipConfig) -> Option<SkipReason> {
+    skip_decision(snapshot, skip).map(|(reason, _)| reason)
+}
+
+/// [`evaluate_skip`] plus which rule matched, in a few words, for
+/// `PrRecord.skip_detail`: `None` for a draft (the reason says it all),
+/// else `author <login> excluded`, `label <name> excluded`, or
+/// `branch <branch> matches <pattern>`. Rules are checked in that order.
+pub fn skip_decision(
+    snapshot: &PrSnapshot,
+    skip: &SkipConfig,
+) -> Option<(SkipReason, Option<String>)> {
     if skip.drafts && snapshot.is_draft {
-        return Some(SkipReason::Draft);
+        return Some((SkipReason::Draft, None));
     }
     if skip.authors.iter().any(|a| a == &snapshot.author) {
-        return Some(SkipReason::Config);
+        return Some((
+            SkipReason::Config,
+            Some(format!("author {} excluded", snapshot.author)),
+        ));
     }
     // A19: labels are case-insensitive EXACT matches, not prefixes.
-    if skip
+    if let Some(label) = snapshot
         .labels
         .iter()
-        .any(|l| snapshot.labels.iter().any(|pl| pl.eq_ignore_ascii_case(l)))
+        .find(|pl| skip.labels.iter().any(|l| pl.eq_ignore_ascii_case(l)))
     {
-        return Some(SkipReason::Config);
+        return Some((SkipReason::Config, Some(format!("label {label} excluded"))));
     }
     // Branch patterns are globs; invalid patterns were rejected by config
     // validation and are ignored here to keep the machine total.
-    if skip.branches.iter().any(|p| {
+    if let Some(pattern) = skip.branches.iter().find(|p| {
         Pattern::new(p)
             .map(|p| p.matches(&snapshot.head_branch))
             .unwrap_or(false)
     }) {
-        return Some(SkipReason::Config);
+        let detail = if *pattern == snapshot.head_branch {
+            format!("branch {pattern} excluded")
+        } else {
+            format!("branch {} matches {pattern}", snapshot.head_branch)
+        };
+        return Some((SkipReason::Config, Some(detail)));
     }
     None
 }
@@ -247,10 +268,11 @@ fn poll_new_pr(current: Option<&PrRecord>, snap: &PrSnapshot, ctx: &MachineCtx) 
         refresh_from_snapshot(&mut rec, snap, ctx.now);
         return Transition::changed(rec, Vec::new());
     }
-    match evaluate_skip(snap, ctx.skip) {
-        Some(reason) => {
+    match skip_decision(snap, ctx.skip) {
+        Some((reason, detail)) => {
             let mut rec = record_from_snapshot(snap, PrState::Skipped, ctx.now);
             rec.skip_reason = Some(reason);
+            rec.skip_detail = detail;
             Transition::changed(rec, vec![Effect::Notify(NotifyEvent::Skipped)])
         }
         None => {
@@ -259,7 +281,13 @@ fn poll_new_pr(current: Option<&PrRecord>, snap: &PrSnapshot, ctx: &MachineCtx) 
             // so pre-existing PRs discovered on the first poll review
             // immediately once their window has passed.
             rec.review_anchor_at = Some(snap.created_at);
-            Transition::changed(rec, vec![Effect::Notify(NotifyEvent::NewPr)])
+            Transition::changed(
+                rec,
+                vec![
+                    Effect::HistoryAppend(HistoryEvent::NewPr),
+                    Effect::Notify(NotifyEvent::NewPr),
+                ],
+            )
         }
     }
 }
@@ -402,16 +430,24 @@ fn poll_reopened(current: Option<&PrRecord>, snap: &PrSnapshot, ctx: &MachineCtx
             rec.review_session = None;
             rec.review_attempts = 0;
             rec.diff_too_large = false;
-            match evaluate_skip(snap, ctx.skip) {
-                Some(reason) => {
+            rec.skip_detail = None;
+            match skip_decision(snap, ctx.skip) {
+                Some((reason, detail)) => {
                     rec.state = PrState::Skipped;
                     rec.skip_reason = Some(reason);
+                    rec.skip_detail = detail;
                     rec.review_anchor_at = None;
                     Transition::changed(rec, vec![Effect::Notify(NotifyEvent::Skipped)])
                 }
                 None => {
                     enter_pending(&mut rec, snap.created_at, ctx.now);
-                    Transition::changed(rec, vec![Effect::Notify(NotifyEvent::NewPr)])
+                    Transition::changed(
+                        rec,
+                        vec![
+                            Effect::HistoryAppend(HistoryEvent::NewPr),
+                            Effect::Notify(NotifyEvent::NewPr),
+                        ],
+                    )
                 }
             }
         }
@@ -454,6 +490,7 @@ fn poll_draft_flipped(
             }
             PrState::Skipped => {
                 rec.skip_reason = Some(SkipReason::Draft);
+                rec.skip_detail = None;
                 Transition::changed(rec, Vec::new())
             }
             // §6: `draft: true` from a non-draft → skipped(draft). If a
@@ -479,9 +516,10 @@ fn poll_draft_flipped(
             // §6: draft→ready flips Skipped(draft) → pending. Any other skip
             // reason needs its own exit (unignore / snooze expiry).
             PrState::Skipped if rec.skip_reason == Some(SkipReason::Draft) => {
-                match evaluate_skip(snap, ctx.skip) {
-                    Some(reason) => {
+                match skip_decision(snap, ctx.skip) {
+                    Some((reason, detail)) => {
                         rec.skip_reason = Some(reason);
+                        rec.skip_detail = detail;
                         Transition::changed(rec, Vec::new())
                     }
                     None => {
@@ -551,6 +589,8 @@ fn review_done(
     rec.blocking_count = blocking_count;
     rec.nit_count = nit_count;
     rec.review_session = None;
+    // A completed review ends the run of consecutive failures.
+    rec.review_attempts = 0;
     // A fresh agent verdict supersedes any earlier human approval: the PR
     // is back to "awaiting the human" if the agent approved again.
     rec.human_approved_at = None;
@@ -807,8 +847,11 @@ fn record_from_snapshot(snap: &PrSnapshot, state: PrState, now: DateTime<Utc>) -
         blocking_count: 0,
         nit_count: 0,
         review_session: None,
+        review_session_info: None,
+        last_manifest: None,
         review_attempts: 0,
         diff_too_large: false,
+        skip_detail: None,
         human_approved_at: None,
         exec_summary: None,
         brief: None,
@@ -872,11 +915,18 @@ pub fn cooldown_remaining(
     }
 }
 
+/// `None` only when the record has no anchor (due immediately). A cooldown
+/// too large to represent as an instant saturates to the far future: it
+/// means "never due", and must not read as "no cooldown".
 fn cooldown_ends_at(rec: &PrRecord, cooldown: &Cooldown) -> Option<DateTime<Utc>> {
     let anchor = rec.review_anchor_at?;
     let minutes = applicable_cooldown_minutes(rec, cooldown);
-    let duration = Duration::try_minutes(i64::try_from(minutes).ok()?)?;
-    anchor.checked_add_signed(duration)
+    let ends = i64::try_from(minutes)
+        .ok()
+        .and_then(Duration::try_minutes)
+        .and_then(|duration| anchor.checked_add_signed(duration))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC);
+    Some(ends)
 }
 
 #[cfg(test)]
@@ -985,7 +1035,8 @@ mod tests {
         assert_eq!(rec.review_anchor_at, Some(t(T0))); // A5: gh_created_at, not detection time
         assert_eq!(rec.gh_created_at, t(T0));
         assert_eq!(notifications(&tr), vec![NotifyEvent::NewPr]);
-        assert!(history(&tr).is_empty());
+        // Recorded too, so PRX.app can raise the banner the daemon defers.
+        assert_eq!(history(&tr), vec![HistoryEvent::NewPr]);
     }
 
     #[test]
@@ -1860,6 +1911,37 @@ mod tests {
         assert_eq!(record_of(&tr).review_attempts, 3);
     }
 
+    /// The count is of consecutive failures: a review that completes ends
+    /// the run, whatever its verdict and even when the head moved meanwhile.
+    #[test]
+    fn review_done_resets_the_failure_count() {
+        for (verdict, blocking_count, reviewed_sha) in [
+            (Verdict::Approved, 0, "aaaa"),
+            (Verdict::CommentOnly, 0, "aaaa"),
+            (Verdict::ChangesRequested, 1, "aaaa"),
+            (Verdict::Approved, 0, "an-older-sha"),
+        ] {
+            let mut rec = record_in(PrState::InReview, None);
+            rec.review_attempts = 2;
+            let tr = poll(
+                Event::ReviewDone {
+                    verdict,
+                    blocking_count,
+                    nit_count: 0,
+                    summary: None,
+                    reviewed_sha: reviewed_sha.into(),
+                },
+                &rec,
+                T0_61M,
+            );
+            assert_eq!(
+                record_of(&tr).review_attempts,
+                0,
+                "{verdict:?} at {reviewed_sha}"
+            );
+        }
+    }
+
     #[test]
     fn review_failed_outside_in_review_is_noop() {
         let rec = tracked();
@@ -2467,6 +2549,364 @@ mod tests {
             "cooling 30m"
         );
         assert_eq!(cooldown_remaining(&rec, &cooldown, t(T0_61M)), None);
+    }
+
+    /// A cooldown too large to turn into an instant means "never due". It
+    /// used to overflow into "no cooldown", so a huge value meant to hold
+    /// automatic reviews off reviewed the PR at once.
+    #[test]
+    fn unrepresentable_cooldown_is_never_due_not_immediately_due() {
+        let far = t("2999-01-01T00:00:00Z");
+        // Beyond i64 minutes, beyond a chrono duration, beyond the calendar.
+        for minutes in [u64::MAX, 1_000_000_000_000_000, 1_000_000_000_000] {
+            let cooldown = Cooldown {
+                before_first_review_minutes: minutes,
+                between_re_reviews_minutes: minutes,
+            };
+            let mut rec = tracked();
+            assert!(!machine_is_due(&rec, &cooldown, far), "{minutes}");
+            assert!(
+                cooldown_remaining(&rec, &cooldown, far).is_some(),
+                "{minutes}"
+            );
+            rec.last_verdict = Some(Verdict::Approved);
+            assert!(!machine_is_due(&rec, &cooldown, far), "{minutes}");
+        }
+        // A large but representable cooldown still ends when it says.
+        let cooldown = Cooldown {
+            before_first_review_minutes: 1_000_000, // ~1.9 years
+            between_re_reviews_minutes: 30,
+        };
+        let rec = tracked();
+        assert!(!machine_is_due(&rec, &cooldown, t("2028-01-01T00:00:00Z")));
+        assert!(machine_is_due(&rec, &cooldown, t("2029-01-01T00:00:00Z")));
+    }
+
+    #[test]
+    fn zero_cooldown_is_due_at_the_anchor() {
+        let cooldown = Cooldown {
+            before_first_review_minutes: 0,
+            between_re_reviews_minutes: 0,
+        };
+        let rec = tracked();
+        assert!(machine_is_due(&rec, &cooldown, t(T0)));
+        assert_eq!(cooldown_remaining(&rec, &cooldown, t(T0)), None);
+        // Before the anchor (a PR created "in the future" by clock skew) it
+        // is still cooling.
+        assert!(!machine_is_due(&rec, &cooldown, t("2026-09-01T09:59:59Z")));
+    }
+
+    /// `cooldown_remaining` describes pending records only: a reviewed or
+    /// skipped record inside its window reports nothing.
+    #[test]
+    fn cooldown_remaining_is_none_outside_pending() {
+        let cooldown = Cooldown::default();
+        for state in [
+            PrState::InReview,
+            PrState::ReviewedApproved,
+            PrState::ReviewedChangesRequested,
+            PrState::Skipped,
+            PrState::Merged,
+            PrState::Closed,
+        ] {
+            let rec = record_in(state, None);
+            assert_eq!(
+                cooldown_remaining(&rec, &cooldown, t(T0_30M)),
+                None,
+                "{state:?}"
+            );
+            assert!(!machine_is_due(&rec, &cooldown, t(T0_61M)), "{state:?}");
+        }
+    }
+
+    // ------------------------------------------------- whole-table rules
+
+    /// Every event that carries no snapshot, applied to a PR prx has never
+    /// seen, changes nothing and emits nothing: there is no record to act on.
+    #[test]
+    fn snapshotless_events_on_an_untracked_pr_are_noops() {
+        let skip = SkipConfig::default();
+        for event in [
+            Event::PollMerged,
+            Event::PollClosed,
+            Event::ReviewStart,
+            Event::ReviewDone {
+                verdict: Verdict::Approved,
+                blocking_count: 0,
+                nit_count: 0,
+                summary: None,
+                reviewed_sha: "aaaa".into(),
+            },
+            Event::ReviewFailed,
+            Event::Snooze {
+                until: Some(t(T0_61M)),
+                until_push: false,
+            },
+            Event::SnoozeExpired,
+            Event::Unsnooze,
+            Event::Ignore,
+            Event::Unignore,
+            Event::Approve,
+            Event::RequestChanges,
+            Event::Unblock,
+        ] {
+            let tr = apply(None, event.clone(), &ctx_at(T0, &skip));
+            assert_eq!(tr.record, None, "{event:?}");
+            assert!(tr.effects.is_empty(), "{event:?}");
+        }
+    }
+
+    /// Merged and closed are absorbing: no event moves a merged record, and
+    /// only a reopen moves a closed one. Nothing is notified or logged twice.
+    #[test]
+    fn terminal_states_absorb_every_event_except_reopening_a_closed_pr() {
+        let skip = SkipConfig::default();
+        let events = || {
+            vec![
+                Event::PollNewPr {
+                    snapshot: snap("bbbb"),
+                },
+                Event::PollShaChanged {
+                    snapshot: snap("bbbb"),
+                },
+                Event::PollUnchanged {
+                    snapshot: snap("aaaa"),
+                },
+                Event::PollMerged,
+                Event::PollClosed,
+                Event::PollReopened {
+                    snapshot: snap("aaaa"),
+                },
+                Event::PollDraftFlipped {
+                    snapshot: PrSnapshot {
+                        is_draft: true,
+                        ..snap("aaaa")
+                    },
+                },
+                Event::ReviewStart,
+                Event::ReviewDone {
+                    verdict: Verdict::Approved,
+                    blocking_count: 0,
+                    nit_count: 0,
+                    summary: None,
+                    reviewed_sha: "aaaa".into(),
+                },
+                Event::ReviewFailed,
+                Event::Snooze {
+                    until: Some(t(T0_61M)),
+                    until_push: true,
+                },
+                Event::SnoozeExpired,
+                Event::Unsnooze,
+                Event::Ignore,
+                Event::Unignore,
+                Event::Approve,
+                Event::RequestChanges,
+                Event::Unblock,
+            ]
+        };
+        for terminal in [PrState::Merged, PrState::Closed] {
+            let rec = record_in(terminal, None);
+            for event in events() {
+                let reopening =
+                    terminal == PrState::Closed && matches!(event, Event::PollReopened { .. });
+                let tr = apply(Some(&rec), event.clone(), &ctx_at(T0_61M, &skip));
+                if reopening {
+                    assert_eq!(state_of(&tr), PrState::Pending);
+                    continue;
+                }
+                // The defensive PollNewPr resync may refresh metadata, but it
+                // never leaves the terminal state.
+                let state = tr.record.as_ref().map_or(terminal, |r| r.state);
+                assert_eq!(state, terminal, "{terminal:?} × {event:?}");
+                assert!(tr.effects.is_empty(), "{terminal:?} × {event:?}");
+            }
+        }
+    }
+
+    /// The engine never approves: no outcome of a review run, whatever the
+    /// manifest said, records a human approval. Only `Event::Approve` does.
+    #[test]
+    fn only_the_human_approve_event_sets_human_approved_at() {
+        let skip = SkipConfig::default();
+        for verdict in [
+            Verdict::Approved,
+            Verdict::CommentOnly,
+            Verdict::ChangesRequested,
+        ] {
+            let rec = record_in(PrState::InReview, None);
+            let tr = apply(
+                Some(&rec),
+                Event::ReviewDone {
+                    verdict,
+                    blocking_count: 0,
+                    nit_count: 0,
+                    summary: None,
+                    reviewed_sha: "aaaa".into(),
+                },
+                &ctx_at(T0_61M, &skip),
+            );
+            assert_eq!(record_of(&tr).human_approved_at, None, "{verdict:?}");
+        }
+        let rec = record_in(PrState::ReviewedApproved, None);
+        let tr = apply(Some(&rec), Event::Approve, &ctx_at(T0_61M, &skip));
+        assert_eq!(record_of(&tr).human_approved_at, Some(t(T0_61M)));
+    }
+
+    /// Going terminal drops everything that only made sense for an open PR:
+    /// the snooze, its restore target, and the retained agent session. The
+    /// review record itself is kept for history.
+    #[test]
+    fn terminal_transition_clears_snooze_and_session_but_keeps_the_review() {
+        let mut rec = record_in(PrState::Skipped, Some(SkipReason::Snoozed));
+        rec.previous_state = Some(PrState::ReviewedApproved);
+        rec.snooze_until = Some(t(T0_61M));
+        rec.snooze_until_push = true;
+        rec.review_session = Some("sess-1".into());
+        rec.last_verdict = Some(Verdict::Approved);
+        rec.last_reviewed_sha = Some("aaaa".into());
+        for event in [Event::PollMerged, Event::PollClosed] {
+            let out = record_of(&poll(event, &rec, T0_61M));
+            assert_eq!(out.skip_reason, None);
+            assert_eq!(out.previous_state, None);
+            assert_eq!(out.snooze_until, None);
+            assert!(!out.snooze_until_push);
+            assert_eq!(out.review_session, None);
+            assert_eq!(out.last_verdict, Some(Verdict::Approved));
+            assert_eq!(out.last_reviewed_sha.as_deref(), Some("aaaa"));
+        }
+    }
+
+    // ---------------------------------------------- skip rule edge cases
+
+    /// Authors match exactly and case-sensitively, a branch pattern must
+    /// match the whole branch name, and a pattern that is not a valid glob
+    /// matches nothing instead of panicking.
+    #[test]
+    fn skip_rules_match_exactly_and_tolerate_bad_globs() {
+        let skip = SkipConfig {
+            drafts: false,
+            authors: vec!["dependabot[bot]".into()],
+            labels: vec![],
+            branches: vec!["release/*".into(), "[unclosed".into()],
+        };
+        let with = |author: &str, branch: &str| PrSnapshot {
+            author: author.into(),
+            head_branch: branch.into(),
+            is_draft: true,
+            ..snap("aaaa")
+        };
+        // Draft skipping is off, so a draft is judged by the other rules.
+        assert_eq!(evaluate_skip(&with("alice", "feat/x"), &skip), None);
+        assert_eq!(
+            evaluate_skip(&with("dependabot[bot]", "feat/x"), &skip),
+            Some(SkipReason::Config)
+        );
+        assert_eq!(
+            evaluate_skip(&with("Dependabot[bot]", "feat/x"), &skip),
+            None
+        );
+        assert_eq!(evaluate_skip(&with("dependabot", "feat/x"), &skip), None);
+        assert_eq!(
+            evaluate_skip(&with("alice", "release/1.2"), &skip),
+            Some(SkipReason::Config)
+        );
+        assert_eq!(
+            evaluate_skip(&with("alice", "pre-release/1.2"), &skip),
+            None
+        );
+        assert_eq!(evaluate_skip(&with("alice", "[unclosed"), &skip), None);
+    }
+
+    /// The skip detail names the rule that matched, in a few words.
+    #[test]
+    fn skip_decision_names_the_matching_rule() {
+        let skip = SkipConfig {
+            drafts: true,
+            authors: vec!["dependabot[bot]".into()],
+            labels: vec!["WIP".into()],
+            branches: vec!["release/*".into(), "main".into()],
+        };
+        let with = |author: &str, branch: &str, labels: &[&str], draft: bool| PrSnapshot {
+            author: author.into(),
+            head_branch: branch.into(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            is_draft: draft,
+            ..snap("aaaa")
+        };
+        let detail = |s: &PrSnapshot| skip_decision(s, &skip);
+        assert_eq!(
+            detail(&with("dependabot[bot]", "x", &[], true)),
+            Some((SkipReason::Draft, None)),
+            "a draft wins over every other rule"
+        );
+        assert_eq!(
+            detail(&with("dependabot[bot]", "x", &[], false)),
+            Some((
+                SkipReason::Config,
+                Some("author dependabot[bot] excluded".into())
+            ))
+        );
+        assert_eq!(
+            detail(&with("alice", "x", &["bug", "wip"], false)),
+            Some((SkipReason::Config, Some("label wip excluded".into())))
+        );
+        assert_eq!(
+            detail(&with("alice", "release/1.2", &[], false)),
+            Some((
+                SkipReason::Config,
+                Some("branch release/1.2 matches release/*".into())
+            ))
+        );
+        assert_eq!(
+            detail(&with("alice", "main", &[], false)),
+            Some((SkipReason::Config, Some("branch main excluded".into())))
+        );
+        assert_eq!(detail(&with("alice", "feat/x", &[], false)), None);
+    }
+
+    /// The machine stores the detail with the reason, and a draft flip
+    /// drops a rule detail that no longer applies.
+    #[test]
+    fn skipped_records_carry_their_detail() {
+        let skip = SkipConfig {
+            drafts: true,
+            authors: vec!["bot".into()],
+            labels: vec![],
+            branches: vec![],
+        };
+        let ctx = MachineCtx {
+            now: Utc::now(),
+            skip: &skip,
+            resume_sessions: false,
+        };
+        let snapshot = PrSnapshot {
+            author: "bot".into(),
+            ..snap("aaaa")
+        };
+        let tr = apply(
+            None,
+            Event::PollNewPr {
+                snapshot: snapshot.clone(),
+            },
+            &ctx,
+        );
+        let rec = record_of(&tr);
+        assert_eq!(rec.skip_detail.as_deref(), Some("author bot excluded"));
+        assert_eq!(rec.skip_text().as_deref(), Some("author bot excluded"));
+        let drafted = PrSnapshot {
+            is_draft: true,
+            ..snapshot
+        };
+        let tr = apply(
+            Some(&rec),
+            Event::PollDraftFlipped { snapshot: drafted },
+            &ctx,
+        );
+        let rec = record_of(&tr);
+        assert_eq!(rec.skip_reason, Some(SkipReason::Draft));
+        assert_eq!(rec.skip_detail, None);
+        assert_eq!(rec.skip_text().as_deref(), Some("draft"));
     }
 
     // -------------------------------------------------- misc invariants

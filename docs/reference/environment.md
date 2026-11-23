@@ -6,7 +6,7 @@
 |----------|--------|
 | `PRX_CONFIG` | Path of the config file (default `~/.config/prx/config.yml`). |
 | `PRX_DATA_DIR` | Data directory for `state.json`, `history.jsonl`, `daemon.*`, `app.pid`, `logs/`, `manifests/` (default `~/.local/share/prx`). |
-| `VISUAL`, `EDITOR` | The editor `prx config edit` opens (`VISUAL` first). |
+| `VISUAL`, `EDITOR` | The editor `prx config edit` opens (`VISUAL` first; an empty value counts as unset). |
 
 `PRX_CONFIG` and `PRX_DATA_DIR` are primarily for tests, but they also let you run multiple isolated prx homes side by side.
 

@@ -8,6 +8,12 @@
 // visible and the page is current. The draft lives here, not in a page, so
 // unsaved edits survive switching to an Overview page and back. The window
 // opens on `#page=<id>`; the host switches pages with prxApp.go(id).
+// When the daemon's config revision changes (a save anywhere, `prx config
+// set`, a hand edit) the host calls prxApp.configChanged(revision): a clean
+// form re-loads, an edited one says the file changed, and the current
+// Overview page refreshes.
+// The PR details page opens at a PR with `#page=pr&pr=<url-encoded key>`,
+// or prxApp.openPr(key) / app.openPr(key) once the window is up.
 (function () {
   "use strict";
   const bridge = window.prxBridge;
@@ -20,6 +26,8 @@
   const state = {
     loaded: null, draft: null, dirty: false, saving: false, offline: false,
     page: S.pageFromHash(window.location && window.location.hash) || "general",
+    // The PR the details page shows (`pr` page).
+    pr: S.prFromHash(window.location && window.location.hash),
     // The mounted Overview page's {refresh}, the mount counter (stale async
     // answers check it), and each Overview page's view state (filters, sort).
     live: null, mount: 0, overview: {},
@@ -30,6 +38,8 @@
     // Installed browsers for the "Open PRs with" picker (browsers.list,
     // app-local, design W1); null until it answers.
     browsers: null, browsersAsked: false,
+    // The config changed outside this window while it had unsaved edits.
+    external: false,
   };
   const pageNode = document.getElementById("page");
   const statusNode = document.getElementById("save-status");
@@ -56,6 +66,13 @@
     if (state.loaded && state.loaded.config_error) {
       notes.push("The config file has errors: saving the form replaces it with the running config plus your edits.");
     }
+    if (state.external) {
+      notes.push(state.page === "raw"
+        ? "The config changed outside this window. Reload from disk to see it."
+        : "The config changed outside this window. Revert loads it and drops your edits; Save replaces it.");
+    }
+    const restart = restartNote(state.loaded && state.loaded.restart_required);
+    if (restart) notes.push(restart);
     if (state.dirty && state.loaded && F.hasYamlComments(state.loaded.yaml)) {
       notes.push("Saving the form rewrites config.yml without its comments. Edit config.yml directly to keep them.");
     }
@@ -96,7 +113,7 @@
 
   function offlinePage() {
     return UI.empty("offline", "The PRX daemon isn't running",
-      "Settings are read from and saved through the daemon. Start it from the PRX menu bar (Start daemon) or with `prx daemon start`, then try again.",
+      "Settings are read from and saved through the daemon. PRX starts it on its own, and this page loads once it answers. If it stays offline, choose Start daemon in the PRX menu bar, or run `prx daemon start`.",
       [UI.button("Try again", function () { load(false); }, "primary")]);
   }
 
@@ -110,8 +127,9 @@
     state.live = null;
     state.mount += 1;
     pageNode.replaceChildren();
+    const current = S.navPage(state.page);
     document.querySelectorAll("#nav button").forEach(function (b) {
-      b.setAttribute("aria-current", b.dataset.page === state.page ? "page" : "false");
+      b.setAttribute("aria-current", b.dataset.page === current ? "page" : "false");
     });
     pageNode.dataset.page = state.page;
     document.body.dataset.page = state.page;
@@ -177,6 +195,7 @@
       state.loaded = config;
       state.draft = F.clone(config.raw);
       state.dirty = false;
+      state.external = false;
       state.errors = {};
       state.localErrors = {};
       updateSavebar();
@@ -197,11 +216,19 @@
     });
   }
 
+  // Settings the daemon applies only when it starts (max_concurrent_reviews).
+  function restartNote(keys) {
+    if (!keys || !keys.length) return "";
+    return keys.join(", ") + " applies after the daemon restarts: choose Restart daemon in the PRX menu, or run prx daemon stop and then prx daemon start.";
+  }
+
   function savedMessage(result) {
     const changes = [];
     if (result.added && result.added.length) changes.push("now watching " + result.added.join(", "));
     if (result.removed && result.removed.length) changes.push("stopped watching " + result.removed.join(", "));
-    return "Saved" + (changes.length ? ": " + changes.join("; ") : " and applied");
+    const restart = result.restart_required && result.restart_required.length
+      ? ". Restart the daemon to apply " + result.restart_required.join(", ") : "";
+    return "Saved" + (changes.length ? ": " + changes.join("; ") : " and applied") + restart;
   }
 
   // A rejected save: the raw view keeps its text and shows the error under
@@ -270,6 +297,27 @@
     return repos.pending;
   }
 
+  // The daemon runs a new config revision. Already showing it (this
+  // window's own save): nothing to do. Clean form: re-load it in place.
+  // Unsaved edits, or the raw text page: keep them and say so.
+  function configChanged(revision) {
+    if (state.live && state.live.refresh) state.live.refresh();
+    if (!state.loaded || state.saving || state.loading) return;
+    if (revision != null && state.loaded.config_revision === revision) return;
+    if (state.dirty || state.page === "raw") {
+      state.external = true;
+      updateSavebar();
+      return;
+    }
+    load(true, true);
+  }
+
+  function openPr(key) {
+    if (!S.prKeyValid(key)) return;
+    state.pr = key;
+    show("pr");
+  }
+
   const app = {
     draft: function () { return state.draft; },
     loaded: function () { return state.loaded; },
@@ -315,6 +363,9 @@
     repos: function () { return state.repos; },
     loadRepos: loadRepos,
     go: function (page) { show(page); },
+    // The PR details page: open it at `key`, and the key it shows.
+    openPr: openPr,
+    prKey: function () { return state.pr; },
     // Overview pages: the mount a render belongs to (async answers for an
     // old mount are dropped), its persistent view state, and daemon health.
     mount: function () { return state.mount; },
@@ -371,14 +422,18 @@
   });
   window.addEventListener("hashchange", function () {
     const page = S.pageFromHash(window.location.hash);
-    if (page && page !== state.page) show(page);
+    const pr = S.prFromHash(window.location.hash);
+    if (page === "pr" && pr) openPr(pr);
+    else if (page && page !== state.page) show(page);
   });
   function poll() {
     if (state.live && state.live.refresh && document.visibilityState === "visible") state.live.refresh();
+    // A settings page opened before the daemon was up loads once it answers.
+    else if (state.offline && !state.loading && !state.dirty) load(true, true);
   }
   setInterval(poll, POLL_MS);
   document.addEventListener("visibilitychange", poll);
-  window.prxApp = Object.freeze({ show: show, go: show, app: app, state: state });
+  window.prxApp = Object.freeze({ show: show, go: show, openPr: openPr, app: app, state: state, configChanged: configChanged });
   updateDaemon();
   show(state.page);
   load(false);

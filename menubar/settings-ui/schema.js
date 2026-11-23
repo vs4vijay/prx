@@ -39,11 +39,13 @@
     { value: "informational", label: "Info" },
     { value: "silent", label: "Silent" },
   ];
-  // [key, label, built-in tier] (config::Notifications::default).
+  // [key, label, built-in tier, built-in sound] (config::Notifications::
+  // default; the sound is notify::builtin_event_sound and, when there is
+  // none, the event plays its tier's sound).
   const EVENTS = [
     ["on_new_pr", "New PR", "informational"],
     ["on_review_started", "Review started", "informational"],
-    ["on_review_complete_approved", "Review complete: approved", "informational"],
+    ["on_review_complete_approved", "Review complete: approved", "informational", "Glass"],
     ["on_review_complete_blocking", "Review complete: blocking", "urgent"],
     ["on_new_commits", "New commits", "informational"],
     ["on_re_review_triggered", "Re-review triggered", "informational"],
@@ -52,6 +54,9 @@
     ["on_failure", "Review failed", "urgent"],
     ["on_skipped", "Skipped", "silent"],
   ];
+  // macOS alert sounds (/System/Library/Sounds), offered in the tier and
+  // event sound menus. Any other name set in config.yml stays listed.
+  const SOUNDS = ["Basso", "Blow", "Bottle", "Frog", "Funk", "Glass", "Hero", "Morse", "Ping", "Pop", "Purr", "Sosumi", "Submarine", "Tink"];
   // Built-in agent engines (config::builtin_engines); `engines:` entries
   // override them.
   const BUILTIN_ENGINES = ["pi", "claude", "codex"];
@@ -88,7 +93,7 @@
     "FINDINGS_BLOCKING", "FINDINGS_NITS", "PR_KEY", "IDENTITY"];
 
   // type: number | text | textarea | prompt | template | choice | mode |
-  //       tier | bool | tokens | engine | model | schedule | browser
+  //       tier | sound | bool | tokens | engine | model | schedule | browser
   // optional: unset is meaningful (empty input removes the key).
   // global: defaults only; org/repo entries cannot override it.
   // top: the key is a top-level config path (`menu.sort`), not under
@@ -156,8 +161,13 @@
     { key: "schedule", label: "Review schedule", type: "schedule", optional: true, stack: true, bare: true, page: "schedule", section: "Schedule" },
     { key: "notifications.enabled", label: "Deliver notifications", type: "bool", fallback: true, global: true, page: "notifications", section: "Delivery",
       help: "Off silences every banner and sound. History still records each event." },
+    { key: "notifications.menubar_bell", label: "Bell in the menu bar", type: "bool", fallback: true, global: true, page: "notifications", section: "Delivery",
+      help: "PRX.app adds a bell to its icon and counts ready (✓) and blocked (✕) PRs until you open them." },
   ].concat(EVENTS.map(function (e) {
     return { key: "notifications." + e[0], label: e[1], type: "tier", options: TIER_OPTIONS, fallback: e[2], page: "notifications", section: "Events" };
+  })).concat(EVENTS.map(function (e) {
+    // `builtin`: what an unset sound plays (null: the tier's sound).
+    return { key: "notifications.sounds." + e[0], label: e[1], type: "sound", optional: true, builtin: e[3] || null, page: "notifications", section: "Sounds" };
   })).concat([
     { key: "identity.login", label: "GitHub login", type: "text", optional: true, page: "identity", section: "GitHub account",
       placeholder: "The account gh is signed in as",
@@ -175,14 +185,19 @@
       page: "menubar", section: "Menu bar" },
   ]);
 
-  // [id, label, icon, group] (design D16): Overview pages watch the daemon,
-  // Settings pages edit the shared config draft.
+  // [id, label, icon, group, parent?] (design D16): Overview pages watch the
+  // daemon, Settings pages edit the shared config draft. A page with a
+  // parent is not in the sidebar: it is reached from that page (its entry
+  // is marked current meanwhile).
   const PAGE_GROUPS = [["overview", "Overview"], ["settings", "Settings"]];
   const PAGES = [
     ["dashboard", "Dashboard", "gauge", "overview"],
     ["prs", "Pull requests", "pr", "overview"],
     ["history", "History", "clock", "overview"],
     ["usage", "Usage & stats", "chart", "overview"],
+    // One PR's details (brief, latest review, actions): opened at a PR with
+    // `#page=pr&pr=<key>` or app.openPr(key).
+    ["pr", "Pull request", "pr", "overview", "prs"],
     ["general", "General", "sliders", "settings"],
     ["review", "Review", "review", "settings"],
     ["messages", "Messages", "message", "settings"],
@@ -198,7 +213,7 @@
   // The sidebar: [{id, label, pages: [{id, label, icon}]}] in group order.
   function navGroups() {
     return PAGE_GROUPS.map(function (g) {
-      return { id: g[0], label: g[1], pages: PAGES.filter(function (p) { return p[3] === g[0]; })
+      return { id: g[0], label: g[1], pages: PAGES.filter(function (p) { return p[3] === g[0] && !p[4]; })
         .map(function (p) { return { id: p[0], label: p[1], icon: p[2] }; }) };
     });
   }
@@ -206,6 +221,26 @@
   function pageGroup(id) {
     const page = PAGES.find(function (p) { return p[0] === id; });
     return page ? page[3] : null;
+  }
+
+  // The sidebar entry a page belongs to: itself, or its parent.
+  function navPage(id) {
+    const page = PAGES.find(function (p) { return p[0] === id; });
+    return page ? page[4] || page[0] : null;
+  }
+
+  // A tracked PR key as the daemon writes it: `org/repo#n`.
+  function prKeyValid(key) {
+    return typeof key === "string" && /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#[0-9]+$/.test(key);
+  }
+
+  // The PR a window URL asks for (`#page=pr&pr=<url-encoded key>`), or null.
+  function prFromHash(hash) {
+    const match = /(?:^#|&)pr=([^&]*)/.exec(hash || "");
+    if (!match) return null;
+    let key;
+    try { key = decodeURIComponent(match[1]); } catch (e) { return null; }
+    return prKeyValid(key) ? key : null;
   }
 
   // The page a window URL asks for (`#page=<id>`), or null.
@@ -236,9 +271,10 @@
   // Fields an org or repo entry may override (everything but `global`).
   const OVERRIDE_FIELDS = FIELDS.filter(function (f) { return !f.global; });
 
-  const api = { MODES: MODES, MODE_OPTIONS: MODE_OPTIONS, TIERS: TIERS, EVENTS: EVENTS, BUILTIN_ENGINES: BUILTIN_ENGINES,
+  const api = { MODES: MODES, MODE_OPTIONS: MODE_OPTIONS, TIERS: TIERS, EVENTS: EVENTS, SOUNDS: SOUNDS, BUILTIN_ENGINES: BUILTIN_ENGINES,
     LLM_PROVIDERS: LLM_PROVIDERS, USAGE_FIELDS: USAGE_FIELDS, FIELDS: FIELDS, OVERRIDE_FIELDS: OVERRIDE_FIELDS,
     PAGES: PAGES, PAGE_GROUPS: PAGE_GROUPS, navGroups: navGroups, pageGroup: pageGroup, pageFromHash: pageFromHash,
+    navPage: navPage, prKeyValid: prKeyValid, prFromHash: prFromHash,
     fieldFor: fieldFor, pageForField: pageForField };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.prxSchema = Object.freeze(api);

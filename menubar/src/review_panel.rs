@@ -98,6 +98,9 @@ impl ReviewPanelResult {
     }
 }
 
+/// The reference field's placeholder: both full forms the daemon accepts.
+const REFERENCE_PLACEHOLDER: &str = "acme/api#42 or https://github.com/acme/api/pull/42";
+
 /// Accessory width and control heights (points).
 const WIDTH: f64 = 380.0;
 const LABEL_WIDTH: f64 = 90.0;
@@ -116,8 +119,9 @@ pub fn ask(mtm: MainThreadMarker, spec: &PanelSpec) -> Option<ReviewPanelResult>
         ),
         None => (
             "Review a pull request".to_string(),
-            "Enter org/repo#N, a PR URL, repo#N, or a PR number. \
-             Options apply to this one run only.",
+            "Enter org/repo#N or paste a GitHub PR URL \
+             (https://github.com/org/repo/pull/N); repo#N or a PR number \
+             also work. Options apply to this one run only.",
         ),
     };
     alert.setMessageText(&NSString::from_str(&title));
@@ -129,7 +133,7 @@ pub fn ask(mtm: MainThreadMarker, spec: &PanelSpec) -> Option<ReviewPanelResult>
     // origin is the bottom-left corner).
     let reference = spec.target.is_none().then(|| {
         let field = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
-        field.setPlaceholderString(Some(&NSString::from_str("acme/api#42")));
+        field.setPlaceholderString(Some(&NSString::from_str(REFERENCE_PLACEHOLDER)));
         field
     });
     let choices = engine_choices(&spec.engines, spec.default_engine.as_deref());
@@ -316,6 +320,26 @@ mod tests {
         // Post stays unset when checked (the repo's mode decides).
         let (_, overrides) = result("42", None, true, "x").into_request().unwrap();
         assert_eq!(overrides.post, None);
+    }
+
+    /// A pasted PR URL goes to the daemon as typed (trimmed); the daemon's
+    /// `parse_pr_ref` resolves it, as it does for `prx review <url>`.
+    #[test]
+    fn a_pasted_pr_url_is_sent_trimmed() {
+        let (target, overrides) = result(
+            "  https://github.com/ren3-ai/ren3/pull/1063/files\n",
+            None,
+            true,
+            "",
+        )
+        .into_request()
+        .unwrap();
+        assert_eq!(target, "https://github.com/ren3-ai/ren3/pull/1063/files");
+        assert_eq!(overrides, ReviewOverrides::default());
+        assert_eq!(
+            prx::review::parse_pr_ref(&target).unwrap(),
+            prx::review::PrRef::Full("ren3-ai/ren3".into(), 1063)
+        );
     }
 
     #[test]

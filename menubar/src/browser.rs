@@ -86,9 +86,10 @@ pub fn repo_of_url(url: &str) -> Option<String> {
     (!org.is_empty() && !repo.is_empty()).then(|| format!("{org}/{repo}"))
 }
 
-/// Open an external link from the app window (an "Open in GitHub" link)
-/// with the repo's effective browser, on a background thread so the GUI
-/// never waits on the daemon. Failures are logged.
+/// Open an external link from the app window (an "Open in GitHub" link) or
+/// a banner click with the repo's effective browser, on a background thread
+/// so the GUI never waits on the daemon. Failures are logged. A PR link that
+/// opens is acknowledged in the menu bar bell ([`crate::bell`]).
 pub fn open_external(url: String) {
     let spawned = std::thread::Builder::new()
         .name("prx-open-link".into())
@@ -106,14 +107,18 @@ pub fn open_external(url: String) {
             let browser = runtime.block_on(async {
                 match repo_of_url(&url) {
                     Some(repo) => {
-                        let client = DaemonClient::discover().await;
+                        let client = DaemonClient::discover_as_menubar().await;
                         resolve(client.as_ref(), &repo).await
                     }
                     None => Browser::System,
                 }
             });
             match open(&browser, &url) {
-                Ok(()) => eprintln!("prx-menubar: opened {url}"),
+                Ok(()) => {
+                    eprintln!("prx-menubar: opened {url}");
+                    // A PR the user opened from PRX no longer rings the bell.
+                    crate::bell::acknowledge_url(&url);
+                }
                 Err(error) => eprintln!("prx-menubar: cannot open {url}: {error}"),
             }
         });

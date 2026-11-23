@@ -47,7 +47,8 @@ use wry::http::{header::CONTENT_TYPE, Response as HttpResponse, StatusCode};
 use wry::{NewWindowResponse, WebView, WebViewBuilder};
 
 use crate::mainloop::{self, MainThreadSender};
-use bridge::{Bridge, DaemonBackend};
+use crate::poller::PollerHandle;
+use bridge::{Bridge, DaemonBackend, Effect};
 
 /// Initial window size (points).
 const WIDTH: f64 = 1040.0;
@@ -86,6 +87,9 @@ struct Inner {
     mtm: MainThreadMarker,
     sender: MainThreadSender<SettingsMsg>,
     open: Option<OpenWindow>,
+    /// The menu's poller: a config write or state change made from the
+    /// window refreshes the menu at once.
+    poller: PollerHandle,
 }
 
 /// Everything alive while the window is shown. Field order is drop order:
@@ -99,12 +103,15 @@ struct OpenWindow {
 
 impl Settings {
     /// Create the host and attach its reply queue to the main run loop.
-    pub fn new(mtm: MainThreadMarker) -> Settings {
+    /// `poller` is nudged after every successful change made from the
+    /// window.
+    pub fn new(mtm: MainThreadMarker, poller: PollerHandle) -> Settings {
         let (sender, pending) = mainloop::channel::<SettingsMsg>();
         let inner = Rc::new(RefCell::new(Inner {
             mtm,
             sender,
             open: None,
+            poller,
         }));
         let weak = Rc::downgrade(&inner);
         mainloop::install_source(pending, move |message| {
@@ -127,10 +134,34 @@ impl Settings {
 
     /// Show the window on `page` (`dashboard`, `general`, …; design D16):
     /// focus it and switch to the page when already open, create it on the
-    /// page otherwise.
+    /// page otherwise. [`assets::pr_page`]`(key)` opens the PR details page
+    /// at that PR.
     pub fn open(&self, page: &str) -> Result<Opened, String> {
         self.inner.borrow_mut().open(page)
     }
+
+    /// The daemon's config revision changed (any route): an open window
+    /// re-loads its form when it has no unsaved edits
+    /// (`prxApp.configChanged`, `settings-ui/app.js`).
+    pub fn config_changed(&self, revision: Option<u64>) {
+        let inner = self.inner.borrow();
+        let Some(open) = &inner.open else { return };
+        if let Err(error) = open
+            .webview
+            .evaluate_script(&config_changed_script(revision))
+        {
+            eprintln!("prx-menubar: cannot tell the window about the config change: {error}");
+        }
+    }
+}
+
+/// The page call for a config revision change (`null` from a daemon that
+/// reports none).
+pub fn config_changed_script(revision: Option<u64>) -> String {
+    let revision = revision.map_or_else(|| "null".to_string(), |r| r.to_string());
+    format!(
+        "window.prxApp && window.prxApp.configChanged && window.prxApp.configChanged({revision});"
+    )
 }
 
 impl Inner {
@@ -202,11 +233,17 @@ impl Inner {
 
         let sender = self.sender.clone();
         let chooser = self.sender.clone();
+        let poller = self.poller.clone();
         let bridge = Bridge::new(
             DaemonBackend,
             Arc::new(move |reply| sender.send(SettingsMsg::Reply(reply))),
         )
-        .with_chooser(Arc::new(move |id| chooser.send(SettingsMsg::ChooseApp(id))));
+        .with_chooser(Arc::new(move |id| chooser.send(SettingsMsg::ChooseApp(id))))
+        // A save or state change from the window shows in the menu now.
+        .with_on_effect(Arc::new(move |effect| match effect {
+            Effect::Config => poller.config_changed(),
+            Effect::State => poller.refresh(),
+        }));
         WebViewBuilder::new()
             .with_custom_protocol(assets::SCHEME.into(), |_id, request| {
                 serve_asset(request.uri().path())
@@ -392,5 +429,21 @@ impl WindowDelegate {
         let this = Self::alloc(mtm).set_ivars(sender);
         // SAFETY: NSObject's designated initializer.
         unsafe { msg_send![super(this), init] }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The page hook is guarded (an older page has no `configChanged`) and
+    /// carries the revision, or `null` from a daemon that reports none.
+    #[test]
+    fn config_changed_script_calls_the_page_hook() {
+        assert_eq!(
+            config_changed_script(Some(7)),
+            "window.prxApp && window.prxApp.configChanged && window.prxApp.configChanged(7);"
+        );
+        assert!(config_changed_script(None).ends_with("configChanged(null);"));
     }
 }
